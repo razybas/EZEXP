@@ -78,9 +78,11 @@ its own data folder. Works the same on any PC it's run on.
 
 ## Rebuilding the exe
 
-Requires Python 3.10+ with `pip install PySide6 pyinstaller`, then run
-`build.bat` (or `py -m PyInstaller --onefile --windowed --name ezexp app.py`).
-Output: `dist\ezexp.exe`.
+Anyone can build EzExp on their own PC: install Python 3.10+ from
+[python.org](https://python.org) (tick "Add Python to PATH" in the
+installer), then double-click `build.bat` — it installs the two
+dependencies (PySide6, PyInstaller) and produces `dist\ezexp.exe`. No other
+setup needed; the first launch of that exe indexes *that* PC.
 
 ## Source layout
 
