@@ -32,6 +32,10 @@ no admin rights).
   ever goes wrong, send the `error.log` from that folder along with
   your report.
 
+Technical friends can also build it themselves: clone this repo and
+run `build.bat` — it installs Python automatically via winget if the
+PC doesn't have it, then produces the same `dist\ezexp.exe`.
+
 ## Using it
 
 - **Open `ezexp.exe`** — the main Finder-style window appears.
