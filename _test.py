@@ -33,6 +33,7 @@ with open(os.path.join(data, "render_final.mp4"), "w") as f:
     f.write("x" * 2048)
 
 conn = ez.db_connect()
+ez.ensure_indexes(conn)
 assert ez.FTS_OK, "FTS5 trigram tokenizer should be available"
 plan = " ".join(str(p) for p in conn.execute(
     "EXPLAIN QUERY PLAN SELECT * FROM files WHERE parent = ?"
@@ -58,6 +59,32 @@ t0 = time.perf_counter()
 ez.scan_full(conn, [data], lambda p, c: None)
 full_secs = time.perf_counter() - t0
 assert delta_secs < full_secs, (delta_secs, full_secs)
+
+_fresh = ez.sqlite3.connect(os.path.join(tmp, "fresh.db"))
+ez._ensure_schema(_fresh)
+assert _fresh.execute(
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+    " AND name='idx_files_parent_nc'").fetchone()[0] == 0
+ez.ensure_indexes(_fresh)
+assert _fresh.execute(
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+    " AND name='idx_files_parent_nc'").fetchone()[0] == 1
+_fresh.close()
+
+_attempts = {"n": 0}
+_orig_schema = ez._ensure_schema
+def _flaky_schema(conn):
+    _attempts["n"] += 1
+    if _attempts["n"] < 3:
+        raise ez.sqlite3.OperationalError("database is locked")
+    return _orig_schema(conn)
+ez._ensure_schema = _flaky_schema
+try:
+    _c = ez.db_connect()
+    _c.close()
+finally:
+    ez._ensure_schema = _orig_schema
+assert _attempts["n"] == 3
 
 _orig_app_dir = ez.APP_DIR
 ez.APP_DIR = data
@@ -567,6 +594,12 @@ assert not os.path.exists(os.path.join(mvB, "move-me.txt"))
 win.handle_drop([os.path.join(mvA, "move-me.txt")], mvA, copy=False)
 assert os.path.isfile(os.path.join(mvA, "move-me.txt"))
 assert not os.path.exists(os.path.join(mvA, "move-me (2).txt"))
+
+win._index_lock_retried = False
+win.on_index_done(-1, "database is locked")
+assert win._index_lock_retried is True
+assert "retrying" in win.status_right.text()
+win._index_lock_retried = False
 
 worker.stop()
 worker.wait(3000)

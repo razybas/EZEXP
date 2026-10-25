@@ -499,14 +499,25 @@ _tls = threading.local()
 
 def db_connect():
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-65536")
-    conn.execute("PRAGMA busy_timeout=30000")
-    _ensure_schema(conn)
-    return conn
+    deadline = time.time() + 180
+    while True:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-65536")
+            conn.execute("PRAGMA busy_timeout=30000")
+            _ensure_schema(conn)
+            return conn
+        except sqlite3.OperationalError as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if "locked" not in str(exc) or time.time() > deadline:
+                raise
+            time.sleep(1)
 
 
 def thread_conn():
@@ -518,6 +529,12 @@ def thread_conn():
 
 
 def _ensure_schema(conn):
+    """Tables and the UNIQUE index only — this runs on EVERY
+    connection, so it must stay instant. The performance indexes are
+    built once by ensure_indexes() (indexer thread): building one
+    over millions of rows here would hold the write lock while every
+    other connection queues behind it and dies on 'database is
+    locked'."""
     global FTS_OK
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS files(
@@ -533,11 +550,6 @@ def _ensure_schema(conn):
             kind TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_key ON files(parent, name);
-        CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
-        CREATE INDEX IF NOT EXISTS idx_files_parent_nc ON files(parent COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive);
-        CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
-        CREATE INDEX IF NOT EXISTS idx_files_cat ON files(category);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS note_links(
             parent TEXT NOT NULL,
@@ -545,7 +557,6 @@ def _ensure_schema(conn):
             mtime REAL NOT NULL,
             target TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_links_key ON note_links(parent, name);
     """)
     try:
         conn.execute(
@@ -556,6 +567,20 @@ def _ensure_schema(conn):
         FTS_OK = True
     except sqlite3.Error:
         FTS_OK = False
+    conn.commit()
+
+
+def ensure_indexes(conn):
+    """Performance indexes, built once per database by the indexer
+    thread before it scans. IF NOT EXISTS keeps later calls cheap."""
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
+        CREATE INDEX IF NOT EXISTS idx_files_parent_nc ON files(parent COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive);
+        CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+        CREATE INDEX IF NOT EXISTS idx_files_cat ON files(category);
+        CREATE INDEX IF NOT EXISTS idx_links_key ON note_links(parent, name);
+    """)
     conn.commit()
 
 
@@ -1779,6 +1804,7 @@ class IndexerThread(QThread):
         conn = None
         try:
             conn = db_connect()
+            ensure_indexes(conn)
             roots = fixed_drives()
             for v in get_vaults():  # vaults may live on drives we don't auto-scan
                 if os.path.isdir(v):
@@ -4077,8 +4103,15 @@ class MainWindow(FramelessWindow):
         self._spinner.stop()
         self.rescan_btn.setEnabled(True)
         if err and err != "stopped":
+            if "locked" in err and not getattr(
+                    self, "_index_lock_retried", False):
+                self._index_lock_retried = True
+                self.status_right.setText("Index busy — retrying in 5 s…")
+                QTimer.singleShot(5000, lambda: self.start_indexer(False))
+                return
             self.status_right.setText(f"Index error: {err}")
             return
+        self._index_lock_retried = False
         stamp = time.strftime("%H:%M")
         if total >= 0:
             self.status_right.setText(f"{total:,} items indexed · updated {stamp}")
