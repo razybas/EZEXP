@@ -35,7 +35,8 @@ from PySide6.QtGui import (
     QPainter, QPainterPath, QPolygonF, QPixmap, QPen, QShortcut, QGuiApplication,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QGraphicsItem, QGraphicsLineItem, QGraphicsObject,
+    QApplication, QFileDialog, QFrame, QGraphicsItem, QGraphicsLineItem,
+    QGraphicsObject,
     QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QStyle,
     QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem,
@@ -111,6 +112,14 @@ def bump_launch_count(path):
     s = QSettings("ezexp", "EzExp")
     d = get_launch_counts()
     d[path] = d.get(path, 0) + 1
+    s.setValue("launch_counts", json.dumps(d))
+    s.sync()
+
+
+def remove_launch_count(path):
+    s = QSettings("ezexp", "EzExp")
+    d = {p: c for p, c in get_launch_counts().items()
+         if p.lower() != path.lower()}
     s.setValue("launch_counts", json.dumps(d))
     s.sync()
 
@@ -2009,9 +2018,9 @@ class GraphNode(QGraphicsObject):
         p.setPen(QPen(border, 1.4))
         p.drawEllipse(QPointF(0, 0), self.radius, self.radius)
         if self.icon_pm is not None and not self.icon_pm.isNull():
-            iw = self.icon_pm.width()
-            ih = self.icon_pm.height()
-            p.drawPixmap(QPointF(-iw / 2.0, -ih / 2.0), self.icon_pm)
+            d = self.radius * 2.0
+            p.drawPixmap(QRectF(-self.radius, -self.radius, d, d),
+                         self.icon_pm, QRectF(self.icon_pm.rect()))
         if self.can_expand:
             bx, by = self.radius * 0.82, -self.radius * 0.82
             p.setBrush(QColor("#8b5cf6"))
@@ -2120,10 +2129,16 @@ class GraphView(QGraphicsView):
         self._timer = QTimer(self)
         self._timer.setInterval(35)
         self._timer.timeout.connect(self._tick)
+        self._float_timer = QTimer(self)
+        self._float_timer.setInterval(50)
+        self._float_timer.timeout.connect(self._float_tick)
+        self._anchors = {}
 
     # -- data ----------------------------------------------------------------
     def clear_graph(self):
         self._timer.stop()
+        self._float_timer.stop()
+        self._anchors = {}
         self.nodes = []
         self.edge_items = []
         self.edge_pairs = []
@@ -2229,7 +2244,7 @@ class GraphView(QGraphicsView):
 
     # ---- structure mode: progressive disclosure --------------------------------
     def node_icon_pm(self, cat, radius):
-        size = max(14, min(34, int(radius * 1.7)))
+        size = max(16, min(56, int(radius * 2)))
         key = (cat, size)
         if key not in self._pm_cache:
             if cat == "drive":
@@ -2462,8 +2477,31 @@ class GraphView(QGraphicsView):
         assign(roots_idx, 0.0, 2 * math.pi, 0)
         for c, li in self._edge_lines.items():
             self._update_line(li, self._parent_of[c], c)
+        self._anchors = {i: it.pos() for i, it in self._items.items()}
+        if not self._float_timer.isActive():
+            self._float_timer.start()
         self._fitted = True
         self.fit_view()
+
+    def _float_tick(self):
+        """Gentle idle drift for structure/vault graphs: each node bobs a
+        few px around its radial-layout anchor. The layout itself stays
+        deterministic; this is a visual offset only."""
+        if self._mode not in ("structure", "vault") or not self._items:
+            return
+        t = time.time()
+        for i, it in self._items.items():
+            anchor = self._anchors.get(i)
+            if anchor is None:
+                continue
+            if getattr(it, "_dragging", False):
+                self._anchors[i] = it.pos()
+                continue
+            ph = i * 2.399963  # golden-angle phase spread
+            it.setPos(anchor.x() + math.sin(t * 0.9 + ph) * 3.5,
+                      anchor.y() + math.cos(t * 0.7 + ph * 1.3) * 3.5)
+        if self._mode == "vault":
+            self._recompute_link_lines()
 
     def _cluster_init(self):
         """Place notes near their folder's group centre so the link graph
@@ -2970,6 +3008,7 @@ class MainWindow(FramelessWindow):
     def remove_quicklaunch(self, path):
         set_quicklaunch([p for p in get_quicklaunch()
                          if p.lower() != path.lower()])
+        remove_launch_count(path)
         if self._ql_selected and self._ql_selected.lower() == path.lower():
             self._ql_selected = None
             self.details.show_row(None)

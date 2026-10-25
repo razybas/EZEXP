@@ -309,6 +309,7 @@ assert win.view_mode == "graph"
 assert len(win.graph_view._items) == 2, list(win.graph_view._items)
 assert {it.kind for it in win.graph_view._items.values()} == {"folder", "file"}
 assert not win.graph_view._timer.isActive(), "structure graphs must be static"
+assert win.graph_view._float_timer.isActive(), "structure graph nodes must float"
 its = list(win.graph_view._items.values())
 assert (its[0].pos() - its[1].pos()).manhattanLength() > 50
 win.enter_list_mode("all")
@@ -378,6 +379,27 @@ assert len(app_menu.actions()) >= 4
 win.remove_quicklaunch(fake_app)
 assert fake_app not in ez.get_quicklaunch()
 assert win._ql_selected is None
+
+# an app that was launched (has a count) must also disappear on remove
+ez.set_quicklaunch([fake_app])
+ez.bump_launch_count(fake_app)
+win.remove_quicklaunch(fake_app)
+assert fake_app not in ez.get_quicklaunch()
+assert fake_app not in ez.get_launch_counts()
+win._build_sidebar()
+wait_results(300)
+assert all(b.path().lower() != fake_app.lower() for b in win._ql_buttons)
+
+# Add App flow (dialog stubbed): must pin the chosen file — this is the
+# regression test for the missing-QFileDialog-import NameError
+_orig_dlg = ez.QFileDialog.getOpenFileName
+ez.QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (fake_app, "Programs"))
+try:
+    win.add_quicklaunch_app()
+finally:
+    ez.QFileDialog.getOpenFileName = _orig_dlg
+assert os.path.normpath(fake_app) in ez.get_quicklaunch()
+win.remove_quicklaunch(fake_app)
 
 worker.stop()
 worker.wait(3000)
