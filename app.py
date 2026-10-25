@@ -1800,7 +1800,7 @@ class IndexerThread(QThread):
     def stop(self):
         self._stop = True
 
-    def run(self):
+    def _run_once(self):
         conn = None
         try:
             conn = db_connect()
@@ -1824,20 +1824,36 @@ class IndexerThread(QThread):
             else:
                 scan_delta(conn, roots, prog, alive)
             if self._stop:
-                self.done.emit(-1, "stopped")
-                return
+                return -1
             total = update_total(conn)
             set_meta(conn, "indexed_at", str(time.time()))
             conn.commit()
-            self.done.emit(total, "")
-        except Exception as exc:
-            self.done.emit(-1, str(exc))
+            return total
         finally:
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
+
+    def run(self):
+        for attempt in range(5):
+            try:
+                total = self._run_once()
+                if self._stop:
+                    self.done.emit(-1, "stopped")
+                    return
+                self.done.emit(total, "")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc) and attempt < 4:
+                    time.sleep(3)
+                    continue
+                self.done.emit(-1, str(exc))
+                return
+            except Exception as exc:
+                self.done.emit(-1, str(exc))
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -3069,7 +3085,9 @@ class MainWindow(FramelessWindow):
         self.view_mode = "list"
         self._graph_seq = 0
         self._analyzer_running = False
+        self._analyzer_stop = threading.Event()
         self._indexer = None
+        self._index_pending = None
         self._ql_buttons = []
         self._ql_selected = None
         self.graph_scope_path = None
@@ -3598,6 +3616,7 @@ class MainWindow(FramelessWindow):
         vaults = get_vaults()
         if not vaults or pending_link_count(thread_conn(), vaults) == 0:
             return
+        self._analyzer_stop.clear()
         threading.Thread(target=self._analyzer_job, daemon=True).start()
 
     def _analyzer_job(self):
@@ -3610,7 +3629,7 @@ class MainWindow(FramelessWindow):
             def prog(done, remaining):
                 self.links_progress.emit(done, remaining)
 
-            while time.time() - t0 < 900:  # one kick never runs forever
+            while time.time() - t0 < 900 and not self._analyzer_stop.is_set():
                 analyzed, remaining = analyze_pending_links(
                     conn, vaults, time_budget=6.0, progress=prog)
                 if remaining == 0:
@@ -4071,8 +4090,13 @@ class MainWindow(FramelessWindow):
 
     # ---- indexing ------------------------------------------------------------
     def start_indexer(self, rebuild):
+        self._last_index_rebuild = rebuild
+        self._index_lock_retried = False
         if self._indexer and self._indexer.isRunning():
+            self._index_pending = True if (self._index_pending or rebuild) else False
+            self.rescan_btn.setText("  Rescan queued…")
             return
+        self._analyzer_stop.set()
         self._indexer = IndexerThread(rebuild=rebuild)
         self._indexer.progress.connect(self.on_index_progress)
         self._indexer.done.connect(self.on_index_done)
@@ -4107,9 +4131,10 @@ class MainWindow(FramelessWindow):
                     self, "_index_lock_retried", False):
                 self._index_lock_retried = True
                 self.status_right.setText("Index busy — retrying in 5 s…")
-                QTimer.singleShot(5000, lambda: self.start_indexer(False))
+                QTimer.singleShot(5000, self._retry_last_index)
                 return
             self.status_right.setText(f"Index error: {err}")
+            self._consume_pending_index()
             return
         self._index_lock_retried = False
         stamp = time.strftime("%H:%M")
@@ -4122,6 +4147,19 @@ class MainWindow(FramelessWindow):
         if self.view_mode == "graph":
             self.refresh_graph()
         self.start_link_analyzer()
+        self._consume_pending_index()
+
+    def _retry_last_index(self):
+        self._index_pending = None
+        self.start_indexer(getattr(self, "_last_index_rebuild", False))
+
+    def _consume_pending_index(self):
+        self.rescan_btn.setText("  Rescan now")
+        if self._index_pending is None:
+            return
+        rebuild = self._index_pending
+        self._index_pending = None
+        QTimer.singleShot(400, lambda: self.start_indexer(rebuild))
 
 
 class ClickableLabel(QLabel):

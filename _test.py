@@ -5,6 +5,7 @@ import time
 import tempfile
 import shutil
 import subprocess
+import threading
 
 tmp = tempfile.mkdtemp(prefix="ezexp_test_")
 os.environ["EZEXP_DB_DIR"] = os.path.join(tmp, "db")
@@ -602,11 +603,97 @@ win.handle_drop([os.path.join(mvA, "move-me.txt")], mvA, copy=False)
 assert os.path.isfile(os.path.join(mvA, "move-me.txt"))
 assert not os.path.exists(os.path.join(mvA, "move-me (2).txt"))
 
+# 1. Lock-hog: hold write lock for ~35 s while IndexerThread runs
+hog_ready = threading.Event()
+
+def _hog():
+    hog = ez.sqlite3.connect(ez.DB_PATH)
+    hog.execute("BEGIN IMMEDIATE")
+    hog.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('lock_hog', '1')")
+    hog_ready.set()
+    time.sleep(35)
+    hog.commit()
+    hog.close()
+
+t_hog = threading.Thread(target=_hog, daemon=True)
+t_hog.start()
+assert hog_ready.wait(5), "hog thread failed to start"
+
+_orig_fixed = ez.fixed_drives
+ez.fixed_drives = lambda: [data]
+idx_res = []
+try:
+    idx = ez.IndexerThread(rebuild=True)
+    idx.done.connect(lambda total, err: idx_res.append((total, err)), ez.Qt.DirectConnection)
+    idx.start()
+    assert idx.wait(60000), "IndexerThread timed out"
+    qapp.processEvents()
+    assert idx_res and idx_res[0][0] >= 0, f"Indexer failed with: {idx_res}"
+finally:
+    ez.fixed_drives = _orig_fixed
+    t_hog.join(10)
+
 win._index_lock_retried = False
 win.on_index_done(-1, "database is locked")
 assert win._index_lock_retried is True
 assert "retrying" in win.status_right.text()
 win._index_lock_retried = False
+
+# 2. Analyzer quiesce
+_orig_fixed = ez.fixed_drives
+ez.fixed_drives = lambda: [data]
+try:
+    win._analyzer_running = True
+    win.start_indexer(True)
+    assert win._analyzer_stop.is_set()
+finally:
+    if win._indexer:
+        win._indexer.wait(5000)
+    ez.fixed_drives = _orig_fixed
+
+# 3. Same-operation retry
+assert getattr(win, "_last_index_rebuild", None) is True
+recorded = []
+_orig_start = win.start_indexer
+win.start_indexer = lambda rebuild: recorded.append(rebuild)
+try:
+    win._retry_last_index()
+    assert recorded == [True], f"Expected [True], got {recorded}"
+finally:
+    win.start_indexer = _orig_start
+
+# 4. Queue-on-busy
+class _RunningStub:
+    def isRunning(self):
+        return True
+
+_orig_indexer = win._indexer
+win._indexer = _RunningStub()
+try:
+    win._index_pending = None
+    win.start_indexer(False)
+    assert win._index_pending is False
+    assert "queued" in win.rescan_btn.text().lower()
+    win.start_indexer(True)
+    assert win._index_pending is True
+finally:
+    win._indexer = _orig_indexer
+
+# 5. Consume-pending
+recorded5 = []
+_orig_start5 = win.start_indexer
+win.start_indexer = lambda rebuild: recorded5.append(rebuild)
+try:
+    win._index_pending = False
+    win._consume_pending_index()
+    loop = QEventLoop()
+    QTimer.singleShot(600, loop.quit)
+    loop.exec()
+    assert recorded5 == [False], f"Expected [False], got {recorded5}"
+    assert win._index_pending is None
+    assert win.rescan_btn.text() == "  Rescan now"
+finally:
+    win.start_indexer = _orig_start5
 
 worker.stop()
 worker.wait(3000)
