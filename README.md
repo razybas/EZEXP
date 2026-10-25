@@ -53,11 +53,16 @@ its own data folder. Works the same on any PC it's run on.
   - **A vault selected in the sidebar** → the Obsidian-style link graph of
     that vault: one node per note, one line per resolved `[[wikilink]]`.
   Structure graphs are read straight from the index so they open instantly.
-  Link graphs analyze notes with a time budget and live progress, so slow or
-  cloud-synced drives (Google Drive, OneDrive) can never hang the app — the
-  status bar reports how many notes were analyzed. Interactions: drag nodes,
-  pan the background, scroll to zoom; click a node for its details pane
-  entry, double-click to open it, right-click for quick actions.
+  Link graphs are too: after the index is built, EzExp analyzes every note's
+  `[[wikilinks]]` **once** in the background and stores them in the index —
+  it keeps chewing through cloud-synced notes (Google Drive, OneDrive) in
+  small passes until every note is done, and afterwards only re-analyzes
+  notes that actually changed. The graph therefore always shows the complete
+  set of notes immediately and its links are complete as soon as the first
+  analysis has finished; the status bar reports coverage while that runs.
+  Interactions: drag nodes, pan the background, scroll to zoom; click a node
+  for its details pane entry, double-click to open it, right-click for quick
+  actions.
 - **Three-dots button** (details pane, bottom right) or **right-click** any
   result: Open, Show in Explorer, Rename, Copy as path, Copy file,
   Move to Recycle Bin, Properties.

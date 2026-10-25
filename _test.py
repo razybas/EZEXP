@@ -142,11 +142,31 @@ ez.set_vaults([gdir])
 assert ez.parse_wikilinks("[[a|x]] [[b#h]] [[c]] broken [[") == ["a", "b", "c"]
 assert ez.active_vault_for(os.path.join(gdir, "sub")) == os.path.normpath(gdir)
 assert ez.active_vault_for("C:\\nowhere") is None
+
+# one-time link analysis: parses every note into note_links, then never again
+assert ez.pending_link_count(conn, [gdir]) == 3
+analyzed, remaining = ez.analyze_pending_links(conn, [gdir], time_budget=60)
+assert (analyzed, remaining) == (3, 0), (analyzed, remaining)
+assert ez.pending_link_count(conn, [gdir]) == 0
 g = ez.build_vault_graph(conn, gdir)
 assert sorted(n["name"] for n in g["nodes"]) == ["alpha", "beta", "gamma"], g["nodes"]
 assert len(g["edges"]) == 2, g["edges"]
 degs = {n["name"]: n["degree"] for n in g["nodes"]}
 assert degs == {"alpha": 2, "beta": 1, "gamma": 1}, degs
+assert g["analyzed"] == 3
+
+# incremental: a new note and an edited note become pending; unchanged never re-read
+with open(os.path.join(gdir, "empty.md"), "w") as f:
+    f.write("no links in this note")
+os.utime(os.path.join(gdir, "alpha.md"))  # content edit -> stale links
+ez.scan_delta(conn, [data, gdir], lambda p, c: None)
+assert ez.pending_link_count(conn, [gdir]) == 2, ez.pending_link_count(conn, [gdir])
+analyzed, remaining = ez.analyze_pending_links(conn, [gdir], time_budget=60)
+assert (analyzed, remaining) == (2, 0)
+g = ez.build_vault_graph(conn, gdir)
+assert sorted(n["name"] for n in g["nodes"]) == ["alpha", "beta", "empty", "gamma"]
+assert len(g["edges"]) == 2, g["edges"]
+assert g["analyzed"] == 4
 
 # --- structure graphs (no file reads) -----------------------------------------
 st = ez.build_structure_graph(conn, place=data)
@@ -222,16 +242,18 @@ win.go_back()
 wait_results(300)
 assert win.current_place is None, win.current_place
 
-# Graph tab: select the vault, switch to graph mode, interact with nodes
+# Graph tab: select the vault, switch to graph mode; links fill in after
+# the background analyzer runs (graph itself renders instantly from the index)
 for b in win._side_buttons:
     if getattr(b, "_vault", False):
         b.click()
         break
 wait_results(500)
 win.enter_graph_mode()
-wait_results(4000)
+wait_results(2000)
 assert win.view_mode == "graph"
-assert len(win.graph_view.nodes) == 3, len(win.graph_view.nodes)
+assert len(win.graph_view.nodes) == 4, len(win.graph_view.nodes)
+assert len(win.graph_view.edge_pairs) == 2, len(win.graph_view.edge_pairs)
 alpha = [n for n in win.graph_view.nodes if n.label == "alpha"][0]
 win.graph_view.select_node(alpha)
 wait_results(300)

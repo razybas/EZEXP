@@ -477,6 +477,13 @@ def _ensure_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
         CREATE INDEX IF NOT EXISTS idx_files_cat ON files(category);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS note_links(
+            parent TEXT NOT NULL,
+            name TEXT NOT NULL,
+            mtime REAL NOT NULL,
+            target TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_links_key ON note_links(parent, name);
     """)
     try:
         conn.execute(
@@ -551,12 +558,18 @@ def delete_tree(conn, path):
     """Remove an item (file or directory) and all descendants from the index."""
     if len(path) == 2 and path[1] == ":":
         ids = [r[0] for r in conn.execute("SELECT id FROM files WHERE drive=?", (path,))]
+        conn.execute("DELETE FROM note_links WHERE parent=? OR parent LIKE ? ESCAPE '#'",
+                     (path, like_escape(path) + "\\%"))
     else:
         parent, name = split_path(path)
         ids = [r[0] for r in conn.execute(
             "SELECT id FROM files WHERE parent=? OR parent LIKE ? ESCAPE '#'"
             " OR (parent=? AND name=?)",
             (path, like_escape(path) + "\\%", parent, name))]
+        conn.execute(
+            "DELETE FROM note_links WHERE (parent=? AND name=?) OR parent=?"
+            " OR parent LIKE ? ESCAPE '#'",
+            (parent, name, path, like_escape(path) + "\\%"))
     for i in range(0, len(ids), 900):
         chunk = ids[i:i + 900]
         fts_drop_ids(conn, chunk)
@@ -684,6 +697,7 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
         should_run = lambda: True
     if wipe:
         conn.execute("DELETE FROM files")
+        conn.execute("DELETE FROM note_links")
         rebuild_fts(conn)
         conn.commit()
     total = 0
@@ -896,17 +910,83 @@ def active_vault_for(place):
     return None
 
 
-def build_vault_graph(conn, vault, max_nodes=4000, max_read=512_000,
-                      time_budget=10.0, progress=None):
-    """Nodes = markdown notes in the vault; edges = resolved [[wikilinks]].
-    Pure function (no Qt) so it can run on a worker thread and be unit-tested.
-    Reading is time-budgeted (cloud-drive placeholders can be very slow) and
-    reports progress through the optional callback."""
-    vp = vault.rstrip("\\")
+def pending_link_count(conn, vaults):
+    """Markdown notes whose [[wikilinks]] have not been parsed yet (or whose
+    mtime changed since they were). Empty list → 0."""
+    vaults = [v.rstrip("\\") for v in (vaults or []) if v]
+    if not vaults:
+        return 0
+    cond_parts, args = [], []
+    for v in vaults:
+        cond_parts.append("(f.parent = ? COLLATE NOCASE OR f.parent LIKE ? ESCAPE '#')")
+        args += [v, like_escape(v) + "\\%"]
+    row = conn.execute(
+        "SELECT COUNT(*) FROM files f LEFT JOIN note_links l"
+        " ON l.parent = f.parent COLLATE NOCASE AND l.name = f.name COLLATE NOCASE"
+        " AND l.mtime = f.mtime"
+        " WHERE f.ext = 'md' AND l.name IS NULL AND (" + " OR ".join(cond_parts) + ")",
+        args).fetchone()
+    return row[0] if row else 0
+
+
+def analyze_pending_links(conn, vaults, time_budget=6.0, progress=None):
+    """Parse [[wikilinks]] out of not-yet-analyzed markdown notes and store
+    them in note_links. Runs at most time_budget seconds per call (cloud
+    placeholders can be slow); unchanged notes are never re-read. A note with
+    zero links gets an empty-target marker row so it is not re-read forever.
+    Returns (analyzed, still_pending)."""
+    vaults = [v.rstrip("\\") for v in (vaults or []) if v]
+    if not vaults:
+        return 0, 0
+    cond_parts, args = [], []
+    for v in vaults:
+        cond_parts.append("(f.parent = ? COLLATE NOCASE OR f.parent LIKE ? ESCAPE '#')")
+        args += [v, like_escape(v) + "\\%"]
     rows = conn.execute(
-        "SELECT parent, name FROM files WHERE (parent = ? COLLATE NOCASE"
-        " OR parent LIKE ? ESCAPE '#') AND ext = 'md'",
-        (vp, like_escape(vp) + "\\%")).fetchall()
+        "SELECT f.parent, f.name, f.mtime FROM files f LEFT JOIN note_links l"
+        " ON l.parent = f.parent COLLATE NOCASE AND l.name = f.name COLLATE NOCASE"
+        " AND l.mtime = f.mtime"
+        " WHERE f.ext = 'md' AND l.name IS NULL AND (" + " OR ".join(cond_parts) + ")",
+        args).fetchall()
+    remaining = len(rows)
+    t0 = time.time()
+    analyzed = 0
+    for parent, name, mtime in rows:
+        if time.time() - t0 > time_budget:
+            break
+        targets = []
+        try:
+            with open(join_path(parent, name), "rb") as f:
+                text = f.read(512_000).decode("utf-8", "replace")
+            targets = parse_wikilinks(text)
+        except OSError:
+            # unreadable right now (cloud placeholder etc.) — stays pending
+            if progress and analyzed % 25 == 0:
+                progress(analyzed, remaining)
+            continue
+        conn.execute("DELETE FROM note_links WHERE parent=? AND name=?", (parent, name))
+        conn.executemany(
+            "INSERT INTO note_links VALUES(?,?,?,?)",
+            [(parent, name, mtime, t) for t in targets] or [(parent, name, mtime, "")])
+        analyzed += 1
+        remaining -= 1
+        if progress and analyzed % 25 == 0:
+            progress(analyzed, remaining)
+    conn.commit()
+    return analyzed, remaining
+
+
+def build_vault_graph(conn, vault, max_nodes=4000):
+    """Nodes = markdown notes in the vault; edges = resolved [[wikilinks]].
+    Everything comes from the index (the note_links table filled by the
+    background analyzer) — no file reads, so opening the graph is instant
+    and the picture is complete once analysis has caught up."""
+    vp = vault.rstrip("\\")
+    scope = "(f.parent = ? COLLATE NOCASE OR f.parent LIKE ? ESCAPE '#')"
+    sargs = [vp, like_escape(vp) + "\\%"]
+    rows = conn.execute(
+        f"SELECT f.parent, f.name FROM files f WHERE {scope} AND f.ext = 'md'",
+        sargs).fetchall()
     total = len(rows)
     rows = rows[:max_nodes]
     nodes = []
@@ -919,12 +999,14 @@ def build_vault_graph(conn, vault, max_nodes=4000, max_read=512_000,
         })
 
     by_base, by_rel = {}, {}
+    file_index = {}
     for i, nd in enumerate(nodes):
         rel = os.path.relpath(nd["path"], vp)
         stem = rel[:-3] if rel.lower().endswith(".md") else rel
         by_base.setdefault(nd["name"].lower(), []).append(i)
         by_rel.setdefault(rel.lower(), []).append(i)
         by_rel.setdefault(stem.lower(), []).append(i)
+        file_index[(nd["parent"].lower(), nd["file"].lower())] = i
 
     def resolve(target, cur_parent):
         t = target.replace("/", "\\").strip().lower()
@@ -946,24 +1028,17 @@ def build_vault_graph(conn, vault, max_nodes=4000, max_read=512_000,
         return None
 
     edge_set = set()
-    t0 = time.time()
-    analyzed = 0
-    for i, nd in enumerate(nodes):
-        if progress and i % 40 == 0:
-            progress(f"Parsed {i}/{len(nodes)} notes…")
-        if time.time() - t0 > time_budget:
-            break  # never hang on slow/network drives; graph shows what we got
-        try:
-            with open(nd["path"], "rb") as f:
-                text = f.read(max_read).decode("utf-8", "replace")
-        except OSError:
-            analyzed += 1
+    link_rows = conn.execute(
+        "SELECT l.parent, l.name, l.target FROM note_links l JOIN files f"
+        " ON f.parent = l.parent COLLATE NOCASE AND f.name = l.name COLLATE NOCASE"
+        " WHERE l.target != '' AND f.ext = 'md' AND " + scope, sargs).fetchall()
+    for lparent, lname, ltarget in link_rows:
+        i = file_index.get((lparent.lower(), lname.lower()))
+        if i is None:
             continue
-        analyzed += 1
-        for t in parse_wikilinks(text):
-            j = resolve(t, nd["parent"])
-            if j is not None and j != i:
-                edge_set.add((min(i, j), max(i, j)))
+        j = resolve(ltarget, lparent)
+        if j is not None and j != i:
+            edge_set.add((min(i, j), max(i, j)))
     edges = sorted(edge_set)
     degree = [0] * len(nodes)
     for a, b in edges:
@@ -972,7 +1047,7 @@ def build_vault_graph(conn, vault, max_nodes=4000, max_read=512_000,
     for nd, d in zip(nodes, degree):
         nd["degree"] = d
     return {"nodes": nodes, "edges": edges, "total_md": total, "vault": vp,
-            "analyzed": analyzed}
+            "analyzed": total - pending_link_count(conn, [vp])}
 
 
 def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
@@ -2102,6 +2177,8 @@ class GraphView(QGraphicsView):
 class MainWindow(FramelessWindow):
     graph_ready = Signal(int, dict, object)
     graph_progress = Signal(int, str)
+    links_progress = Signal(int, int)
+    links_done = Signal()
 
     def __init__(self, worker: SearchWorker):
         super().__init__()
@@ -2110,6 +2187,8 @@ class MainWindow(FramelessWindow):
         self.worker.have.connect(self.on_results)
         self.graph_ready.connect(self.on_graph_ready)
         self.graph_progress.connect(self.on_graph_progress)
+        self.links_progress.connect(self.on_links_progress)
+        self.links_done.connect(self.on_links_done)
         self.view_seq = 0
         self.current_place = None
         self.current_place_name = "All Files"
@@ -2117,6 +2196,7 @@ class MainWindow(FramelessWindow):
         self.current_rows = []
         self.view_mode = "list"
         self._graph_seq = 0
+        self._analyzer_running = False
         self._indexer = None
 
         root = QVBoxLayout(self)
@@ -2466,6 +2546,7 @@ class MainWindow(FramelessWindow):
         self.empty_label.hide()
         self.graph_view.show()
         self.refresh_graph()
+        self.start_link_analyzer()
 
     def refresh_graph(self):
         """Scope follows the current view: a vault tab → its link graph;
@@ -2488,9 +2569,7 @@ class MainWindow(FramelessWindow):
     def _graph_job(self, seq, spec):
         try:
             if spec["mode"] == "links":
-                data = build_vault_graph(
-                    thread_conn(), spec["vault"],
-                    progress=lambda text: self.graph_progress.emit(seq, text))
+                data = build_vault_graph(thread_conn(), spec["vault"])
             else:
                 data = build_structure_graph(thread_conn(), spec.get("place"))
             data["mode"] = spec["mode"]
@@ -2501,6 +2580,49 @@ class MainWindow(FramelessWindow):
     def on_graph_progress(self, seq, text):
         if seq == self._graph_seq and self.view_mode == "graph":
             self.graph_view.show_message(text)
+
+    # ---- background link analyzer ---------------------------------------------
+    def start_link_analyzer(self):
+        """Parse [[wikilinks]] of not-yet-analyzed vault notes into the index.
+        Runs in the background in budgeted passes until every note is done;
+        unchanged notes are never re-read."""
+        if self._analyzer_running:
+            return
+        vaults = get_vaults()
+        if not vaults or pending_link_count(thread_conn(), vaults) == 0:
+            return
+        threading.Thread(target=self._analyzer_job, daemon=True).start()
+
+    def _analyzer_job(self):
+        self._analyzer_running = True
+        try:
+            conn = thread_conn()
+            vaults = get_vaults()
+            t0 = time.time()
+
+            def prog(done, remaining):
+                self.links_progress.emit(done, remaining)
+
+            while time.time() - t0 < 900:  # one kick never runs forever
+                analyzed, remaining = analyze_pending_links(
+                    conn, vaults, time_budget=6.0, progress=prog)
+                if remaining == 0:
+                    break
+                time.sleep(2.5)
+        finally:
+            self._analyzer_running = False
+            self.links_done.emit()
+
+    def on_links_progress(self, done, remaining):
+        if self.view_mode == "graph" and not self.graph_view.nodes:
+            self.graph_view.show_message(f"Analyzing vault links… {remaining} notes left")
+
+    def on_links_done(self):
+        if self.view_mode == "graph":
+            place = self.current_place
+            vault = active_vault_for(place) if place else None
+            if vault and place.rstrip("\\").lower() == vault.lower():
+                self.refresh_graph()
 
     def on_graph_ready(self, seq, spec, data):
         if seq != self._graph_seq or self.view_mode != "graph":
@@ -2684,6 +2806,11 @@ class MainWindow(FramelessWindow):
                     "UPDATE files SET parent = ? || substr(parent, ?) "
                     "WHERE parent LIKE ? ESCAPE '#'",
                     (new_path, len(old_path) + 1, like_escape(old_path) + "\\%"))
+                conn.execute(
+                    "DELETE FROM note_links WHERE parent=? OR parent LIKE ? ESCAPE '#'",
+                    (old_path, like_escape(old_path) + "\\%"))
+            conn.execute("DELETE FROM note_links WHERE parent=? AND name=?",
+                         (parent, row["name"]))
             conn.commit()
         except sqlite3.Error:
             pass
@@ -2757,6 +2884,7 @@ class MainWindow(FramelessWindow):
         self.refresh_view()
         if self.view_mode == "graph":
             self.refresh_graph()
+        self.start_link_analyzer()
 
 
 class ClickableLabel(QLabel):
