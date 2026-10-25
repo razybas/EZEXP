@@ -193,6 +193,14 @@ assert "(C:)" in st2["nodes"][0]["label"], st2["nodes"][0]["label"]
 # depth-capped: only the drive root is close enough to the temp data to show
 assert all(n["kind"] in ("drive", "folder") or n["parent_path"] == "C:" for n in st2["nodes"])
 
+# multi-drive view gets a single virtual "This PC" root connecting the drives
+st3 = ez.build_structure_graph(conn, None, roots=["C:", "D:"])
+assert st3["nodes"][0]["label"] == "This PC" and st3["nodes"][0]["kind"] == "drive"
+lab = {n["label"] for n in st3["nodes"]}
+assert any("(C:)" in l for l in lab) and any("(D:)" in l for l in lab), lab
+drive_edges = [(a, b) for a, b in st3["edges"] if st3["nodes"][a]["label"] == "This PC"]
+assert len(drive_edges) == 2, drive_edges
+
 # --- GUI smoke test ----------------------------------------------------------
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
@@ -262,7 +270,8 @@ win.enter_list_mode("all")
 wait_results(300)
 assert win.view_mode == "list" and not win.graph_view.isVisible()
 
-# a plain folder (inside the vault) gets a STRUCTURE graph: root + its files
+# a plain folder (inside the vault) gets a STRUCTURE graph: root + its files,
+# laid out as a static radial tree (no simulation running)
 sub_path = os.path.normpath(os.path.join(gdir, "sub"))
 win.drill_to_path(sub_path, "sub")
 win.enter_graph_mode()
@@ -270,6 +279,8 @@ wait_results(4000)
 assert win.view_mode == "graph"
 assert len(win.graph_view.nodes) == 2, [n.label for n in win.graph_view.nodes]
 assert {n.kind for n in win.graph_view.nodes} == {"folder", "file"}
+assert not win.graph_view._timer.isActive(), "structure graphs must be static"
+assert (win.graph_view.nodes[0].pos() - win.graph_view.nodes[1].pos()).manhattanLength() > 50
 win.enter_list_mode("all")
 wait_results(300)
 assert win.view_mode == "list" and not win.graph_view.isVisible()

@@ -1131,9 +1131,16 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
         if len(kept) >= budget:
             break
 
-    # nodes: roots, then kept dirs level by level (deterministic order)
+    # nodes: optional virtual root (multi-drive view), then roots, then kept dirs
     nodes = []
     idx_of = {}
+    virtual = None
+    if len(roots) > 1:
+        tot = sum(total.get(r.lower(), 0) for r in roots)
+        nodes.append({"label": "This PC", "kind": "drive", "weight": tot,
+                      "sub": f"{tot:,} items", "path": None,
+                      "parent_path": None, "file": None})
+        virtual = len(nodes) - 1
     for r in roots:
         rl = r.lower()
         if len(r) == 2:
@@ -1159,6 +1166,8 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
     edges = []
     for pl in idx_of:
         if pl in {r.lower() for r in roots}:
+            if virtual is not None:
+                edges.append((virtual, idx_of[pl]))
             continue
         anc = parent_of.get(pl)
         while anc is not None and anc not in idx_of:
@@ -1166,21 +1175,23 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
         if anc is not None:
             edges.append((idx_of[anc], idx_of[pl]))
 
-    # direct files of each root as leaf nodes
+    # direct files of each root as leaf nodes (suppressed on huge trees so
+    # drive-wide diagrams stay readable)
     truncated = False
-    for r in roots:
-        ri = idx_of[r.lower()]
-        rows = conn.execute(
-            "SELECT name, size FROM files WHERE parent = ? COLLATE NOCASE AND is_dir = 0"
-            " ORDER BY name COLLATE NOCASE LIMIT 250", (r,)).fetchall()
-        for name, size in rows:
-            idx = len(nodes)
-            nodes.append({"label": name, "kind": "file", "weight": size or 0,
-                          "sub": human_size(size), "path": join_path(r, name),
-                          "parent_path": r, "file": name})
-            edges.append((ri, idx))
-        if len(rows) == 250:
-            truncated = True
+    if len(order) <= 400:
+        for r in roots:
+            ri = idx_of[r.lower()]
+            rows = conn.execute(
+                "SELECT name, size FROM files WHERE parent = ? COLLATE NOCASE AND is_dir = 0"
+                " ORDER BY name COLLATE NOCASE LIMIT 250", (r,)).fetchall()
+            for name, size in rows:
+                idx = len(nodes)
+                nodes.append({"label": name, "kind": "file", "weight": size or 0,
+                              "sub": human_size(size), "path": join_path(r, name),
+                              "parent_path": r, "file": name})
+                edges.append((ri, idx))
+            if len(rows) == 250:
+                truncated = True
 
     return {"nodes": nodes, "edges": edges, "mode": "structure",
             "roots": roots, "truncated_files": truncated}
@@ -1804,6 +1815,7 @@ class GraphNode(QGraphicsObject):
         self.path = path
         self.kind = kind
         self.sub = sub
+        self.show_label = True
         self.state = 0      # 0 normal, 1 neighbor/hover, 2 selected, 3 dimmed
         self._hover = False
         self._dragging = False
@@ -1813,8 +1825,9 @@ class GraphNode(QGraphicsObject):
         self.setZValue(1)
 
     def boundingRect(self):
-        extra = 14 if self.sub else 0
-        return QRectF(-118, -self.radius - 6, 236, self.radius * 2 + 24 + extra)
+        show_text = self.show_label or self._hover or self.state == 2
+        extra = (14 if self.sub else 0) + (20 if show_text else 0)
+        return QRectF(-118, -self.radius - 6, 236, self.radius * 2 + 4 + extra)
 
     def paint(self, p, option, widget):
         st = self.state
@@ -1832,6 +1845,8 @@ class GraphNode(QGraphicsObject):
         p.setBrush(fill)
         p.setPen(QPen(border, 1.4))
         p.drawEllipse(QPointF(0, 0), self.radius, self.radius)
+        if not (self.show_label or self._hover or self.state == 2):
+            return
         fm = QFontMetrics(self.view.label_font)
         p.setPen(QPen(text, 1))
         p.drawText(QRectF(-110, self.radius + 3, 220, 14),
@@ -1871,7 +1886,7 @@ class GraphNode(QGraphicsObject):
         self.view.node_activated.emit(self)
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionHasChanged:
+        if change == QGraphicsItem.ItemPositionHasChanged and not self.view._simulating:
             self.view.update_edges_for(self.index)
         return super().itemChange(change, value)
 
@@ -1903,14 +1918,17 @@ class GraphView(QGraphicsView):
         self.edge_pairs = []
         self.vx = []
         self.vy = []
+        self.folder_of = []
         self.sel_index = None
+        self._mode = "links"
+        self._simulating = False
         self._zoom = 1.0
         self._settle = 0
         self._fitted = False
         self._pan_from = None
         self._msg = None
         self._timer = QTimer(self)
-        self._timer.setInterval(30)
+        self._timer.setInterval(35)
         self._timer.timeout.connect(self._tick)
 
     # -- data ----------------------------------------------------------------
@@ -1921,9 +1939,11 @@ class GraphView(QGraphicsView):
         self.edge_pairs = []
         self.vx = []
         self.vy = []
+        self.folder_of = []
         self.sel_index = None
         self._fitted = False
         self._settle = 0
+        self._simulating = False
         self.scene().clear()
         if self._msg is not None:
             self._msg.deleteLater()
@@ -1949,13 +1969,15 @@ class GraphView(QGraphicsView):
     def set_graph(self, data):
         self.clear_graph()
         nodes, edges = data["nodes"], data["edges"]
-        mode = data.get("mode", "links")
+        self._mode = data.get("mode", "links")
         if not nodes:
             self.show_message("Nothing to graph here yet.")
             return
         scene = self.scene()
+        small = len(nodes) <= 120
+        groups = {}
         for i, nd in enumerate(nodes):
-            if mode == "structure":
+            if self._mode == "structure":
                 if nd.get("kind") == "drive":
                     r = 15.0
                 elif nd.get("kind") == "file":
@@ -1968,13 +1990,19 @@ class GraphView(QGraphicsView):
                              nd.get("parent_path") or nd.get("parent"),
                              nd.get("file"), nd.get("path"),
                              nd.get("kind", "note"), nd.get("sub"))
-            ang = i * 2.39996          # golden-angle spiral start
-            rad = 30.0 * ((i + 1) ** 0.62)
-            item.setPos(rad * math.cos(ang), rad * math.sin(ang))
+            if self._mode == "structure":
+                item.show_label = small or nd.get("kind") in ("drive", "folder")
+            else:
+                item.show_label = small or nd.get("degree", 0) >= 3
+            item.setToolTip((nd.get("label") or nd.get("name", ""))
+                            + (("\n" + nd["sub"]) if nd.get("sub") else ""))
             scene.addItem(item)
             self.nodes.append(item)
             self.vx.append(0.0)
             self.vy.append(0.0)
+            self.folder_of.append(
+                (nd.get("parent_path") or nd.get("parent") or "").lower()
+                if self._mode == "links" else "")
         pen = QPen(QColor("#e3e5e8"), 1.4)
         for a, b in edges:
             li = QGraphicsLineItem(0, 0, 0, 0)
@@ -1984,7 +2012,87 @@ class GraphView(QGraphicsView):
             self.edge_items.append((li, a, b))
             self.edge_pairs.append((a, b))
         self.apply_highlights()
-        self.kick()
+        if self._mode == "structure":
+            self._apply_radial_layout()   # static, deterministic, zero lag
+        else:
+            self._cluster_init()          # start notes near their folder group
+            self.kick()
+
+    def _cluster_init(self):
+        """Place notes near their folder's group centre so the link graph
+        forms communities instead of one hairball."""
+        groups = {}
+        for i, key in enumerate(self.folder_of):
+            groups.setdefault(key, []).append(i)
+        for gi, key in enumerate(sorted(groups.keys())):
+            ga = gi * 2.39996
+            gr = 70.0 * ((gi + 1) ** 0.6)
+            cx, cy = gr * math.cos(ga), gr * math.sin(ga)
+            for k, i in enumerate(groups[key]):
+                a2 = k * 2.39996
+                rr = 26.0 * ((k + 1) ** 0.5)
+                self.nodes[i].setPos(cx + rr * math.cos(a2), cy + rr * math.sin(a2))
+
+    def _apply_radial_layout(self):
+        """Deterministic radial tidy-tree: the place at the centre, its
+        sub-branches fanning out clockwise in A→Z order, ring radius by
+        depth, angular width by subtree size. No simulation involved."""
+        children = {}
+        has_parent = set()
+        for a, b in self.edge_pairs:
+            children.setdefault(a, []).append(b)
+            has_parent.add(b)
+        roots_idx = [i for i in range(len(self.nodes)) if i not in has_parent]
+        if not roots_idx:
+            return
+        depth_of = {}
+        post = []
+        visited = set()
+        stack = [(r, 0, False) for r in reversed(roots_idx)]
+        while stack:
+            node, depth, done = stack.pop()
+            if done:
+                post.append(node)
+                continue
+            if node in visited:
+                continue
+            visited.add(node)
+            depth_of[node] = depth
+            stack.append((node, depth, True))
+            for c in children.get(node, []):
+                if c not in visited:
+                    stack.append((c, depth + 1, False))
+        disp_leaf = [1] * len(self.nodes)
+        for node in post:  # children already accumulated
+            kids = children.get(node)
+            if kids:
+                disp_leaf[node] = sum(disp_leaf[c] for c in kids)
+        total_leaves = max(1, sum(disp_leaf[r] for r in roots_idx))
+        max_depth = max(1, max(depth_of.values()))
+        ring = min(9000.0, max(320.0, total_leaves * 30.0 / (2 * math.pi)))
+
+        def assign(idxs, a0, a1, depth):
+            total = sum(disp_leaf[i] for i in idxs)
+            ang = a0
+            for i in sorted(idxs, key=lambda x: self.nodes[x].label.lower()):
+                w = (a1 - a0) * disp_leaf[i] / total
+                mid = ang + w / 2
+                rad = ring * depth / max_depth
+                self.nodes[i].setPos(rad * math.cos(mid), rad * math.sin(mid))
+                self.nodes[i].show_label = (small_global or depth <= 2
+                                            or self.nodes[i].kind == "drive")
+                kids = children.get(i)
+                if kids:
+                    assign(kids, ang, ang + w, depth + 1)
+                ang += w
+
+        small_global = len(self.nodes) <= 120
+        assign(roots_idx, 0.0, 2 * math.pi, 0)
+        for li, a, b in self.edge_items:
+            self._update_line(li, a, b)
+        self.nodes[roots_idx[0]].show_label = True
+        self._fitted = True
+        self.fit_view()
 
     def select_node(self, node):
         self.sel_index = None if node.index == self.sel_index else node.index
@@ -2088,8 +2196,28 @@ class GraphView(QGraphicsView):
             fy[a] += uy * f
             fx[b] -= ux * f
             fy[b] -= uy * f
+        # mild pull toward each folder's centroid → visible communities
+        if self._mode == "links" and self.folder_of:
+            cen, cnt = {}, {}
+            for i in range(n):
+                k = self.folder_of[i]
+                if k:
+                    c = cen.get(k)
+                    if c is None:
+                        cen[k] = [xs[i], ys[i]]
+                        cnt[k] = 1
+                    else:
+                        c[0] += xs[i]
+                        c[1] += ys[i]
+                        cnt[k] += 1
+            for i in range(n):
+                k = self.folder_of[i]
+                if k and cnt[k] > 1:
+                    fx[i] += (cen[k][0] / cnt[k] - xs[i]) * 0.012
+                    fy[i] += (cen[k][1] / cnt[k] - ys[i]) * 0.012
         moved = 0.0
-        damp, maxv = 0.82, 13.0
+        damp, maxv = 0.80, 11.0
+        self._simulating = True
         for i in range(n):
             fx[i] += -xs[i] * 0.0016
             fy[i] += -ys[i] * 0.0016
@@ -2104,11 +2232,12 @@ class GraphView(QGraphicsView):
             self.vx[i], self.vy[i] = vx, vy
             items[i].setPos(xs[i] + vx, ys[i] + vy)
             moved += abs(vx) + abs(vy)
+        self._simulating = False
         for li, a, b in self.edge_items:
             self._update_line(li, a, b)
-        if moved / max(1, n) < 0.12:
+        if moved / max(1, n) < 0.15:
             self._settle += 1
-            if self._settle > 25:
+            if self._settle > 18:
                 self._timer.stop()
                 if not self._fitted:
                     self._fitted = True
@@ -2166,7 +2295,10 @@ class GraphView(QGraphicsView):
             return
         menu = QMenu(self)
         menu.addAction("Fit to view", self.fit_view)
-        menu.addAction("Re-run layout", self.kick)
+        if self._mode == "links":
+            menu.addAction("Re-run layout", self.kick)
+        else:
+            menu.addAction("Reapply radial layout", self._apply_radial_layout)
         menu.exec(e.globalPos())
 
 
