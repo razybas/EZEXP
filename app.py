@@ -986,10 +986,11 @@ def analyze_pending_links(conn, vaults, time_budget=6.0, progress=None):
 
 
 def build_vault_graph(conn, vault, max_nodes=4000):
-    """Nodes = markdown notes in the vault; edges = resolved [[wikilinks]].
-    Everything comes from the index (the note_links table filled by the
-    background analyzer) — no file reads, so opening the graph is instant
-    and the picture is complete once analysis has caught up."""
+    """Obsidian-style graph with progressive disclosure: the displayed tree
+    is the vault root + its top-level folders (bubbles, sized by note count)
+    + notes that live at the root; deeper folders/notes arrive on demand via
+    the child provider. link_edges holds resolved [src_path, dst_path] note
+    links from the note_links table — no file reads, instant."""
     vp = vault.rstrip("\\")
     scope = "(f.parent = ? COLLATE NOCASE OR f.parent LIKE ? ESCAPE '#')"
     sargs = [vp, like_escape(vp) + "\\%"]
@@ -1008,14 +1009,16 @@ def build_vault_graph(conn, vault, max_nodes=4000):
         })
 
     by_base, by_rel = {}, {}
-    file_index = {}
-    for i, nd in enumerate(nodes):
-        rel = os.path.relpath(nd["path"], vp)
-        stem = rel[:-3] if rel.lower().endswith(".md") else rel
-        by_base.setdefault(nd["name"].lower(), []).append(i)
+    note_paths = []
+    for i, (parent, name) in enumerate(rows):
+        path = join_path(parent, name)
+        note_paths.append(path)
+        stem = name[:-3] if name.lower().endswith(".md") else name
+        by_base.setdefault(stem.lower(), []).append(i)
+        rel = os.path.relpath(path, vp)
+        rstem = rel[:-3] if rel.lower().endswith(".md") else rel
         by_rel.setdefault(rel.lower(), []).append(i)
-        by_rel.setdefault(stem.lower(), []).append(i)
-        file_index[(nd["parent"].lower(), nd["file"].lower())] = i
+        by_rel.setdefault(rstem.lower(), []).append(i)
 
     def resolve(target, cur_parent):
         t = target.replace("/", "\\").strip().lower()
@@ -1025,37 +1028,69 @@ def build_vault_graph(conn, vault, max_nodes=4000):
             lst = by_rel.get(key)
             if lst:
                 for i in lst:  # same-folder notes win on ambiguous names
-                    if nodes[i]["parent"].lower() == cur_parent.lower():
+                    if note_paths[i].rsplit("\\", 1)[0].lower() == cur_parent.lower():
                         return i
                 return lst[0]
         lst = by_base.get(t)
         if lst:
             for i in lst:
-                if nodes[i]["parent"].lower() == cur_parent.lower():
+                if note_paths[i].rsplit("\\", 1)[0].lower() == cur_parent.lower():
                     return i
             return lst[0]
         return None
 
-    edge_set = set()
+    link_edges = []
+    seen = set()
     link_rows = conn.execute(
         "SELECT l.parent, l.name, l.target FROM note_links l JOIN files f"
         " ON f.parent = l.parent COLLATE NOCASE AND f.name = l.name COLLATE NOCASE"
         " WHERE l.target != '' AND f.ext = 'md' AND " + scope, sargs).fetchall()
     for lparent, lname, ltarget in link_rows:
-        i = file_index.get((lparent.lower(), lname.lower()))
-        if i is None:
-            continue
+        sp = join_path(lparent, lname).lower()
         j = resolve(ltarget, lparent)
-        if j is not None and j != i:
-            edge_set.add((min(i, j), max(i, j)))
-    edges = sorted(edge_set)
-    degree = [0] * len(nodes)
-    for a, b in edges:
-        degree[a] += 1
-        degree[b] += 1
-    for nd, d in zip(nodes, degree):
-        nd["degree"] = d
-    return {"nodes": nodes, "edges": edges, "total_md": total, "vault": vp,
+        if j is None:
+            continue
+        dp = note_paths[j].lower()
+        if sp == dp:
+            continue
+        key = tuple(sorted((sp, dp)))
+        if key in seen:
+            continue
+        seen.add(key)
+        link_edges.append([sp, dp])
+    degree = {}
+    for a, b in link_edges:
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+
+    # displayed tree: vault root + top-level folder bubbles + root notes
+    nodes = [{"label": vp.rsplit("\\", 1)[-1] or vp, "kind": "folder",
+              "weight": total, "sub": f"{total:,} notes", "path": vp,
+              "parent_path": None, "file": None, "has_children": True}]
+    edges = []
+    root_idx = 0
+    for (name,) in conn.execute(
+            "SELECT name FROM files WHERE parent = ? COLLATE NOCASE AND is_dir = 1"
+            " ORDER BY name COLLATE NOCASE", (vp,)).fetchall():
+        full = join_path(vp, name)
+        fl = full.lower()
+        n = sum(1 for p in note_paths if p.lower().startswith(fl + "\\"))
+        nodes.append({"label": name, "kind": "folder", "weight": n,
+                      "sub": f"{n:,} notes", "path": full, "parent_path": vp,
+                      "file": name, "has_children": n > 0})
+        edges.append([root_idx, len(nodes) - 1])
+    for parent, name in rows:
+        if parent.lower() != vp.lower():
+            continue
+        stem = name[:-3] if name.lower().endswith(".md") else name
+        p = join_path(parent, name)
+        d = degree.get(p.lower(), 0)
+        nodes.append({"label": stem, "kind": "note", "weight": d,
+                      "sub": f"{d} links" if d else None, "path": p,
+                      "parent_path": vp, "file": name, "has_children": False})
+        edges.append([root_idx, len(nodes) - 1])
+    return {"nodes": nodes, "edges": edges, "mode": "vault",
+            "link_edges": link_edges, "total_md": total, "vault": vp,
             "analyzed": total - pending_link_count(conn, [vp])}
 
 
@@ -1953,6 +1988,8 @@ class GraphView(QGraphicsView):
         self._parent_of_data = {}
         self._data_key = {}          # (parent_lower, file_lower) -> node idx
         self._roots_idx = []
+        self._link_src_dst = []      # vault mode: resolved note-link paths
+        self._link_lines = []        # vault mode: (line_item, a_idx, b_idx)
         self._zoom = 1.0
         self._settle = 0
         self._fitted = False
@@ -1985,6 +2022,8 @@ class GraphView(QGraphicsView):
         self._parent_of_data = {}
         self._data_key = {}
         self._roots_idx = []
+        self._link_src_dst = []
+        self._link_lines = []
         self.scene().clear()
         if self._msg is not None:
             self._msg.deleteLater()
@@ -2015,7 +2054,7 @@ class GraphView(QGraphicsView):
             self.show_message("Nothing to graph here yet.")
             return
         scene = self.scene()
-        if self._mode == "structure":
+        if self._mode in ("structure", "vault"):
             self._data_nodes = [dict(nd) for nd in nodes]
             incoming = set()
             for a, b in edges:
@@ -2033,7 +2072,11 @@ class GraphView(QGraphicsView):
                     visible.add(c)
             for i in sorted(visible):
                 self._add_visible(i, self._parent_of_data.get(i))
+            self._link_src_dst = [(a.lower(), b.lower())
+                                  for a, b in data.get("link_edges", [])] \
+                if self._mode == "vault" else []
             self._apply_radial_layout()
+            self._recompute_link_lines()
             return
         small = len(nodes) <= 120
         for i, nd in enumerate(nodes):
@@ -2094,11 +2137,24 @@ class GraphView(QGraphicsView):
         """Reveal the direct children of this node — from the built data when
         available, otherwise fetched live from the index, so any depth of any
         drive can be explored."""
-        if self._mode != "structure":
+        if self._mode not in ("structure", "vault"):
             return
         parent_path = self._data_nodes[idx].get("path")
         if parent_path and self.child_provider:
             for nd in self.child_provider(parent_path):
+                if self._mode == "vault":
+                    # the link graph only shows folders and markdown notes
+                    if nd.get("kind") == "file":
+                        fn = (nd.get("file") or "").lower()
+                        if not fn.endswith(".md"):
+                            continue
+                        stem = nd["file"][:-3] if fn.endswith(".md") else nd["file"]
+                        nd = dict(nd)
+                        nd["kind"] = "note"
+                        nd["label"] = stem
+                        nd["weight"] = 0
+                        nd["sub"] = None
+                        nd["has_children"] = False
                 key = ((nd.get("parent_path") or "").lower(),
                        (nd.get("file") or "").lower())
                 if key in self._data_key:
@@ -2121,7 +2177,7 @@ class GraphView(QGraphicsView):
             self._apply_radial_layout()
 
     def collapse_node(self, idx):
-        if self._mode != "structure":
+        if self._mode not in ("structure", "vault"):
             return
 
         def rm(i):
@@ -2147,11 +2203,61 @@ class GraphView(QGraphicsView):
             item.update()
         self._apply_radial_layout()
 
+    def _recompute_link_lines(self):
+        """Vault mode: draw one line per resolved note link. Both endpoints
+        visible → note-to-note; a hidden endpoint attaches to its nearest
+        visible ancestor bubble, so collapsed folders still show their
+        connections."""
+        scene = self.scene()
+        for li, a, b in self._link_lines:
+            scene.removeItem(li)
+        self._link_lines = []
+        if self._mode != "vault":
+            return
+        vis = {}
+        for i in self._visible:
+            p = (self._data_nodes[i].get("path") or "").lower()
+            if p:
+                vis[p] = i
+
+        def endpoint(pl):
+            while pl:
+                if pl in vis:
+                    return vis[pl]
+                if "\\" not in pl:
+                    break
+                pl = pl.rsplit("\\", 1)[0]
+            return None
+
+        pairs = set()
+        deg = {}
+        for s, d in self._link_src_dst:
+            a = endpoint(s)
+            b = endpoint(d)
+            if a is None or b is None or a == b:
+                continue
+            key = (min(a, b), max(a, b))
+            if key in pairs:
+                continue
+            pairs.add(key)
+            deg[a] = deg.get(a, 0) + 1
+            deg[b] = deg.get(b, 0) + 1
+        for a, b in sorted(pairs):
+            li = QGraphicsLineItem(0, 0, 0, 0)
+            li.setPen(QPen(QColor("#c3b8e2"), 1.2))
+            li.setZValue(0)
+            scene.addItem(li)
+            self._link_lines.append((li, a, b))
+            self._update_line(li, a, b)
+        for i, it in self._items.items():
+            if it.kind == "note" and deg.get(i, 0) >= 3:
+                it.show_label = True
+
     def _apply_radial_layout(self):
         """Deterministic radial tidy-tree over the visible nodes: centre root,
         branches clockwise A→Z, ring radius by depth, angular width by subtree
         size. No simulation involved."""
-        if self._mode != "structure" or not self._items:
+        if self._mode not in ("structure", "vault") or not self._items:
             return
         children = {i: list(c) for i, c in self._tree_children.items() if c}
         roots_idx = [i for i in self._visible if i not in self._edge_lines]
@@ -2224,14 +2330,18 @@ class GraphView(QGraphicsView):
         self.sel_index = None if node.index == self.sel_index else node.index
         self.apply_highlights()
         self.node_clicked.emit(node if self.sel_index is not None else None)
-        if self._mode == "structure" and self.sel_index is not None and node.can_expand:
+        if self._mode in ("structure", "vault") and self.sel_index is not None \
+                and node.can_expand:
             self.expand_node(node.index)
 
     def apply_highlights(self):
         pen_norm = QPen(QColor("#e3e5e8"), 1.4)
         pen_hot = QPen(QColor("#a7adb4"), 2.0)
         pen_dim = QPen(QColor("#f0f1f4"), 1.2)
-        if self._mode == "structure":
+        if self._mode in ("structure", "vault"):
+            link_norm = QPen(QColor("#c3b8e2"), 1.2)
+            link_hot = QPen(QColor("#8b5cf6"), 2.0)
+            link_dim = QPen(QColor("#eeeaf6"), 1.0)
             neigh = set()
             if self.sel_index is not None:
                 neigh.update(self._tree_children.get(self.sel_index, []))
@@ -2255,6 +2365,13 @@ class GraphView(QGraphicsView):
                     li.setPen(pen_hot)
                 else:
                     li.setPen(pen_dim)
+            for li, a, b in self._link_lines:
+                if self.sel_index is None:
+                    li.setPen(link_norm)
+                elif a == self.sel_index or b == self.sel_index:
+                    li.setPen(link_hot)
+                else:
+                    li.setPen(link_dim)
             return
         neigh = set()
         if self.sel_index is not None:
@@ -2291,7 +2408,7 @@ class GraphView(QGraphicsView):
             self._timer.start()
 
     def update_edges_for(self, idx):
-        if self._mode == "structure":
+        if self._mode in ("structure", "vault"):
             li = self._edge_lines.get(idx)
             if li is not None:
                 self._update_line(li, self._parent_of[idx], idx)
@@ -2301,7 +2418,7 @@ class GraphView(QGraphicsView):
                 self._update_line(li, a, b)
 
     def _update_line(self, li, a, b):
-        if self._mode == "structure":
+        if self._mode in ("structure", "vault"):
             pa = self._items[a].pos()
             pb = self._items[b].pos()
         else:
@@ -2855,7 +2972,7 @@ class MainWindow(FramelessWindow):
         if is_vault_root:
             self.graph_view.show_message(
                 f"Building link graph of “{os.path.basename(vault)}”…")
-            spec = {"mode": "links", "vault": vault}
+            spec = {"mode": "vault", "vault": vault}
         else:
             self.graph_view.show_message("Building structure graph from the index…")
             spec = {"mode": "structure", "place": place}
@@ -2863,7 +2980,7 @@ class MainWindow(FramelessWindow):
 
     def _graph_job(self, seq, spec):
         try:
-            if spec["mode"] == "links":
+            if spec["mode"] in ("links", "vault"):
                 data = build_vault_graph(thread_conn(), spec["vault"])
             else:
                 data = build_structure_graph(thread_conn(), spec.get("place"))
@@ -2938,9 +3055,9 @@ class MainWindow(FramelessWindow):
             v = spec["vault"]
             analyzed = data.get("analyzed", data["total_md"])
             ann = "" if analyzed >= data["total_md"] else \
-                f" · analyzed {analyzed}/{data['total_md']} notes (time-limited)"
+                f" · analyzing {analyzed}/{data['total_md']} notes (completes in background)"
             self.status_left.setText(
-                f"{len(data['nodes'])} notes · {len(data['edges'])} links · "
+                f"{data['total_md']} notes · {len(data.get('link_edges', []))} links · "
                 f"{os.path.basename(v)}{ann}")
 
     def on_node_clicked(self, node):
@@ -2996,7 +3113,7 @@ class MainWindow(FramelessWindow):
     def show_node_menu(self, node, gpos):
         menu = QMenu(self)
         gv = self.graph_view
-        if gv._mode == "structure":
+        if gv._mode in ("structure", "vault"):
             if node.can_expand:
                 menu.addAction("Expand", lambda: gv.expand_node(node.index))
             if gv._tree_children.get(node.index):

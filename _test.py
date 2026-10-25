@@ -167,10 +167,13 @@ analyzed, remaining = ez.analyze_pending_links(conn, [gdir], time_budget=60)
 assert (analyzed, remaining) == (3, 0), (analyzed, remaining)
 assert ez.pending_link_count(conn, [gdir]) == 0
 g = ez.build_vault_graph(conn, gdir)
-assert sorted(n["name"] for n in g["nodes"]) == ["alpha", "beta", "gamma"], g["nodes"]
-assert len(g["edges"]) == 2, g["edges"]
-degs = {n["name"]: n["degree"] for n in g["nodes"]}
-assert degs == {"alpha": 2, "beta": 1, "gamma": 1}, degs
+assert g["mode"] == "vault"
+labels = {n["label"] for n in g["nodes"]}
+assert {"gvault", "sub", "alpha", "beta"} <= labels, labels
+le = [(a.lower(), b.lower()) for a, b in g["link_edges"]]
+assert len(le) == 2, le
+assert all(a.endswith("alpha.md") for a, b in le), le
+assert sorted(b.rsplit("\\", 1)[-1] for a, b in le) == ["beta.md", "gamma.md"]
 assert g["analyzed"] == 3
 
 # incremental: a new note and an edited note become pending; unchanged never re-read
@@ -182,8 +185,9 @@ assert ez.pending_link_count(conn, [gdir]) == 2, ez.pending_link_count(conn, [gd
 analyzed, remaining = ez.analyze_pending_links(conn, [gdir], time_budget=60)
 assert (analyzed, remaining) == (2, 0)
 g = ez.build_vault_graph(conn, gdir)
-assert sorted(n["name"] for n in g["nodes"]) == ["alpha", "beta", "empty", "gamma"]
-assert len(g["edges"]) == 2, g["edges"]
+labels = {n["label"] for n in g["nodes"]}
+assert "empty" in labels and "gamma" not in labels, labels
+assert len(g["link_edges"]) == 2, g["link_edges"]
 assert g["analyzed"] == 4
 
 # --- structure graphs (no file reads) -----------------------------------------
@@ -278,12 +282,19 @@ wait_results(500)
 win.enter_graph_mode()
 wait_results(2000)
 assert win.view_mode == "graph"
-assert len(win.graph_view.nodes) == 4, len(win.graph_view.nodes)
-assert len(win.graph_view.edge_pairs) == 2, len(win.graph_view.edge_pairs)
-alpha = [n for n in win.graph_view.nodes if n.label == "alpha"][0]
+assert len(win.graph_view._items) == 5, list(win.graph_view._items)
+assert len(win.graph_view._link_lines) == 2, len(win.graph_view._link_lines)
+alpha = [it for it in win.graph_view._items.values() if it.label == "alpha"][0]
 win.graph_view.select_node(alpha)
 wait_results(300)
 assert "alpha" in win.details.name_label.text().lower()
+# burst the sub bubble: gamma appears, its bubble link becomes a direct note link
+sub_idx = [i for i, it in win.graph_view._items.items() if it.label == "sub"][0]
+assert win.graph_view._items[sub_idx].can_expand
+win.graph_view.expand_node(sub_idx)
+wait_results(300)
+assert len(win.graph_view._items) == 6, len(win.graph_view._items)
+assert len(win.graph_view._link_lines) == 2, len(win.graph_view._link_lines)
 win.enter_list_mode("all")
 wait_results(300)
 assert win.view_mode == "list" and not win.graph_view.isVisible()

@@ -51,10 +51,14 @@ its own data folder. Works the same on any PC it's run on.
     (press a folder in Pictures and every picture appears as a node).
   - **A drive or any folder** → that place's own tree, same expand-by-click
     behaviour.
-  - **A vault selected in the sidebar** → the Obsidian-style link graph of
-    that vault: one node per note, one line per resolved `[[wikilink]]`,
-    clustered by folder. Link data is parsed once in the background (right
-    after the index builds) and kept incrementally up to date afterwards.
+  - **A vault selected in the sidebar** → the Obsidian-style link graph with
+    the same progressive disclosure: the vault and its top-level folders
+    appear as bubbles sized by note count, and clicking a bubble bursts it
+    into its sub-folders and notes. Resolved `[[wikilinks]]` are drawn
+    between visible notes; while a folder is collapsed, its notes' links
+    attach to the bubble so no connection is ever lost. Link data is parsed
+    once in the background (right after the index builds) and kept
+    incrementally up to date afterwards.
   Everything is read straight from the index, so expanding is instant at any
   depth and the layout re-sorts itself into a clean radial tree (branches
   clockwise A→Z, ring radius by depth, size by item count) after every
