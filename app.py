@@ -1498,6 +1498,63 @@ def app_icon(size=18):
     return icon
 
 
+def resolve_lnk_target(path):
+    """Target path of a .lnk shortcut via IShellLink (ctypes COM, same
+    style as shell_thumbnail). None when unresolvable."""
+    from ctypes import byref, c_long, c_ubyte, c_ulong, c_ushort, c_void_p, \
+        c_wchar_p, create_unicode_buffer
+    if not path or not path.lower().endswith(".lnk"):
+        return None
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", c_ulong), ("Data2", c_ushort),
+                    ("Data3", c_ushort), ("Data4", c_ubyte * 8)]
+
+    def guid(a):
+        return GUID(a, 0, 0, (c_ubyte * 8)(0xC0, 0, 0, 0, 0, 0, 0, 0x46))
+
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitializeEx(None, 0)
+    link = c_void_p()
+    persist = c_void_p()
+    try:
+        hr = ole32.CoCreateInstance(byref(guid(0x00021401)), None, 1,
+                                    byref(guid(0x000214F9)), byref(link))
+        if hr != 0 or not link:
+            return None
+        vtbl = ctypes.cast(
+            link, ctypes.POINTER(ctypes.POINTER(c_void_p))).contents
+        qi = ctypes.WINFUNCTYPE(
+            c_long, c_void_p, c_void_p,
+            ctypes.POINTER(c_void_p))(vtbl[0])
+        if qi(link, byref(guid(0x0000010B)),
+              byref(persist)) != 0 or not persist:
+            return None
+        pvtbl = ctypes.cast(
+            persist, ctypes.POINTER(ctypes.POINTER(c_void_p))).contents
+        load = ctypes.WINFUNCTYPE(
+            c_long, c_void_p, c_wchar_p, c_ulong)(pvtbl[5])
+        if load(persist, path, 0) != 0:
+            return None
+        getpath = ctypes.WINFUNCTYPE(
+            c_long, c_void_p, c_wchar_p, c_long,
+            c_void_p, c_ulong)(vtbl[3])
+        buf = create_unicode_buffer(32768)
+        if getpath(link, buf, 32768, None, 0) != 0 or not buf.value:
+            return None
+        return buf.value
+    except Exception:
+        return None
+    finally:
+        for ptr in (persist, link):
+            if ptr:
+                vt = ctypes.cast(
+                    ptr, ctypes.POINTER(
+                        ctypes.POINTER(c_void_p))).contents
+                ctypes.WINFUNCTYPE(c_ulong, c_void_p)(vt[2])(ptr)
+        ole32.CoUninitialize()
+
+
 _icon_provider = None
 
 
@@ -3005,9 +3062,18 @@ class MainWindow(FramelessWindow):
     # ---- quick launch ---------------------------------------------------------
     def select_app(self, path, btn):
         folder = os.path.dirname(path)
-        if (self.view_mode == "list" and folder
-                and os.path.normcase(folder)
-                != os.path.normcase(self.current_place or "")):
+        if folder and path.lower().endswith(".lnk"):
+            # the shortcut sits on the Desktop / in the Start Menu, but
+            # the app's root folder is its TARGET's folder
+            target = resolve_lnk_target(path)
+            if target:
+                folder = os.path.dirname(target) or folder
+        if folder:
+            # ALWAYS open the folder: current_place may already equal it
+            # while the list shows search/category results instead of the
+            # folder's contents, and in graph mode nothing would open.
+            if self.view_mode != "list" or self.current_cat != "all":
+                self.enter_list_mode("all")
             self.drill_to_path(folder,
                                os.path.basename(folder) or folder)
         self._ql_selected = path

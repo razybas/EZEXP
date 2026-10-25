@@ -4,6 +4,7 @@ import sys
 import time
 import tempfile
 import shutil
+import subprocess
 
 tmp = tempfile.mkdtemp(prefix="ezexp_test_")
 os.environ["EZEXP_DB_DIR"] = os.path.join(tmp, "db")
@@ -352,7 +353,7 @@ assert not win.empty_label.isHidden()
 # --- quick launch -------------------------------------------------------------
 fake_app = os.path.join(data, "fake_app.exe")
 with open(fake_app, "wb") as f:
-    f.write(b"MZ" + b"\x00" * 100)
+    f.write(b"x")
 
 ez.set_quicklaunch([fake_app])
 assert ez.get_quicklaunch() == [os.path.normpath(fake_app)]
@@ -415,6 +416,42 @@ assert "fake_app" in win.details.name_label.text().lower()
 assert not ql_btn.icon().isNull()
 assert not win.details.icon_label.pixmap().isNull()
 win.remove_quicklaunch(fake_app)
+
+# press must open the folder even when already "in" it behind a search
+win.titlebar.search.edit.setText("alpha")
+wait_results(500)
+win.select_app(fake_app, ql_btn)
+wait_results(500)
+assert win.titlebar.search.edit.text() == ""
+assert win.current_place == os.path.dirname(fake_app)
+assert win.tree.topLevelItemCount() >= 3, win.tree.topLevelItemCount()
+# and from graph mode: press returns to the list with the folder open
+win.enter_graph_mode()
+wait_results(500)
+assert win.view_mode == "graph"
+win.select_app(fake_app, ql_btn)
+wait_results(500)
+assert win.view_mode == "list"
+assert win.current_place == os.path.dirname(fake_app)
+assert win._ql_selected == fake_app
+# a .lnk press opens the TARGET's folder, not the shortcut's folder
+desk = os.path.join(data, "Desktop")
+os.makedirs(desk, exist_ok=True)
+lnk = os.path.join(desk, "fake_app.lnk")
+ps = ("$s=(New-Object -COM WScript.Shell).CreateShortcut('%s');"
+      "$s.TargetPath='%s';$s.Save()") % (lnk, fake_app)
+subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+               check=True, capture_output=True)
+assert os.path.isfile(lnk)
+assert os.path.normpath(ez.resolve_lnk_target(lnk)) \
+    == os.path.normpath(fake_app)
+ez.set_quicklaunch([lnk])
+win._build_sidebar()
+wait_results(300)
+win.select_app(lnk, win._ql_buttons[0])
+wait_results(500)
+assert win.current_place == os.path.dirname(fake_app), win.current_place
+win.remove_quicklaunch(lnk)
 
 worker.stop()
 worker.wait(3000)
