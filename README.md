@@ -8,6 +8,30 @@ digging through folders.
 The exe is fully portable: no installer, no admin rights, nothing outside
 its own data folder. Works the same on any PC it's run on.
 
+## Sharing EzExp with a friend
+
+Send them `ezexp.exe` — nothing else is needed (no Python, no install,
+no admin rights).
+
+- **Windows SmartScreen**: the exe is not code-signed, so Windows may
+  say "Windows protected your PC" the first time. Click **More info →
+  Run anyway**. This is a one-time step; it happens because the exe has
+  no paid publisher certificate, not because anything is wrong.
+- **First launch**: EzExp indexes the whole PC in the background — a
+  few minutes on an SSD, longer on a hard drive or a machine with
+  millions of files. Search and browsing already work while it runs,
+  and closing the app mid-scan is safe: the next launch simply resumes
+  and finishes the job.
+- **Later launches** pick up new and changed files within seconds, and
+  it re-checks quietly every 10 minutes.
+- **Alt+Space** opens quick search from anywhere. If another program
+  already owns that shortcut, the status bar says so and everything
+  else still works.
+- **Its data** lives in `%LOCALAPPDATA%\EzExp` (the index and logs) —
+  deleting that folder resets it to a fresh first launch. If something
+  ever goes wrong, send the `error.log` from that folder along with
+  your report.
+
 ## Using it
 
 - **Open `ezexp.exe`** — the main Finder-style window appears.

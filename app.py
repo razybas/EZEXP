@@ -18,6 +18,7 @@ import re
 import json
 import math
 import time
+import traceback
 import zlib
 import ctypes
 import threading
@@ -29,7 +30,7 @@ from ctypes import wintypes
 from PySide6.QtCore import (
     Qt, QFileInfo, QTimer, QThread, QUrl, QSize, QPointF, QRectF, QLineF,
     QMimeData,
-    QEvent, QSettings, Signal, QAbstractNativeEventFilter,
+    QEvent, QSettings, Signal, QAbstractNativeEventFilter, QLockFile,
 )
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient,
@@ -50,7 +51,8 @@ if sys.platform != "win32":
     sys.exit(1)
 
 APP_NAME = "EzExp"
-DB_DIR = os.environ.get(
+APP_VERSION = "1.0.0"
+APP_DIR = DB_DIR = os.environ.get(
     "EZEXP_DB_DIR",
     os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "EzExp"),
 )
@@ -4532,14 +4534,49 @@ QPushButton { min-height: 22px; }
 # Entry point
 # ---------------------------------------------------------------------------
 
+_single_instance_lock = None
+
+def acquire_single_instance():
+    """Hold a lock file so a second launch exits politely. QLockFile
+    detects locks left behind by a crashed process and takes them over.
+    Returns the held QLockFile, or None if another instance holds it."""
+    global _single_instance_lock
+    lock = QLockFile(os.path.join(APP_DIR, "ezexp.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(100):
+        return None
+    _single_instance_lock = lock
+    return lock
+
+def install_crash_log():
+    """A windowed exe dies silently on an unhandled exception. Append
+    the traceback to APP_DIR/error.log so it can be sent for support."""
+    def hook(exc_type, exc, tb):
+        try:
+            with open(os.path.join(APP_DIR, "error.log"), "a",
+                      encoding="utf-8") as fh:
+                fh.write("\n=== %s ===\n" % time.strftime(
+                    "%Y-%m-%d %H:%M:%S"))
+                traceback.print_exception(exc_type, exc, tb, file=fh)
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = hook
+
 def main():
+    install_crash_log()
     QApplication.setStyle("Fusion")
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("ezexp")
     app.setWindowIcon(category_icon("folder"))
     app.setStyleSheet(QSS)
 
+    if acquire_single_instance() is None:
+        QMessageBox.information(None, APP_NAME,
+                                "EzExp is already running.")
+        return
     worker = SearchWorker()
     worker.start()
 

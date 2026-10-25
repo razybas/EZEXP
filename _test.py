@@ -55,6 +55,30 @@ ez.scan_full(conn, [data], lambda p, c: None)
 full_secs = time.perf_counter() - t0
 assert delta_secs < full_secs, (delta_secs, full_secs)
 
+_orig_app_dir = ez.APP_DIR
+ez.APP_DIR = data
+try:
+    # crash log hook appends a traceback to APP_DIR/error.log
+    log = os.path.join(data, "error.log")
+    ez.install_crash_log()
+    try:
+        raise ValueError("ezexp-test-marker")
+    except ValueError:
+        ez.sys.excepthook(*ez.sys.exc_info())
+    with open(log, encoding="utf-8") as fh:
+        assert "ezexp-test-marker" in fh.read()
+    # single instance: first acquire holds, second is refused
+    lk = ez.acquire_single_instance()
+    assert lk is not None
+    assert ez.acquire_single_instance() is None
+    lk.unlock()
+    ez._single_instance_lock = None
+finally:
+    if os.path.exists(log):
+        os.remove(log)
+    ez.APP_DIR = _orig_app_dir
+assert ez.APP_VERSION.count(".") == 2
+
 
 def names(rows):
     return sorted(r["name"] for r in rows)
