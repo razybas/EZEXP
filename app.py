@@ -1,0 +1,3209 @@
+"""
+EzExp — a Mac-style universal file finder for Windows.
+
+Indexes every file on every fixed drive into a local SQLite catalog, then
+gives instant, Finder/Spotlight-style search. Files stay where they are;
+EzExp just always knows where everything is.
+
+- First launch: full index of all fixed drives.
+- Every later launch: quick incremental scan (new/changed/deleted items).
+- Search works immediately, even while the index is still being built.
+- Enter / double-click reveals a result in Explorer; Ctrl+Enter opens it.
+- Alt+Space anywhere in Windows summons the Spotlight-style quick search.
+"""
+
+import os
+import sys
+import re
+import math
+import time
+import ctypes
+import threading
+import subprocess
+import sqlite3
+from ctypes import wintypes
+
+from PySide6.QtCore import (
+    Qt, QTimer, QThread, QUrl, QSize, QPointF, QRectF, QLineF, QMimeData,
+    QEvent, QSettings, Signal, QAbstractNativeEventFilter,
+)
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient,
+    QPainter, QPainterPath, QPolygonF, QPixmap, QPen, QShortcut, QGuiApplication,
+)
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QGraphicsItem, QGraphicsLineItem, QGraphicsObject,
+    QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QStyle,
+    QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
+)
+
+if sys.platform != "win32":
+    print("EzExp requires Windows.")
+    sys.exit(1)
+
+APP_NAME = "EzExp"
+DB_DIR = os.environ.get(
+    "EZEXP_DB_DIR",
+    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "EzExp"),
+)
+DB_PATH = os.path.join(DB_DIR, "index.db")
+
+
+# ---------------------------------------------------------------------------
+# Obsidian vault favourites (persisted per user)
+# ---------------------------------------------------------------------------
+
+def get_vaults():
+    v = QSettings("ezexp", "EzExp").value("vaults", [])
+    if isinstance(v, str):
+        v = [v]
+    return [p for p in (v or []) if isinstance(p, str) and p and os.path.isdir(p)]
+
+
+def set_vaults(paths):
+    s = QSettings("ezexp", "EzExp")
+    s.setValue("vaults", [os.path.normpath(p) for p in paths])
+    s.sync()
+
+ACCENT = "#0a84ff"
+TEXT = "#1d1d1f"
+SUBTLE = "#86868b"
+
+# ---------------------------------------------------------------------------
+# Categories
+# ---------------------------------------------------------------------------
+
+CAT_EXTS = {
+    "doc": {
+        "pdf", "doc", "docx", "docm", "dot", "dotx", "xls", "xlsx", "xlsm",
+        "xlsb", "ppt", "pptx", "pptm", "odt", "ods", "odp", "txt", "text",
+        "md", "markdown", "rtf", "csv", "tsv", "epub", "mobi", "log", "ini",
+        "cfg", "wps", "xps", "one", "vsd",
+    },
+    "img": {
+        "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "heic", "heif",
+        "tif", "tiff", "ico", "psd", "ai", "raw", "cr2", "cr3", "nef",
+        "arw", "dng", "orf", "rw2", "avif", "jfif",
+    },
+    "vid": {
+        "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg",
+        "mpeg", "3gp", "ts", "mts", "m2ts", "vob", "ogv",
+    },
+    "aud": {
+        "mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus", "mid",
+        "midi", "aiff", "alac", "amr",
+    },
+    "zip": {
+        "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso", "cab",
+        "tgz", "tbz2", "lz4",
+    },
+    "code": {
+        "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm", "css",
+        "scss", "less", "json", "xml", "yml", "yaml", "toml", "java", "c",
+        "cpp", "cc", "cxx", "h", "hpp", "cs", "go", "rb", "php", "sh",
+        "bash", "bat", "cmd", "ps1", "psm1", "sql", "vbs", "lua", "rs",
+        "swift", "kt", "kts", "dart", "vue", "svelte", "gradle", "cmake",
+        "ipynb", "r", "pl",
+    },
+}
+
+KIND_NAMES = {
+    "pdf": "PDF Document", "doc": "Word Document", "docx": "Word Document",
+    "xls": "Excel Spreadsheet", "xlsx": "Excel Spreadsheet",
+    "ppt": "PowerPoint Presentation", "pptx": "PowerPoint Presentation",
+    "txt": "Plain Text", "md": "Markdown Document", "csv": "CSV File",
+    "jpg": "JPEG Image", "jpeg": "JPEG Image", "png": "PNG Image",
+    "gif": "GIF Image", "webp": "WebP Image", "svg": "SVG Image",
+    "heic": "HEIC Image", "mp4": "MP4 Video", "mov": "QuickTime Movie",
+    "mkv": "Matroska Video", "avi": "AVI Video", "mp3": "MP3 Audio",
+    "wav": "WAV Audio", "flac": "FLAC Audio", "zip": "ZIP Archive",
+    "rar": "RAR Archive", "7z": "7z Archive", "iso": "Disc Image",
+    "exe": "Application", "msi": "Windows Installer", "dll": "System Library",
+    "py": "Python Script", "js": "JavaScript File", "ts": "TypeScript File",
+    "json": "JSON File", "html": "HTML Document", "css": "CSS File",
+    "bat": "Batch File", "ps1": "PowerShell Script", "sql": "SQL File",
+}
+
+
+def ext_of(name):
+    return name.rsplit(".", 1)[1].lower() if "." in name else ""
+
+
+# Extensions whose content we can show as a text snippet in the details pane
+TEXT_EXTS = {
+    "txt", "text", "md", "markdown", "log", "ini", "cfg", "conf", "csv",
+    "tsv", "json", "xml", "yml", "yaml", "toml", "py", "js", "ts", "tsx",
+    "jsx", "html", "htm", "css", "scss", "c", "cpp", "h", "hpp", "cs", "go",
+    "rb", "php", "sh", "bat", "ps1", "sql", "lua", "rs", "swift", "kt",
+    "java", "r", "pl", "srt", "vtt",
+}
+
+
+def category_for(name, is_dir):
+    if is_dir:
+        return "folder"
+    ext = ext_of(name)
+    for cat, exts in CAT_EXTS.items():
+        if ext in exts:
+            return cat
+    return "other"
+
+
+def kind_for(name, is_dir):
+    if is_dir:
+        return "Folder"
+    ext = ext_of(name)
+    if ext in KIND_NAMES:
+        return KIND_NAMES[ext]
+    return ext.upper() + " File" if ext else "File"
+
+
+def human_size(n):
+    if n is None or n < 0:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{n} B"
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return "—"
+
+
+def fmt_date(mtime):
+    try:
+        return time.strftime("%d %b %Y", time.localtime(mtime))
+    except (ValueError, OverflowError):
+        return "—"
+
+
+def join_path(parent, name):
+    return parent + "\\" + name if parent else name
+
+
+def split_path(path):
+    if len(path) == 2 and path[1] == ":":
+        return "", path
+    i = path.rfind("\\")
+    if i < 0:
+        return "", path
+    return path[:i], path[i + 1:]
+
+
+def real_dir(path):
+    return path + "\\" if len(path) == 2 and path[1] == ":" else path
+
+
+def like_escape(s, esc="#"):
+    return s.replace(esc, esc + esc).replace("%", esc + "%").replace("_", esc + "_")
+
+
+# ---------------------------------------------------------------------------
+# Windows shell helpers
+# ---------------------------------------------------------------------------
+
+SKIP_DIR_NAMES = {
+    "$recycle.bin", "system volume information", "$winreagent",
+    "config.msi", "recovery",
+}
+SKIP_FILE_NAMES = {"hiberfil.sys", "pagefile.sys", "swapfile.sys",
+                   "dumpstack.log", "dumpstack.log.tmp"}
+REPARSE_ATTR = 0x400
+
+
+def fixed_drives():
+    k32 = ctypes.windll.kernel32
+    mask = k32.GetLogicalDrives()
+    drives = []
+    for i, letter in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+        if mask >> i & 1:
+            root = letter + ":\\"
+            if k32.GetDriveTypeW(ctypes.c_wchar_p(root)) == 3:  # DRIVE_FIXED
+                drives.append(root)
+    return drives or ["C:\\"]
+
+
+def drive_label(root):
+    name = ctypes.create_unicode_buffer(261)
+    k32 = ctypes.windll.kernel32
+    ok = k32.GetVolumeInformationW(ctypes.c_wchar_p(root), name, 261, None, None, None, None, 0)
+    label = name.value.strip() if ok and name.value.strip() else "Local Disk"
+    return f"{label} ({root[:2]})"
+
+
+def shell_folders():
+    """Resolve the user's real Desktop/Documents/... paths (handles OneDrive redirection)."""
+    import winreg
+    GUIDS = {
+        "Desktop": "Desktop",
+        "Personal": "Documents",
+        "{374DE290-123F-4565-9164-39C4925E467B}": "Downloads",
+        "My Pictures": "Pictures",
+        "My Music": "Music",
+        "My Video": "Videos",
+    }
+    home = os.path.expanduser("~")
+    out = {}
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        )
+        with key:
+            for regname, nice in GUIDS.items():
+                try:
+                    val, _ = winreg.QueryValueEx(key, regname)
+                    out[nice] = val
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    fallbacks = {
+        "Desktop": os.path.join(home, "Desktop"),
+        "Documents": os.path.join(home, "Documents"),
+        "Downloads": os.path.join(home, "Downloads"),
+        "Pictures": os.path.join(home, "Pictures"),
+        "Music": os.path.join(home, "Music"),
+        "Videos": os.path.join(home, "Videos"),
+    }
+    for nice, path in fallbacks.items():
+        out.setdefault(nice, path)
+    order = ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"]
+    return [(n, out[n]) for n in order if out.get(n)]
+
+
+def reveal_in_explorer(path):
+    try:
+        subprocess.Popen(["explorer", "/select," + path])
+    except OSError:
+        subprocess.Popen(["explorer", real_dir(path) if len(path) <= 3 else path])
+
+
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND), ("wFunc", ctypes.c_uint),
+        ("pFrom", ctypes.c_wchar_p), ("pTo", ctypes.c_wchar_p),
+        ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", ctypes.c_wchar_p),
+    ]
+
+
+def recycle_path(path):
+    """Send a file/folder to the Recycle Bin."""
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT = 3, 0x40, 0x10, 0x4
+    op = _SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = path + "\0"
+    op.pTo = None
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+    res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    return res == 0 and not op.fAnyOperationsAborted
+
+
+def show_properties(path):
+    """Open the native Explorer Properties dialog."""
+    import ctypes as c
+
+    class SHELLEXECUTEINFOW(c.Structure):
+        _fields_ = [
+            ("cbSize", c.c_ulong), ("fMask", c.c_ulong), ("hwnd", wintypes.HWND),
+            ("lpVerb", c.c_wchar_p), ("lpFile", c.c_wchar_p),
+            ("lpParameters", c.c_wchar_p), ("lpDirectory", c.c_wchar_p),
+            ("nShow", c.c_int), ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", c.c_void_p), ("lpClass", c.c_wchar_p),
+            ("hkeyClass", wintypes.HKEY), ("dwHotKey", c.c_ulong),
+            ("hIconOrMonitor", wintypes.HANDLE),
+        ]
+
+    SEE_MASK_INVOKEIDLIST = 0x0000000C
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = c.sizeof(sei)
+    sei.fMask = SEE_MASK_INVOKEIDLIST
+    sei.lpVerb = "properties"
+    sei.lpFile = path
+    sei.nShow = 1
+    try:
+        return bool(ctypes.windll.shell32.ShellExecuteExW(c.byref(sei)))
+    except Exception:
+        return False
+
+
+def _hbitmap_to_qimage(hbm):
+    """Copy a GDI HBITMAP into a QImage (32bpp, alpha forced opaque if absent)."""
+    from ctypes import byref, c_long, c_void_p, c_ushort
+
+    class BITMAP(ctypes.Structure):
+        _fields_ = [("bmType", c_long), ("bmWidth", c_long), ("bmHeight", c_long),
+                    ("bmWidthBytes", c_long), ("bmPlanes", c_ushort),
+                    ("bmBitsPixel", c_ushort), ("bmBits", c_void_p)]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_ulong), ("biWidth", c_long),
+                    ("biHeight", c_long), ("biPlanes", c_ushort),
+                    ("biBitCount", c_ushort), ("biCompression", ctypes.c_ulong),
+                    ("biSizeImage", ctypes.c_ulong), ("biXPelsPerMeter", c_long),
+                    ("biYPelsPerMeter", c_long), ("biClrUsed", ctypes.c_ulong),
+                    ("biClrImportant", ctypes.c_ulong)]
+
+    gdi32 = ctypes.windll.gdi32
+    bm = BITMAP()
+    if not gdi32.GetObjectW(hbm, ctypes.sizeof(bm), byref(bm)):
+        return None
+    w, h = bm.bmWidth, bm.bmHeight
+    if w <= 0 or h <= 0 or w * h > 4096 * 4096:
+        return None
+    bi = BITMAPINFOHEADER()
+    bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bi.biWidth, bi.biHeight = w, -h  # top-down
+    bi.biPlanes, bi.biBitCount, bi.biCompression = 1, 32, 0
+    hdc = gdi32.CreateCompatibleDC(None)
+    buf = ctypes.create_string_buffer(w * h * 4)
+    try:
+        if gdi32.GetDIBits(hdc, hbm, 0, h, buf, byref(bi), 0) != h:
+            return None
+    finally:
+        gdi32.DeleteDC(hdc)
+    raw = bytearray(buf.raw)
+    if not any(raw[3::4]):  # no alpha in the bitmap — make it opaque
+        raw[3::4] = b"\xff" * len(raw[3::4])
+    return QImage(bytes(raw), w, h, w * 4, QImage.Format_ARGB32).copy()
+
+
+def shell_thumbnail(path, maxdim=512):
+    """Explorer-style thumbnail (works for videos, images, documents).
+    Returns a QImage or None. Call from a background thread only."""
+    from ctypes import byref, c_long, c_void_p, c_wchar_p
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class SIZE(ctypes.Structure):
+        _fields_ = [("cx", c_long), ("cy", c_long)]
+
+    GetImageProto = ctypes.WINFUNCTYPE(
+        ctypes.c_long, c_void_p, SIZE, ctypes.c_uint, ctypes.POINTER(c_void_p))
+    ReleaseProto = ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)
+
+    path = os.path.normpath(path.replace("/", "\\"))
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitializeEx(None, 0)  # MTA is fine for shell thumbnails
+    pp = c_void_p()
+    funcs = None
+    try:
+        # IID_IShellItemImageFactory {BCC18B79-BA16-442F-80C4-8A59C30C463B}
+        iid = GUID(0xBCC18B79, 0xBA16, 0x442F,
+                   (ctypes.c_ubyte * 8)(0x80, 0xC4, 0x8A, 0x59, 0xC3, 0x0C, 0x46, 0x3B))
+        hr = ctypes.windll.shell32.SHCreateItemFromParsingName(
+            c_wchar_p(path), None, byref(iid), byref(pp))
+        if hr < 0 or not pp.value:
+            return None
+        vtbl_ptr = ctypes.cast(pp, ctypes.POINTER(c_void_p)).contents
+        funcs = ctypes.cast(vtbl_ptr, ctypes.POINTER(c_void_p * 4)).contents
+        get_image = GetImageProto(funcs[3])
+        hbm = c_void_p()
+        SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY = 0x1, 0x4
+        size = SIZE(maxdim, maxdim)
+        hr = get_image(pp, size, SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY, byref(hbm))
+        if hr < 0 or not hbm.value:  # no thumbnail: fall back to the file icon
+            hr = get_image(pp, size, SIIGBF_BIGGERSIZEOK, byref(hbm))
+            if hr < 0 or not hbm.value:
+                return None
+        img = _hbitmap_to_qimage(hbm.value)
+        ctypes.windll.gdi32.DeleteObject(hbm)
+        return img
+    except Exception:
+        return None
+    finally:
+        if pp.value and funcs:
+            try:
+                ReleaseProto(funcs[2])(pp)
+            except Exception:
+                pass
+        ole32.CoUninitialize()
+
+
+# ---------------------------------------------------------------------------
+# Database layer
+# ---------------------------------------------------------------------------
+
+FTS_OK = False
+_tls = threading.local()
+
+
+def db_connect():
+    os.makedirs(DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-65536")
+    conn.execute("PRAGMA busy_timeout=30000")
+    _ensure_schema(conn)
+    return conn
+
+
+def thread_conn():
+    conn = getattr(_tls, "conn", None)
+    if conn is None:
+        conn = db_connect()
+        _tls.conn = conn
+    return conn
+
+
+def _ensure_schema(conn):
+    global FTS_OK
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS files(
+            id INTEGER PRIMARY KEY,
+            parent TEXT NOT NULL,
+            name TEXT NOT NULL,
+            is_dir INTEGER NOT NULL,
+            ext TEXT,
+            size INTEGER,
+            mtime REAL,
+            drive TEXT,
+            category TEXT,
+            kind TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_key ON files(parent, name);
+        CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
+        CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive);
+        CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+        CREATE INDEX IF NOT EXISTS idx_files_cat ON files(category);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+    """)
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
+            "name, content='files', content_rowid='id', tokenize='trigram')"
+        )
+        conn.execute("SELECT count(*) FROM fts")
+        FTS_OK = True
+    except sqlite3.Error:
+        FTS_OK = False
+    conn.commit()
+
+
+def rebuild_fts(conn):
+    global FTS_OK
+    if not FTS_OK:
+        return
+    conn.execute("DROP TABLE IF EXISTS fts")
+    conn.execute(
+        "CREATE VIRTUAL TABLE fts USING fts5("
+        "name, content='files', content_rowid='id', tokenize='trigram')"
+    )
+    conn.execute("INSERT INTO fts(rowid, name) SELECT id, name FROM files")
+
+
+def fts_touch(conn, rowid, name):
+    if not FTS_OK:
+        return
+    conn.execute("DELETE FROM fts WHERE rowid=?", (rowid,))
+    conn.execute("INSERT INTO fts(rowid, name) VALUES(?,?)", (rowid, name))
+
+
+def fts_drop_ids(conn, ids):
+    if not FTS_OK or not ids:
+        return
+    conn.executemany("DELETE FROM fts WHERE rowid=?", [(i,) for i in ids])
+
+
+def get_meta(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, str(value)))
+
+
+def update_total(conn):
+    total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    set_meta(conn, "total", total)
+    conn.commit()
+    return total
+
+
+def insert_rows(conn, rows, sync_fts=True):
+    """rows: (parent, name, is_dir, ext, size, mtime, drive, category, kind)"""
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT OR IGNORE INTO files(parent,name,is_dir,ext,size,mtime,drive,category,kind)"
+        " VALUES(?,?,?,?,?,?,?,?,?)", rows)
+    if sync_fts and FTS_OK:
+        conn.executemany(
+            "INSERT INTO fts(rowid, name)"
+            " SELECT id, name FROM files WHERE parent=? AND name=?",
+            [(r[0], r[1]) for r in rows])
+        # De-duplicate defensively: a rowid that somehow got indexed twice.
+        conn.execute("DELETE FROM fts WHERE rowid NOT IN (SELECT id FROM files)")
+
+
+def delete_tree(conn, path):
+    """Remove an item (file or directory) and all descendants from the index."""
+    if len(path) == 2 and path[1] == ":":
+        ids = [r[0] for r in conn.execute("SELECT id FROM files WHERE drive=?", (path,))]
+    else:
+        parent, name = split_path(path)
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM files WHERE parent=? OR parent LIKE ? ESCAPE '#'"
+            " OR (parent=? AND name=?)",
+            (path, like_escape(path) + "\\%", parent, name))]
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        fts_drop_ids(conn, chunk)
+        conn.executemany("DELETE FROM files WHERE id=?", [(c,) for c in chunk])
+    conn.commit()
+
+
+ROW_FIELDS = "parent, name, is_dir, size, mtime, category, kind"
+ROW_FIELDS_F = ("files.parent, files.name, files.is_dir, files.size, "
+                "files.mtime, files.category, files.kind")
+
+
+def _row_dict(r):
+    return {
+        "parent": r[0], "name": r[1], "is_dir": r[2], "size": r[3],
+        "mtime": r[4], "category": r[5], "kind": r[6],
+    }
+
+
+def do_search(conn, query, place=None, cat="all", limit=600):
+    """Returns (rows, note). Empty query = browse the current place by date."""
+    q = (query or "").strip()
+    conds, args = [], []
+    if place:
+        p = place.rstrip("\\")
+        if q:
+            # searching within a place: everything beneath it
+            conds.append("(files.parent = ? COLLATE NOCASE OR files.parent LIKE ? ESCAPE '#')")
+            args += [p, like_escape(p) + "\\%"]
+        else:
+            # browsing a place: its direct children only
+            conds.append("files.parent = ? COLLATE NOCASE")
+            args.append(p)
+    if cat and cat != "all":
+        conds.append("files.category = ?")
+        args.append(cat)
+    base = " FROM files"
+    if q and FTS_OK and len(q) >= 3:
+        base = " FROM fts JOIN files ON files.id = fts.rowid"
+    conds_sql = (" WHERE " + " AND ".join(conds)) if conds else ""
+
+    rows = []
+    FETCH_CAP = 20000  # hard ceiling before in-Python ranking
+    if q:
+        if base.startswith(" FROM fts"):
+            m = '"' + q.replace('"', '""') + '"'
+            try:
+                cur = conn.execute("SELECT " + ROW_FIELDS_F + base + conds_sql +
+                                   (" AND " if conds else " WHERE ") + "fts.name MATCH ?" +
+                                   " LIMIT ?",
+                                   args + [m, FETCH_CAP])
+                rows = [_row_dict(r) for r in cur.fetchall()]
+            except sqlite3.Error:
+                rows = []
+            if not rows:
+                # trigram found nothing (rare) — fall back to plain LIKE
+                base = " FROM files"
+                cur = conn.execute("SELECT " + ROW_FIELDS + base + conds_sql +
+                                   (" AND " if conds else " WHERE ") +
+                                   "files.name LIKE ? ESCAPE '#' LIMIT ?",
+                                   args + ["%" + like_escape(q) + "%", FETCH_CAP])
+                rows = [_row_dict(r) for r in cur.fetchall()]
+        else:
+            cur = conn.execute("SELECT " + ROW_FIELDS + base + conds_sql +
+                               (" AND " if conds else " WHERE ") +
+                               "files.name LIKE ? ESCAPE '#' LIMIT ?",
+                               args + ["%" + like_escape(q) + "%", FETCH_CAP])
+            rows = [_row_dict(r) for r in cur.fetchall()]
+    else:
+        # browsing a place = its direct children, folders first (Finder-style);
+        # browsing All Files = most recently modified across the whole index
+        if place:
+            order = " ORDER BY files.is_dir DESC, files.name COLLATE NOCASE ASC LIMIT ?"
+        else:
+            order = " ORDER BY files.mtime DESC LIMIT ?"
+        cur = conn.execute("SELECT " + ROW_FIELDS + base + conds_sql + order,
+                           args + [limit])
+        rows = [_row_dict(r) for r in cur.fetchall()]
+
+    if q:
+        def rank(r):
+            n = r["name"].lower()
+            if n == q.lower():
+                g = 0
+            elif n.startswith(q.lower()):
+                g = 1
+            else:
+                g = 2
+            return (g, len(n), -(r["mtime"] or 0))
+        rows.sort(key=rank)
+        truncated = len(rows) >= limit
+        rows = rows[:limit]
+        note = "search"
+    else:
+        truncated = len(rows) >= limit
+        note = "browse"
+    return rows, ("truncated" if truncated else "")
+
+
+# ---------------------------------------------------------------------------
+# Indexing engine
+# ---------------------------------------------------------------------------
+
+BATCH = 4000
+# NTFS stores 100ns mtimes; both reads see the identical double, so compare
+# with microsecond tolerance. Anything looser silently misses rapid changes.
+MTIME_EPS = 1e-6
+
+
+def _entry_skipped(name, is_dir):
+    low = name.lower()
+    return (low in SKIP_DIR_NAMES) if is_dir else (low in SKIP_FILE_NAMES)
+
+
+def _make_row(parent, name, is_dir, st, drive):
+    return (parent, name, 1 if is_dir else 0, ext_of(name),
+            st.st_size if not is_dir else 0, st.st_mtime, drive,
+            category_for(name, is_dir), kind_for(name, is_dir))
+
+
+def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
+    """Rebuild the index from the given roots. wipe=False indexes extra roots
+    without erasing the rest of the catalog (used for newly-appeared drives)."""
+    if should_run is None:
+        should_run = lambda: True
+    if wipe:
+        conn.execute("DELETE FROM files")
+        rebuild_fts(conn)
+        conn.commit()
+    total = 0
+    batch = []
+    for root in roots:
+        if not should_run():
+            break
+        drive = root[:2]
+        try:
+            root_st = os.stat(real_dir(root))
+        except OSError:
+            continue
+        stack = []
+        if len(root) == 3 and root.endswith("\\"):
+            row = _make_row("", drive, True, root_st, drive)
+            batch.append(row)
+        stack.append(root.rstrip("\\"))
+        while stack and should_run():
+            d = stack.pop()
+            real = real_dir(d)
+            try:
+                it = os.scandir(real)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    if not should_run():
+                        break
+                    name = e.name
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    is_dir = e.is_dir(follow_symlinks=False)
+                    if is_dir:
+                        if getattr(st, "st_file_attributes", 0) & REPARSE_ATTR:
+                            continue  # junction / symlink dir: never recurse
+                        if _entry_skipped(name, True):
+                            continue
+                        try:
+                            # Directory enumeration can report a stale (lagged)
+                            # mtime; os.stat is authoritative, and dirs are
+                            # rare enough that the extra syscall is free.
+                            st = os.stat(e.path, follow_symlinks=False)
+                        except OSError:
+                            continue
+                    else:
+                        if _entry_skipped(name, False):
+                            continue
+                        if os.path.abspath(e.path).lower() == DB_PATH.lower():
+                            continue
+                    batch.append(_make_row(d, name, is_dir, st, drive))
+                    if is_dir:
+                        stack.append(join_path(d, name))
+                    if len(batch) >= BATCH:
+                        total += len(batch)
+                        insert_rows(conn, batch, sync_fts=False)
+                        conn.commit()
+                        if progress:
+                            progress(d, total)
+                        batch = []
+        if batch:
+            total += len(batch)
+            insert_rows(conn, batch, sync_fts=False)
+            batch = []
+        conn.commit()
+        if progress:
+            progress(root, total)
+    if should_run():
+        rebuild_fts(conn)  # index all names in one pass
+        conn.commit()
+        set_meta(conn, "phase", "full_done")
+        conn.commit()
+
+
+def scan_delta(conn, roots, progress=None, should_run=None):
+    """Incremental scan: only re-read directories whose mtime changed."""
+    if should_run is None:
+        should_run = lambda: True
+    changed_items = 0
+    for root in roots:
+        if not should_run():
+            break
+        drive = root[:2]
+        existing = {}
+        for parent, name, mtime, in conn.execute(
+                "SELECT parent, name, mtime FROM files WHERE drive=? AND is_dir=1", (drive,)):
+            existing[join_path(parent, name)] = mtime
+        if not existing:
+            scan_full(conn, [root], progress, should_run, wipe=False)
+            continue
+        stack = [root.rstrip("\\")]
+        visited = set()
+        while stack and should_run():
+            d = stack.pop()
+            if d in visited:
+                continue
+            visited.add(d)
+            real = real_dir(d)
+            try:
+                cur_mtime = os.stat(real).st_mtime
+            except OSError:
+                if os.path.exists(real):
+                    continue  # permission problem, not a deletion — keep the index
+                delete_tree(conn, d)
+                continue
+            old_mtime = existing.get(d)
+            if old_mtime is not None and abs(cur_mtime - old_mtime) < MTIME_EPS:
+                # unchanged — keep walking into known child dirs
+                for parent, name in conn.execute(
+                        "SELECT parent, name FROM files WHERE parent=? AND is_dir=1", (d,)):
+                    stack.append(join_path(parent, name))
+                continue
+
+            # changed or new directory: rescan its direct children
+            prev = {}
+            for row in conn.execute(
+                    "SELECT id, name, is_dir, size, mtime FROM files WHERE parent=?", (d,)):
+                prev[row[1]] = (row[0], row[2], row[3], row[4])
+            conn.execute("UPDATE files SET mtime=? WHERE parent=? AND name=?",
+                         (cur_mtime, *split_path(d)))
+            seen = set()
+            new_rows = []
+            try:
+                it = os.scandir(real)
+            except OSError:
+                if not os.path.exists(real):
+                    delete_tree(conn, d)
+                continue
+            with it:
+                for e in it:
+                    if not should_run():
+                        break
+                    name = e.name
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    is_dir = e.is_dir(follow_symlinks=False)
+                    if is_dir:
+                        if getattr(st, "st_file_attributes", 0) & REPARSE_ATTR:
+                            continue
+                        if _entry_skipped(name, True):
+                            continue
+                        try:
+                            # match scan_full: authoritative mtime for dirs
+                            st = os.stat(e.path, follow_symlinks=False)
+                        except OSError:
+                            continue
+                    else:
+                        if _entry_skipped(name, False):
+                            continue
+                        if os.path.abspath(e.path).lower() == DB_PATH.lower():
+                            continue
+                    seen.add(name)
+                    old = prev.get(name)
+                    if old and old[1] == (1 if is_dir else 0):
+                        if is_dir or (old[2] == st.st_size and abs(old[3] - st.st_mtime) < MTIME_EPS):
+                            if is_dir:
+                                stack.append(join_path(d, name))  # still check deeper levels
+                            continue
+                    if old:
+                        fts_drop_ids(conn, [old[0]])
+                        conn.execute("DELETE FROM files WHERE id=?", (old[0],))
+                    new_rows.append(_make_row(d, name, is_dir, st, drive))
+                    changed_items += 1
+            for name, old in prev.items():
+                if name not in seen:
+                    fts_drop_ids(conn, [old[0]])
+                    conn.execute("DELETE FROM files WHERE id=?", (old[0],))
+                    changed_items += 1
+            if new_rows:
+                insert_rows(conn, new_rows)
+                changed_items += len(new_rows)
+                for r in new_rows:
+                    if r[2]:
+                        stack.append(join_path(d, r[1]))
+            conn.commit()
+            if progress:
+                progress(d, changed_items)
+
+
+# ---------------------------------------------------------------------------
+# Obsidian vault graph (data side)
+# ---------------------------------------------------------------------------
+
+WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
+
+
+def parse_wikilinks(text):
+    """Extract wikilink targets: [[Note]], [[Note|alias]], [[Note#Heading]]."""
+    targets = []
+    for m in WIKILINK_RE.finditer(text):
+        t = m.group(1).split("|", 1)[0].split("#", 1)[0].split("^", 1)[0].strip()
+        if t:
+            targets.append(t)
+    return targets
+
+
+def active_vault_for(place):
+    """The saved vault that contains this place (or None)."""
+    if not place:
+        return None
+    p = place.rstrip("\\").lower()
+    for v in get_vaults():
+        vp = v.rstrip("\\")
+        vl = vp.lower()
+        if p == vl or p.startswith(vl + "\\"):
+            return vp
+    return None
+
+
+def build_vault_graph(conn, vault, max_nodes=4000, max_read=1_000_000):
+    """Nodes = markdown notes in the vault; edges = resolved [[wikilinks]].
+    Pure function (no Qt) so it can run on a worker thread and be unit-tested."""
+    vp = vault.rstrip("\\")
+    rows = conn.execute(
+        "SELECT parent, name FROM files WHERE (parent = ? COLLATE NOCASE"
+        " OR parent LIKE ? ESCAPE '#') AND ext = 'md'",
+        (vp, like_escape(vp) + "\\%")).fetchall()
+    total = len(rows)
+    rows = rows[:max_nodes]
+    nodes = []
+    for parent, name in rows:
+        path = join_path(parent, name)
+        nodes.append({
+            "name": name[:-3] if name.lower().endswith(".md") else name,
+            "file": name,
+            "parent": parent, "path": path,
+        })
+
+    by_base, by_rel = {}, {}
+    for i, nd in enumerate(nodes):
+        rel = os.path.relpath(nd["path"], vp)
+        stem = rel[:-3] if rel.lower().endswith(".md") else rel
+        by_base.setdefault(nd["name"].lower(), []).append(i)
+        by_rel.setdefault(rel.lower(), []).append(i)
+        by_rel.setdefault(stem.lower(), []).append(i)
+
+    def resolve(target, cur_parent):
+        t = target.replace("/", "\\").strip().lower()
+        if t.endswith(".md"):
+            t = t[:-3]
+        for key in (t, t + ".md"):
+            lst = by_rel.get(key)
+            if lst:
+                for i in lst:  # same-folder notes win on ambiguous names
+                    if nodes[i]["parent"].lower() == cur_parent.lower():
+                        return i
+                return lst[0]
+        lst = by_base.get(t)
+        if lst:
+            for i in lst:
+                if nodes[i]["parent"].lower() == cur_parent.lower():
+                    return i
+            return lst[0]
+        return None
+
+    edge_set = set()
+    for i, nd in enumerate(nodes):
+        try:
+            with open(nd["path"], "rb") as f:
+                text = f.read(max_read).decode("utf-8", "replace")
+        except OSError:
+            continue
+        for t in parse_wikilinks(text):
+            j = resolve(t, nd["parent"])
+            if j is not None and j != i:
+                edge_set.add((min(i, j), max(i, j)))
+    edges = sorted(edge_set)
+    degree = [0] * len(nodes)
+    for a, b in edges:
+        degree[a] += 1
+        degree[b] += 1
+    for nd, d in zip(nodes, degree):
+        nd["degree"] = d
+    return {"nodes": nodes, "edges": edges, "total_md": total, "vault": vp}
+
+
+# ---------------------------------------------------------------------------
+# Painted icons (no external assets)
+# ---------------------------------------------------------------------------
+
+CAT_COLORS = {
+    "folder": "#0a84ff", "img": "#34c759", "vid": "#bf5af2", "aud": "#ff9f0a",
+    "zip": "#64d2ff", "code": "#30d158", "doc": "#98989d", "other": "#98989d",
+}
+
+_icon_cache = {}
+
+
+def _painter_on(size):
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    return pm, p
+
+
+def category_icon(cat):
+    if cat in _icon_cache:
+        return _icon_cache[cat]
+    pm, p = _painter_on(64)
+    pen = QPen(QColor("#c2c2c9"), 2)
+    if cat == "folder":
+        grad = QLinearGradient(0, 12, 0, 52)
+        grad.setColorAt(0, QColor("#6cb5ff"))
+        grad.setColorAt(1, QColor("#0a84ff"))
+        p.setPen(QPen(QColor("#0a84ff"), 1))
+        p.setBrush(QColor("#3f9bff"))
+        p.drawRoundedRect(7, 14, 22, 12, 3, 3)
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawRoundedRect(7, 19, 50, 32, 7, 7)
+    else:
+        p.setPen(pen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(18, 8, 32, 48, 5, 5)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#e9e9ee"))
+        fold = QPainterPath()
+        fold.moveTo(38, 8)
+        fold.lineTo(50, 20)
+        fold.lineTo(38, 20)
+        fold.closeSubpath()
+        p.drawPath(fold)
+        color = QColor(CAT_COLORS.get(cat, "#98989d"))
+        if cat == "doc":
+            p.setPen(QPen(QColor("#b0b0b7"), 2.4))
+            for i, y in enumerate((30, 36, 42)):
+                p.drawLine(25, y, 43 if i < 2 else 36, y)
+        elif cat == "img":
+            p.setPen(Qt.NoPen)
+            p.setBrush(color)
+            p.drawEllipse(QColor("#ffcB3E").name()) if False else p.drawEllipse(24, 24, 8, 8)
+            path = QPainterPath()
+            path.moveTo(23, 44)
+            path.lineTo(30, 32)
+            path.lineTo(35, 39)
+            path.lineTo(38, 35)
+            path.lineTo(45, 44)
+            path.closeSubpath()
+            p.drawPath(path)
+        elif cat == "vid":
+            p.setPen(Qt.NoPen)
+            p.setBrush(color)
+            tri = QPainterPath()
+            tri.moveTo(27, 28)
+            tri.lineTo(27, 44)
+            tri.lineTo(43, 36)
+            tri.closeSubpath()
+            p.drawPath(tri)
+        elif cat == "aud":
+            p.setPen(QPen(color, 2.6))
+            p.drawLine(33, 44, 33, 26)
+            p.drawLine(33, 26, 41, 29)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(27, 40, 8, 6)
+        elif cat == "zip":
+            p.setPen(QPen(color, 2.6, Qt.DashLine))
+            p.drawLine(34, 24, 34, 46)
+        elif cat == "code":
+            p.setPen(QPen(color, 3))
+            p.drawLine(27, 28, 20, 36)
+            p.drawLine(20, 36, 27, 44)
+            p.drawLine(41, 28, 48, 36)
+            p.drawLine(48, 36, 41, 44)
+    p.end()
+    icon = QIcon(pm)
+    _icon_cache[cat] = icon
+    return icon
+
+
+def place_icon(kind):
+    key = "place:" + kind
+    if key in _icon_cache:
+        return _icon_cache[key]
+    pm, p = _painter_on(18)
+    pen = QPen(QColor(ACCENT), 1.7)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    if kind == "grid":
+        for x, y in ((3, 3), (10, 3), (3, 10), (10, 10)):
+            p.drawRoundedRect(x, y, 5, 5, 1.5, 1.5)
+    elif kind == "monitor":
+        p.drawRoundedRect(2, 3, 14, 9, 2, 2)
+        p.drawLine(9, 12, 9, 15)
+        p.drawLine(6, 15, 12, 15)
+    elif kind == "files":
+        p.drawRoundedRect(4, 4, 9, 12, 2, 2)
+        p.drawLine(7, 2, 14, 2)
+        p.drawLine(14, 2, 14, 13)
+    elif kind == "download":
+        p.drawLine(9, 2, 9, 11)
+        p.drawLine(5, 7, 9, 11)
+        p.drawLine(13, 7, 9, 11)
+        p.drawLine(3, 14, 15, 14)
+    elif kind == "image":
+        p.drawRoundedRect(2, 3, 14, 12, 2, 2)
+        p.drawEllipse(5, 5, 3, 3)
+        p.drawLine(3, 12, 7, 9)
+        p.drawLine(7, 9, 10, 12)
+        p.drawLine(10, 12, 13, 8)
+    elif kind == "music":
+        p.drawEllipse(4, 11, 4, 3)
+        p.drawLine(8, 12, 8, 3)
+        p.drawLine(8, 3, 13, 5)
+        p.drawLine(13, 5, 13, 8)
+    elif kind == "film":
+        p.drawRoundedRect(2, 3, 14, 12, 2, 2)
+        p.drawLine(6, 3, 6, 15)
+        p.drawLine(2, 7, 6, 7)
+        p.drawLine(2, 11, 6, 11)
+    elif kind == "drive":
+        p.drawRoundedRect(2, 5, 14, 8, 2, 2)
+        p.drawEllipse(12, 8, 2, 2)
+        p.drawLine(4, 10, 9, 10)
+    elif kind == "vault":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#8b5cf6"))
+        gem = QPainterPath()
+        gem.moveTo(9, 2)
+        gem.lineTo(15, 8)
+        gem.lineTo(9, 16)
+        gem.lineTo(3, 8)
+        gem.closeSubpath()
+        p.drawPath(gem)
+        p.setBrush(QColor("#c4b5fd"))
+        p.drawPolygon(QPolygonF([QPointF(9, 2), QPointF(12, 8), QPointF(9, 8)]))
+    p.end()
+    icon = QIcon(pm)
+    _icon_cache[key] = icon
+    return icon
+
+
+def search_glyph():
+    key = "glyph:search"
+    if key in _icon_cache:
+        return _icon_cache[key]
+    pm, p = _painter_on(16)
+    p.setPen(QPen(QColor(SUBTLE), 1.8))
+    p.drawEllipse(2, 2, 9, 9)
+    p.drawLine(10, 10, 14, 14)
+    p.end()
+    icon = QIcon(pm)
+    _icon_cache[key] = icon
+    return icon
+
+
+def rounded_pixmap(pm, radius=8):
+    out = QPixmap(pm.size())
+    out.setDevicePixelRatio(pm.devicePixelRatio())
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, pm.width(), pm.height(), radius, radius)
+    p.setClipPath(path)
+    p.drawPixmap(0, 0, pm)
+    p.end()
+    return out
+
+
+def with_play_badge(pm):
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    w, h = pm.width(), pm.height()
+    r = min(w, h) * 0.14
+    cx, cy = w / 2.0, h / 2.0
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(20, 20, 22, 170))
+    p.drawEllipse(QPointF(cx, cy), r, r)
+    p.setBrush(QColor(255, 255, 255, 235))
+    tri = QPainterPath()
+    s = r * 0.62
+    tri.moveTo(cx - s * 0.5, cy - s)
+    tri.lineTo(cx - s * 0.5, cy + s)
+    tri.lineTo(cx + s * 0.85, cy)
+    tri.closeSubpath()
+    p.drawPath(tri)
+    p.end()
+    return pm
+
+
+# ---------------------------------------------------------------------------
+# Background workers
+# ---------------------------------------------------------------------------
+
+class SearchWorker(QThread):
+    have = Signal(int, str, list, str)
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._job = None
+        self._seq = 0
+        self._alive = True
+
+    def submit(self, q, place, cat):
+        with self._lock:
+            self._seq += 1
+            self._job = (self._seq, q, place, cat)
+            return self._seq
+
+    def stop(self):
+        self._alive = False
+
+    def run(self):
+        while self._alive:
+            with self._lock:
+                job = self._job
+                self._job = None
+            if job is None:
+                self.msleep(20)
+                continue
+            seq, q, place, cat = job
+            try:
+                rows, note = do_search(thread_conn(), q, place, cat)
+            except Exception as exc:  # keep the UI alive if a query fails
+                rows, note = [], f"error: {exc}"
+            self.have.emit(seq, q, rows, note)
+
+
+class IndexerThread(QThread):
+    progress = Signal(str, int)
+    done = Signal(int, str)  # total, error-or-empty
+
+    def __init__(self, rebuild=False):
+        super().__init__()
+        self.rebuild = rebuild
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        conn = None
+        try:
+            conn = db_connect()
+            roots = fixed_drives()
+            for v in get_vaults():  # vaults may live on drives we don't auto-scan
+                if os.path.isdir(v):
+                    rv = v.rstrip("\\")
+                    if rv not in roots:
+                        roots.append(rv)
+            phase = get_meta(conn, "phase")
+
+            def prog(path, count):
+                self.progress.emit(path, count)
+
+            def alive():
+                return not self._stop
+
+            if self.rebuild or phase != "full_done":
+                scan_full(conn, roots, prog, alive)
+            else:
+                scan_delta(conn, roots, prog, alive)
+            if self._stop:
+                self.done.emit(-1, "stopped")
+                return
+            total = update_total(conn)
+            set_meta(conn, "indexed_at", str(time.time()))
+            conn.commit()
+            self.done.emit(total, "")
+        except Exception as exc:
+            self.done.emit(-1, str(exc))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Frameless mac-style window
+# ---------------------------------------------------------------------------
+
+RESIZE_MARGIN = 6
+
+
+class FramelessWindow(QWidget):
+    def __init__(self):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMinimumSize(900, 560)
+        self._resize_dir = 0
+        self._resize_geo = None
+        self._resize_gpos = None
+        self._move_offset = None
+        self._maximized = False
+        self._normal_geo = None
+
+    # -- traffic light actions --------------------------------------------
+    def toggle_max(self):
+        if self._maximized:
+            self._maximized = False
+            if self._normal_geo:
+                self.setGeometry(self._normal_geo)
+            self.on_max_state()
+        else:
+            self._normal_geo = self.geometry()
+            avail = self.screen().availableGeometry()
+            self._maximized = True
+            self.setGeometry(avail)
+            self.on_max_state()
+
+    def on_max_state(self):
+        pass
+
+    def begin_move(self, gpos):
+        if self._maximized:
+            return
+        self._move_offset = gpos - self.frameGeometry().topLeft()
+
+    def move_move(self, gpos):
+        if self._maximized or self._move_offset is None:
+            return
+        self.move(gpos - self._move_offset)
+
+    def end_move(self):
+        self._move_offset = None
+
+    # -- edge resizing ------------------------------------------------------
+    def _hit_edges(self, pos):
+        if self._maximized:
+            return 0
+        m = RESIZE_MARGIN
+        r = self.rect()
+        L = 1 if pos.x() <= m else 0
+        R = 2 if pos.x() >= r.width() - m else 0
+        T = 4 if pos.y() <= m else 0
+        B = 8 if pos.y() >= r.height() - m else 0
+        return L | R | T | B
+
+    _CURSORS = {1: Qt.SizeHorCursor, 2: Qt.SizeHorCursor, 4: Qt.SizeVerCursor,
+                8: Qt.SizeVerCursor, 5: Qt.SizeFDiagCursor, 10: Qt.SizeBDiagCursor,
+                6: Qt.SizeBDiagCursor, 9: Qt.SizeFDiagCursor}
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return super().mousePressEvent(e)
+        pos = e.position().toPoint()
+        d = self._hit_edges(pos)
+        if d:
+            self._resize_dir = d
+            self._resize_geo = self.geometry()
+            self._resize_gpos = e.globalPosition().toPoint()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        pos = e.position().toPoint()
+        if self._resize_dir and self._resize_geo is not None:
+            g = e.globalPosition().toPoint()
+            geo = QRect(self._resize_geo)
+            dx = g.x() - self._resize_gpos.x()
+            dy = g.y() - self._resize_gpos.y()
+            d = self._resize_dir
+            mn = self.minimumSize()
+            if d & 1:
+                nw = max(mn.width(), geo.width() - dx)
+                geo.setX(geo.right() - nw + 1)
+                geo.setWidth(nw)
+            if d & 2:
+                geo.setWidth(max(mn.width(), geo.width() + dx))
+            if d & 4:
+                nh = max(mn.height(), geo.height() - dy)
+                geo.setY(geo.bottom() - nh + 1)
+                geo.setHeight(nh)
+            if d & 8:
+                geo.setHeight(max(mn.height(), geo.height() + dy))
+            self.setGeometry(geo)
+            return
+        d = self._hit_edges(pos)
+        if d in self._CURSORS:
+            self.setCursor(self._CURSORS[d])
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._resize_dir = 0
+        self._resize_geo = None
+        super().mouseReleaseEvent(e)
+
+
+class TitleBar(QFrame):
+    def __init__(self, window, with_search=True):
+        super().__init__(window)
+        self.setObjectName("titlebar")
+        self.setFixedHeight(52)
+        self.win = window
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(10)
+
+        self.btn_close = QPushButton(self)
+        self.btn_min = QPushButton(self)
+        self.btn_max = QPushButton(self)
+        for b, name in ((self.btn_close, "tclose"), (self.btn_min, "tmin"), (self.btn_max, "tmax")):
+            b.setObjectName(name)
+            b.setFixedSize(13, 13)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+        self.btn_close.clicked.connect(window.close)
+        self.btn_min.clicked.connect(window.showMinimized)
+        self.btn_max.clicked.connect(window.toggle_max)
+        lay.addWidget(self.btn_close)
+        lay.addWidget(self.btn_min)
+        lay.addWidget(self.btn_max)
+
+        self.btn_back = QToolButton(self)
+        self.btn_back.setObjectName("backBtn")
+        self.btn_back.setText("‹")
+        self.btn_back.setFixedSize(26, 26)
+        self.btn_back.setToolTip("Back")
+        self.btn_back.setCursor(Qt.PointingHandCursor)
+        self.btn_back.setFocusPolicy(Qt.NoFocus)
+        self.btn_back.setAutoRaise(True)
+        lay.addSpacing(4)
+        lay.addWidget(self.btn_back)
+
+        lay.addStretch(1)
+        self.title = QLabel(window.windowTitle(), self)
+        self.title.setObjectName("title")
+        lay.addWidget(self.title)
+        lay.addStretch(1)
+
+        self.search = None
+        if with_search:
+            self.search = SearchField(self)
+            self.search.setFixedWidth(230)
+            lay.addWidget(self.search)
+
+    def setTitle(self, text):
+        self.title.setText(text)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.win.begin_move(e.globalPosition().toPoint())
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton:
+            self.win.move_move(e.globalPosition().toPoint())
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self.win.end_move()
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self.win.toggle_max()
+
+
+class SearchField(QFrame):
+    def __init__(self, parent=None, placeholder="Search"):
+        super().__init__(parent)
+        self.setObjectName("searchField")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(9, 0, 9, 0)
+        lay.setSpacing(6)
+        icon = QLabel(self)
+        icon.setPixmap(search_glyph().pixmap(14, 14))
+        icon.setFixedSize(14, 14)
+        lay.addWidget(icon)
+        self.edit = QLineEdit(self)
+        self.edit.setObjectName("searchEdit")
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.setAttribute(Qt.WA_MacShowFocusRect, False)
+        lay.addWidget(self.edit, 1)
+        self.edit.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.edit and ev.type() in (QEvent.FocusIn, QEvent.FocusOut):
+            self.setProperty("focus", "true" if ev.type() == QEvent.FocusIn else "false")
+            self.style().unpolish(self)
+            self.style().polish(self)
+        return super().eventFilter(obj, ev)
+
+
+# ---------------------------------------------------------------------------
+# Results list
+# ---------------------------------------------------------------------------
+
+class NameDelegate(QStyledItemDelegate):
+    ROW_H = 46
+
+    def sizeHint(self, option, index):
+        return QSize(120, self.ROW_H)
+
+    def paint(self, p, option, index):
+        row = index.data(Qt.UserRole)
+        if not row:
+            return super().paint(p, option, index)
+        selected = bool(option.state & QStyle.State_Selected)
+        p.save()
+        r = option.rect
+        icon = category_icon(row["category"])
+        pm = icon.pixmap(30, 30)
+        p.drawPixmap(r.left() + 12, r.top() + (r.height() - 30) // 2, pm)
+        tx = r.left() + 52
+        tw = r.width() - 64
+        name_font = QFont(option.font)
+        name_font.setPointSizeF(9.0)
+        p.setFont(name_font)
+        fm = QFontMetrics(name_font)
+        name = fm.elidedText(row["name"], Qt.ElideRight, tw)
+        p.setPen(QColor("#ffffff") if selected else QColor(TEXT))
+        p.drawText(tx, r.top() + 8, tw, 18, Qt.AlignLeft | Qt.AlignVCenter, name)
+        small = QFont(option.font)
+        small.setPointSizeF(7.5)
+        p.setFont(small)
+        p.setPen(QColor("rgba(255,255,255,0.8)") if selected else QColor(SUBTLE))
+        path = row["parent"] + ("\\" + row["name"] if not row["is_dir"] else "")
+        if len(path) == 2:
+            path = path + "\\"
+        p.drawText(tx, r.top() + 25, tw, 14, Qt.AlignLeft | Qt.AlignVCenter,
+                   QFontMetrics(small).elidedText(path, Qt.ElideLeft, tw))
+        p.restore()
+
+
+class ResultsTree(QTreeWidget):
+    """Tree that maps Return/Ctrl+Return to reveal/open."""
+    reveal_requested = Signal()
+    open_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(4)
+        self.setHeaderLabels(["Name", "Size", "Kind", "Date Modified"])
+        self.setRootIsDecorated(False)
+        self.setUniformRowHeights(True)
+        self.setAllColumnsShowFocus(True)
+        self.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.setSelectionBehavior(QTreeWidget.SelectRows)
+        self.setSortingEnabled(False)
+        self.setItemDelegateForColumn(0, NameDelegate(self))
+        h = self.header()
+        h.setSectionsMovable(False)
+        h.setStretchLastSection(False)
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col, w in ((1, 90), (2, 150), (3, 110)):
+            h.setSectionResizeMode(col, QHeaderView.Fixed)
+            self.setColumnWidth(col, w)
+        self.setVerticalScrollMode(QTreeWidget.ScrollPerItem)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if e.modifiers() & Qt.ControlModifier:
+                self.open_requested.emit()
+            else:
+                self.reveal_requested.emit()
+            return
+        super().keyPressEvent(e)
+
+
+def make_row_item(row):
+    item = QTreeWidgetItem()
+    item.setData(0, Qt.UserRole, row)
+    item.setText(1, "—" if row["is_dir"] else human_size(row["size"]))
+    item.setText(2, row["kind"])
+    item.setText(3, fmt_date(row["mtime"]))
+    item.setTextAlignment(1, Qt.AlignLeft | Qt.AlignVCenter)
+    item.setTextAlignment(2, Qt.AlignLeft | Qt.AlignVCenter)
+    item.setTextAlignment(3, Qt.AlignLeft | Qt.AlignVCenter)
+    item.setData(0, Qt.AccessibleTextRole, row["name"])
+    return item
+
+
+# ---------------------------------------------------------------------------
+# Vault graph view (interactive force-directed rendering)
+# ---------------------------------------------------------------------------
+
+class GraphNode(QGraphicsObject):
+    def __init__(self, view, index, label, radius, parent_path, file_name, path):
+        super().__init__()
+        self.view = view
+        self.index = index
+        self.label = label
+        self.radius = radius
+        self.parent_path = parent_path
+        self.file = file_name
+        self.path = path
+        self.state = 0      # 0 normal, 1 neighbor/hover, 2 selected, 3 dimmed
+        self._hover = False
+        self._dragging = False
+        self._press_pos = None
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+        self.setZValue(1)
+
+    def boundingRect(self):
+        return QRectF(-118, -self.radius - 6, 236, self.radius * 2 + 24)
+
+    def paint(self, p, option, widget):
+        st = self.state
+        if st == 0 and self._hover:
+            st = 1
+        fill, border, text = {
+            0: (QColor("#b9bfc6"), QColor("#989ea6"), QColor("#6e6e73")),
+            1: (QColor("#9ba2a9"), QColor("#7c828a"), QColor("#3a3a3c")),
+            2: (QColor("#8b5cf6"), QColor("#7c3aed"), QColor("#6d28d9")),
+            3: (QColor("#dfe2e6"), QColor("#e4e7ea"), QColor("#c7c7cc")),
+        }[st]
+        p.setBrush(fill)
+        p.setPen(QPen(border, 1.4))
+        p.drawEllipse(QPointF(0, 0), self.radius, self.radius)
+        p.setPen(QPen(text, 1))
+        p.drawText(QRectF(-110, self.radius + 3, 220, 14),
+                   Qt.AlignHCenter | Qt.AlignTop,
+                   QFontMetrics(self.view.label_font).elidedText(self.label, Qt.ElideRight, 200))
+
+    def hoverEnterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def hoverLeaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._dragging = True
+            self._press_pos = e.pos()
+            self.view.kick()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        moved = (self._press_pos is not None and e.button() == Qt.LeftButton
+                 and (e.pos() - self._press_pos).manhattanLength() > 4)
+        self._dragging = False
+        self._press_pos = None
+        super().mouseReleaseEvent(e)
+        if not moved and e.button() == Qt.LeftButton:
+            self.view.select_node(self)
+
+    def mouseDoubleClickEvent(self, e):
+        self.view.node_activated.emit(self)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionHasChanged:
+            self.view.update_edges_for(self.index)
+        return super().itemChange(change, value)
+
+    def contextMenuEvent(self, event):
+        event.accept()
+        self.view.show_node_menu.emit(self, event.screenPos())
+
+
+class GraphView(QGraphicsView):
+    node_clicked = Signal(object)
+    node_activated = Signal(object)
+    show_node_menu = Signal(object, object)
+
+    CELL = 120.0
+    CUTOFF = 300.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setBackgroundBrush(QColor("#ffffff"))
+        self.setFrameShape(QGraphicsView.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.label_font = QFont()
+        self.label_font.setPointSize(8)
+        self.nodes = []
+        self.edge_items = []   # (line_item, a, b)
+        self.edge_pairs = []
+        self.vx = []
+        self.vy = []
+        self.sel_index = None
+        self._zoom = 1.0
+        self._settle = 0
+        self._fitted = False
+        self._pan_from = None
+        self._msg = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._tick)
+
+    # -- data ----------------------------------------------------------------
+    def clear_graph(self):
+        self._timer.stop()
+        self.nodes = []
+        self.edge_items = []
+        self.edge_pairs = []
+        self.vx = []
+        self.vy = []
+        self.sel_index = None
+        self._fitted = False
+        self._settle = 0
+        self.scene().clear()
+        if self._msg is not None:
+            self._msg.deleteLater()
+            self._msg = None
+
+    def show_message(self, text):
+        self.clear_graph()
+        self._msg = QLabel(text, self.viewport())
+        self._msg.setObjectName("graphMsg")
+        self._msg.setWordWrap(True)
+        self._msg.setAlignment(Qt.AlignCenter)
+        self._msg.show()
+        self._place_msg()
+
+    def _place_msg(self):
+        if self._msg is not None:
+            self._msg.setGeometry(self.viewport().rect().adjusted(40, 40, -40, -40))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_msg()
+
+    def set_graph(self, data):
+        self.clear_graph()
+        nodes, edges = data["nodes"], data["edges"]
+        if not nodes:
+            self.show_message("No markdown notes found in this vault.")
+            return
+        scene = self.scene()
+        for i, nd in enumerate(nodes):
+            r = 6.0 + min(12.0, (nd["degree"] ** 0.5) * 2.4)
+            item = GraphNode(self, i, nd["name"], r, nd["parent"], nd["file"], nd["path"])
+            ang = i * 2.39996          # golden-angle spiral start
+            rad = 30.0 * ((i + 1) ** 0.62)
+            item.setPos(rad * math.cos(ang), rad * math.sin(ang))
+            scene.addItem(item)
+            self.nodes.append(item)
+            self.vx.append(0.0)
+            self.vy.append(0.0)
+        pen = QPen(QColor("#e3e5e8"), 1.4)
+        for a, b in edges:
+            li = QGraphicsLineItem(0, 0, 0, 0)
+            li.setPen(pen)
+            li.setZValue(0)
+            scene.addItem(li)
+            self.edge_items.append((li, a, b))
+            self.edge_pairs.append((a, b))
+        self.apply_highlights()
+        self.kick()
+
+    def select_node(self, node):
+        self.sel_index = None if node.index == self.sel_index else node.index
+        self.apply_highlights()
+        self.node_clicked.emit(node if self.sel_index is not None else None)
+
+    def apply_highlights(self):
+        neigh = set()
+        if self.sel_index is not None:
+            for a, b in self.edge_pairs:
+                if a == self.sel_index:
+                    neigh.add(b)
+                elif b == self.sel_index:
+                    neigh.add(a)
+        for i, it in enumerate(self.nodes):
+            if self.sel_index is None:
+                it.state = 0
+            elif i == self.sel_index:
+                it.state = 2
+            elif i in neigh:
+                it.state = 1
+            else:
+                it.state = 3
+            it.update()
+        pen_norm = QPen(QColor("#e3e5e8"), 1.4)
+        pen_hot = QPen(QColor("#a7adb4"), 2.0)
+        pen_dim = QPen(QColor("#f0f1f4"), 1.2)
+        for li, a, b in self.edge_items:
+            if self.sel_index is None:
+                li.setPen(pen_norm)
+            elif a == self.sel_index or b == self.sel_index:
+                li.setPen(pen_hot)
+            else:
+                li.setPen(pen_dim)
+
+    def pause(self):
+        self._timer.stop()
+
+    # -- simulation ------------------------------------------------------------
+    def kick(self):
+        self._settle = 0
+        if self.nodes and not self._timer.isActive():
+            self._timer.start()
+
+    def update_edges_for(self, idx):
+        for li, a, b in self.edge_items:
+            if a == idx or b == idx:
+                self._update_line(li, a, b)
+
+    def _update_line(self, li, a, b):
+        pa, pb = self.nodes[a].pos(), self.nodes[b].pos()
+        li.setLine(QLineF(pa.x(), pa.y(), pb.x(), pb.y()))
+
+    def _tick(self):
+        n = len(self.nodes)
+        if n == 0:
+            self._timer.stop()
+            return
+        items = self.nodes
+        xs = [it.x() for it in items]
+        ys = [it.y() for it in items]
+        fx = [0.0] * n
+        fy = [0.0] * n
+        cell = self.CELL
+        cutoff2 = self.CUTOFF * self.CUTOFF
+        grid = {}
+        for i in range(n):
+            grid.setdefault((int(xs[i] // cell), int(ys[i] // cell)), []).append(i)
+        kr = 26000.0
+        for i in range(n):
+            cx, cy = int(xs[i] // cell), int(ys[i] // cell)
+            xi, yi = xs[i], ys[i]
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for j in grid.get((gx, gy), ()):
+                        if j == i:
+                            continue
+                        dx, dy = xi - xs[j], yi - ys[j]
+                        d2 = dx * dx + dy * dy
+                        if d2 == 0.0:
+                            fx[i] += 2.0
+                            fy[i] += 1.5
+                            continue
+                        if d2 > cutoff2:
+                            continue
+                        f = kr / d2
+                        if f > 60.0:
+                            f = 60.0
+                        d = d2 ** 0.5
+                        fx[i] += dx / d * f
+                        fy[i] += dy / d * f
+        ks, rest = 0.028, 115.0
+        for a, b in self.edge_pairs:
+            dx, dy = xs[b] - xs[a], ys[b] - ys[a]
+            d = (dx * dx + dy * dy) ** 0.5
+            if d == 0.0:
+                continue
+            f = ks * (d - rest)
+            ux, uy = dx / d, dy / d
+            fx[a] += ux * f
+            fy[a] += uy * f
+            fx[b] -= ux * f
+            fy[b] -= uy * f
+        moved = 0.0
+        damp, maxv = 0.82, 13.0
+        for i in range(n):
+            fx[i] += -xs[i] * 0.0016
+            fy[i] += -ys[i] * 0.0016
+            if items[i]._dragging:
+                self.vx[i] = self.vy[i] = 0.0
+                continue
+            vx = (self.vx[i] + fx[i]) * damp
+            vy = (self.vy[i] + fy[i]) * damp
+            sp = (vx * vx + vy * vy) ** 0.5
+            if sp > maxv:
+                vx, vy = vx / sp * maxv, vy / sp * maxv
+            self.vx[i], self.vy[i] = vx, vy
+            items[i].setPos(xs[i] + vx, ys[i] + vy)
+            moved += abs(vx) + abs(vy)
+        for li, a, b in self.edge_items:
+            self._update_line(li, a, b)
+        if moved / max(1, n) < 0.12:
+            self._settle += 1
+            if self._settle > 25:
+                self._timer.stop()
+                if not self._fitted:
+                    self._fitted = True
+                    self.fit_view()
+        else:
+            self._settle = 0
+
+    def fit_view(self):
+        br = self.scene().itemsBoundingRect().adjusted(-80, -80, 80, 80)
+        if br.width() < 10:
+            return
+        self.fitInView(br, Qt.KeepAspectRatio)
+        self._zoom = self.transform().m11()
+
+    # -- interaction -----------------------------------------------------------
+    def wheelEvent(self, e):
+        delta = e.angleDelta().y()
+        factor = 1.18 if delta > 0 else 1 / 1.18
+        nz = self._zoom * factor
+        if 0.08 <= nz <= 8.0:
+            self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+            self.scale(factor, factor)
+            self._zoom = nz
+        e.accept()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and not isinstance(self.itemAt(e.pos()), GraphNode):
+            self._pan_from = e.pos()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._pan_from is not None:
+            d = e.pos() - self._pan_from
+            self._pan_from = e.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._pan_from is not None and e.button() == Qt.LeftButton:
+            self._pan_from = None
+            self.viewport().unsetCursor()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def contextMenuEvent(self, e):
+        if isinstance(self.itemAt(e.pos()), GraphNode):
+            super().contextMenuEvent(e)
+            return
+        menu = QMenu(self)
+        menu.addAction("Fit to view", self.fit_view)
+        menu.addAction("Re-run layout", self.kick)
+        menu.exec(e.globalPos())
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class MainWindow(FramelessWindow):
+    graph_ready = Signal(int, str, object)
+
+    def __init__(self, worker: SearchWorker):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.worker = worker
+        self.worker.have.connect(self.on_results)
+        self.graph_ready.connect(self.on_graph_ready)
+        self.view_seq = 0
+        self.current_place = None
+        self.current_place_name = "All Files"
+        self.current_cat = "all"
+        self.current_rows = []
+        self.view_mode = "list"
+        self._graph_seq = 0
+        self._indexer = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.titlebar = TitleBar(self, with_search=True)
+        self.titlebar.search.edit.textChanged.connect(self.on_search_changed)
+        root.addWidget(self.titlebar)
+
+        self._history = []
+        self.titlebar.btn_back.clicked.connect(self.go_back)
+        self.titlebar.btn_back.setEnabled(False)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        root.addLayout(body, 1)
+
+        # ---- sidebar ----
+        self.sidebar = QFrame(self)
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(206)
+        sbar = QVBoxLayout(self.sidebar)
+        sbar.setContentsMargins(10, 10, 10, 10)
+        sbar.setSpacing(2)
+        self._side_buttons = []
+        self._build_sidebar()
+        body.addWidget(self.sidebar)
+
+        # ---- main column ----
+        main = QFrame(self)
+        main.setObjectName("content")
+        mbar = QVBoxLayout(main)
+        mbar.setContentsMargins(0, 0, 0, 0)
+        mbar.setSpacing(0)
+
+        chips = QHBoxLayout()
+        chips.setContentsMargins(16, 10, 16, 8)
+        chips.setSpacing(8)
+        self._cat_buttons = {}
+        for label, cat in (("All", "all"), ("Folders", "folder"), ("Documents", "doc"),
+                           ("Images", "img"), ("Videos", "vid"), ("Music", "aud"),
+                           ("Archives", "zip"), ("Code", "code")):
+            b = QPushButton(label, main)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda checked, c=cat: self.select_cat(c))
+            chips.addWidget(b)
+            self._cat_buttons[cat] = b
+        self._cat_buttons["all"].setChecked(True)
+        self.btn_graph = QPushButton("Graph", main)
+        self.btn_graph.setCheckable(True)
+        self.btn_graph.setCursor(Qt.PointingHandCursor)
+        self.btn_graph.setFocusPolicy(Qt.NoFocus)
+        self.btn_graph.setToolTip("Force-directed graph of the current vault's notes and links")
+        self.btn_graph.clicked.connect(lambda checked: self.toggle_graph(checked))
+        chips.addWidget(self.btn_graph)
+        chips.addStretch(1)
+        chipsw = QWidget(main)
+        chipsw.setObjectName("chips")
+        chipsw.setLayout(chips)
+        mbar.addWidget(chipsw)
+
+        self.tree = ResultsTree(main)
+        self.tree.itemSelectionChanged.connect(self.on_selection)
+        self.tree.itemDoubleClicked.connect(
+            lambda item, col: self.open_in_app(item.data(0, Qt.UserRole)))
+        self.tree.reveal_requested.connect(lambda: self.open_in_app())
+        self.tree.open_requested.connect(self.open_current)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_context_menu)
+        mbar.addWidget(self.tree, 1)
+
+        self.empty_label = QLabel("No matches in this view", main)
+        self.empty_label.setObjectName("emptyLabel")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.hide()
+        mbar.addWidget(self.empty_label, 1)
+
+        self.graph_view = GraphView(main)
+        self.graph_view.hide()
+        self.graph_view.node_clicked.connect(self.on_node_clicked)
+        self.graph_view.node_activated.connect(self.on_node_activated)
+        self.graph_view.show_node_menu.connect(self.show_node_menu)
+        mbar.addWidget(self.graph_view, 1)
+        body.addWidget(main, 1)
+
+        # ---- details pane ----
+        self.details = DetailsPane(self)
+        body.addWidget(self.details)
+
+        # ---- status bar ----
+        self.status_bar = QFrame(self)
+        self.status_bar.setObjectName("statusbar")
+        self.status_bar.setFixedHeight(30)
+        stab = QHBoxLayout(self.status_bar)
+        stab.setContentsMargins(14, 0, 14, 0)
+        self.status_left = QLabel("", self.status_bar)
+        self.status_right = QLabel("", self.status_bar)
+        for lab in (self.status_left, self.status_right):
+            lab.setObjectName("statusText")
+        stab.addWidget(self.status_left)
+        stab.addStretch(1)
+        stab.addWidget(self.status_right)
+        root.addWidget(self.status_bar)
+
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(150)
+        self._search_debounce.timeout.connect(self.refresh_view)
+
+        self._spinner = QTimer(self)
+        self._spinner.setInterval(110)
+        self._spinner.timeout.connect(self._tick_spinner)
+        self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spin_i = 0
+        self._indexing_path = ""
+
+        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.titlebar.search.edit.setFocus())
+        QShortcut(QKeySequence("Escape"), self, self.escape_pressed)
+
+        self.select_cat("all")
+        if not os.environ.get("EZEXP_NO_AUTOSCAN"):
+            QTimer.singleShot(400, lambda: self.start_indexer(False))
+
+    # ---- helpers -----------------------------------------------------------
+    def on_max_state(self):
+        r = 0 if self._maximized else 12
+        self.titlebar.setStyleSheet(
+            f"#titlebar {{ border-top-left-radius: {r}px; border-top-right-radius: {r}px; }}")
+        self.status_bar.setStyleSheet(
+            f"#statusbar {{ border-bottom-left-radius: {r}px; border-bottom-right-radius: {r}px; }}")
+
+    def select_place(self, btn, path, name, vault=False):
+        self._push_history()
+        for b in self._side_buttons:
+            b.setChecked(b is btn)
+        self.current_place = path
+        self.current_place_name = name
+        self.titlebar.setTitle(name)
+        self.refresh_view()
+        if vault and path:
+            self.ensure_indexed(path)
+        if self.view_mode == "graph":
+            self.refresh_graph()
+
+    # ---- sidebar ----------------------------------------------------------
+    def _build_sidebar(self):
+        sbar = self.sidebar.layout()
+        while sbar.count():
+            item = sbar.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._side_buttons = []
+
+        def section(text):
+            lab = QLabel(text, self.sidebar)
+            lab.setObjectName("sideSection")
+            sbar.addSpacing(8)
+            sbar.addWidget(lab)
+
+        def place_btn(name, path, icon_kind, vault=False):
+            b = QPushButton("  " + name, self.sidebar)
+            b.setObjectName("sideBtn")
+            b.setIcon(place_icon(icon_kind))
+            b.setIconSize(QSize(16, 16))
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b._place = path
+            b._vault = vault
+            if vault:
+                b.setToolTip(path)
+                b.setContextMenuPolicy(Qt.CustomContextMenu)
+                b.customContextMenuRequested.connect(
+                    lambda pos, btn=b, p=path: self.show_vault_menu(btn, p))
+            b.clicked.connect(
+                lambda checked, btn=b, p=path, n=name, v=vault: self.select_place(btn, p, n, v))
+            sbar.addWidget(b)
+            self._side_buttons.append(b)
+            return b
+
+        section("Library")
+        self.btn_all = place_btn("All Files", None, "grid")
+        section("Favourites")
+        for nice, path in shell_folders():
+            icons = {"Desktop": "monitor", "Documents": "files", "Downloads": "download",
+                     "Pictures": "image", "Music": "music", "Videos": "film"}
+            place_btn(nice, path, icons.get(nice, "files"))
+        for v in get_vaults():
+            place_btn(os.path.basename(v) or v, v, "vault", vault=True)
+        add_btn = QPushButton("  ＋ Add Obsidian Vault…", self.sidebar)
+        add_btn.setObjectName("sideAction")
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.clicked.connect(self.add_vault)
+        sbar.addWidget(add_btn)
+        section("Locations")
+        for root_drive in fixed_drives():
+            place_btn(drive_label(root_drive), root_drive.rstrip("\\") or root_drive[:2], "drive")
+
+        sbar.addStretch(1)
+        self.rescan_btn = QPushButton("  Rescan now", self.sidebar)
+        self.rescan_btn.setObjectName("sideAction")
+        self.rescan_btn.setIcon(place_icon("drive"))
+        self.rescan_btn.setCursor(Qt.PointingHandCursor)
+        self.rescan_btn.clicked.connect(lambda: self.start_indexer(False))
+        sbar.addWidget(self.rescan_btn)
+        self.rebuild_btn = QPushButton("  Rebuild index", self.sidebar)
+        self.rebuild_btn.setObjectName("sideAction")
+        self.rebuild_btn.setCursor(Qt.PointingHandCursor)
+        self.rebuild_btn.clicked.connect(self.confirm_rebuild)
+        sbar.addWidget(self.rebuild_btn)
+
+        # restore the check mark on the current place
+        cur = (self.current_place or "").lower()
+        for b in self._side_buttons:
+            b.setChecked(bool(b._place) and (b._place or "").lower() == cur)
+
+    def show_vault_menu(self, btn, path):
+        menu = QMenu(self)
+        act = menu.addAction("Remove from Favourites")
+        act.triggered.connect(lambda: self.remove_vault(path))
+        menu.exec(btn.mapToGlobal(btn.rect().center()))
+
+    def add_vault(self):
+        vaults = get_vaults()
+        suggested = vaults[0] if vaults else "G:/mydrive/obsidian"
+        text, ok = QInputDialog.getText(
+            self, "Add Obsidian Vault", "Path to your Obsidian vault folder:",
+            text=suggested)
+        if not ok:
+            return
+        path = os.path.normpath(text.strip().strip('"').replace("/", os.sep))
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, APP_NAME, f"That folder doesn't exist:\n{path}")
+            return
+        if not any(v.lower() == path.lower() for v in vaults):
+            vaults.append(path)
+            set_vaults(vaults)
+        self._build_sidebar()
+        for b in self._side_buttons:
+            if getattr(b, "_vault", False) and (b._place or "").lower() == path.lower():
+                b.click()
+                break
+
+    def remove_vault(self, path):
+        set_vaults([v for v in get_vaults() if v.lower() != path.lower()])
+        self._build_sidebar()
+        if self.current_place and self.current_place.lower() == path.lower():
+            self.btn_all.click()
+
+    def ensure_indexed(self, path):
+        """If this place has never been indexed (e.g. a vault on a removable
+        drive), kick off a scan right away."""
+        p = path.rstrip("\\")
+        try:
+            n = thread_conn().execute(
+                "SELECT COUNT(*) FROM files WHERE parent=? COLLATE NOCASE"
+                " OR parent LIKE ? ESCAPE '#'",
+                (p, like_escape(p) + "\\%")).fetchone()[0]
+        except sqlite3.Error:
+            n = 1
+        if n == 0:
+            self.start_indexer(False)
+            self.status_left.setText("Scanning this vault for the first time…")
+
+    # ---- navigation ---------------------------------------------------------
+    def _push_history(self):
+        self._history.append((self.current_place, self.current_place_name))
+        if len(self._history) > 60:
+            self._history.pop(0)
+        self.titlebar.btn_back.setEnabled(True)
+
+    def go_back(self):
+        if not self._history:
+            return
+        place, name = self._history.pop()
+        self.current_place = place
+        self.current_place_name = name
+        self.titlebar.setTitle(name)
+        self.titlebar.search.edit.clear()
+        self.refresh_view()
+        self.titlebar.btn_back.setEnabled(bool(self._history))
+        cur = (place or "").lower()
+        for b in self._side_buttons:
+            b.setChecked(bool(b._place) and (b._place or "").lower() == cur)
+        if self.view_mode == "graph":
+            self.refresh_graph()
+
+    def drill_to_path(self, path, name):
+        self._push_history()
+        self.current_place = path.rstrip("\\")
+        self.current_place_name = name
+        self.titlebar.setTitle(name)
+        self.titlebar.search.edit.clear()
+        cur = (self.current_place or "").lower()
+        for b in self._side_buttons:
+            b.setChecked(bool(b._place) and (b._place or "").lower() == cur)
+        self.refresh_view()
+        if self.view_mode == "graph":
+            self.refresh_graph()
+
+    def drill_in(self, row):
+        path = join_path(row["parent"], row["name"])
+        self.drill_to_path(path, row["name"])
+
+    def open_in_app(self, row=None):
+        """Enter / double-click: folders drill down in EzExp; files show their
+        preview in the details pane (which selection already triggers)."""
+        row = row or self.current_row()
+        if not row:
+            return
+        if row["is_dir"]:
+            self.drill_in(row)
+
+    def select_cat(self, cat):
+        self.enter_list_mode(cat)
+
+    # ---- view modes ----------------------------------------------------------
+    def toggle_graph(self, checked):
+        if checked:
+            self.enter_graph_mode()
+        else:
+            self.enter_list_mode("all")
+
+    def enter_list_mode(self, cat="all"):
+        self.view_mode = "list"
+        self.current_cat = cat
+        self.btn_graph.setChecked(False)
+        for c, b in self._cat_buttons.items():
+            b.setChecked(c == cat)
+        self.graph_view.pause()
+        self.graph_view.hide()
+        self.tree.show()
+        self.refresh_view()
+
+    def enter_graph_mode(self):
+        self.view_mode = "graph"
+        for b in self._cat_buttons.values():
+            b.setChecked(False)
+        self.tree.hide()
+        self.empty_label.hide()
+        self.graph_view.show()
+        self.refresh_graph()
+
+    def refresh_graph(self):
+        vault = active_vault_for(self.current_place)
+        if not vault:
+            self.graph_view.show_message(
+                "Graph view shows an Obsidian vault.\n\n"
+                "Pick a vault in the sidebar (or any folder inside one), "
+                "then open the Graph tab again.")
+            self.status_left.setText("No vault selected")
+            return
+        self._graph_seq += 1
+        seq = self._graph_seq
+        self.graph_view.show_message(f"Building graph of “{os.path.basename(vault)}”…")
+        threading.Thread(target=self._build_graph_job, args=(seq, vault), daemon=True).start()
+
+    def _build_graph_job(self, seq, vault):
+        try:
+            data = build_vault_graph(thread_conn(), vault)
+        except Exception as exc:
+            data = {"error": str(exc)}
+        self.graph_ready.emit(seq, vault, data)
+
+    def on_graph_ready(self, seq, vault, data):
+        if seq != self._graph_seq or self.view_mode != "graph":
+            return
+        if "error" in data:
+            self.graph_view.show_message(f"Could not build the graph:\n{data['error']}")
+            return
+        self.graph_view.set_graph(data)
+        extra = ""
+        if data["total_md"] > len(data["nodes"]):
+            extra = f" (first {len(data['nodes'])} of {data['total_md']})"
+        self.status_left.setText(
+            f"{len(data['nodes'])} notes · {len(data['edges'])} links · "
+            f"{os.path.basename(vault)}{extra}")
+
+    def on_node_clicked(self, node):
+        if node is None:
+            return
+        try:
+            r = thread_conn().execute(
+                "SELECT parent, name, is_dir, size, mtime, category, kind FROM files"
+                " WHERE parent=? AND name=?", (node.parent_path, node.file)).fetchone()
+        except sqlite3.Error:
+            r = None
+        if r:
+            self.details.show_row(_row_dict(r))
+
+    def on_node_activated(self, node):
+        try:
+            os.startfile(node.path)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not open:\n{exc}")
+
+    def show_node_menu(self, node, gpos):
+        menu = QMenu(self)
+        menu.addAction("Open", lambda: self.on_node_activated(node))
+        menu.addAction("Show in Explorer", lambda: reveal_in_explorer(node.path))
+        menu.addAction("Copy as path", lambda: QApplication.clipboard().setText(node.path))
+        menu.exec(gpos)
+
+    def on_search_changed(self, text):
+        self._search_debounce.start()
+
+    def refresh_view(self):
+        q = self.titlebar.search.edit.text()
+        self.view_seq = self.worker.submit(q, self.current_place, self.current_cat)
+
+    def on_results(self, seq, q, rows, note):
+        if seq != self.view_seq:
+            return
+        self.current_rows = rows
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        for r in rows:
+            self.tree.addTopLevelItem(make_row_item(r))
+        self.tree.setUpdatesEnabled(True)
+        if self.view_mode != "list":
+            return
+        has = bool(rows)
+        self.tree.setVisible(has)
+        self.empty_label.setVisible(not has)
+        self.empty_label.setText("No matches in this view")
+        total = get_meta(thread_conn(), "total", "?")
+        try:
+            total_s = f"{int(total):,}"
+        except (TypeError, ValueError):
+            total_s = "…"
+        if q.strip():
+            left = f"{len(rows)} result{'s' if len(rows) != 1 else ''} for “{q.strip()}”"
+        else:
+            left = f"{len(rows)} shown · {total_s} items in index"
+        if note == "truncated":
+            left += "  (showing first 600 — refine to narrow)"
+        self.status_left.setText(left)
+        if not rows:
+            self.details.show_row(None)
+        else:
+            self.tree.setCurrentItem(self.tree.topLevelItem(0))
+
+    def on_selection(self):
+        item = self.tree.currentItem()
+        self.details.show_row(item.data(0, Qt.UserRole) if item else None)
+
+    def current_row(self):
+        item = self.tree.currentItem()
+        return item.data(0, Qt.UserRole) if item else None
+
+    def row_path(self, row):
+        p = join_path(row["parent"], row["name"])
+        return p + "\\" if len(p) == 2 else p
+
+    # ---- actions -----------------------------------------------------------
+    def reveal_current(self):
+        row = self.current_row()
+        if row:
+            reveal_in_explorer(self.row_path(row))
+
+    def open_current(self):
+        row = self.current_row()
+        if row:
+            try:
+                os.startfile(self.row_path(row))
+            except OSError as exc:
+                QMessageBox.warning(self, APP_NAME, f"Could not open:\n{exc}")
+
+    def show_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if not item:
+            return
+        self.tree.setCurrentItem(item)
+        row = item.data(0, Qt.UserRole)
+        menu = self.build_menu(row)
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def build_menu(self, row):
+        menu = QMenu(self)
+        act_reveal = menu.addAction("Show in Explorer")
+        act_reveal.triggered.connect(self.reveal_current)
+        act_open = menu.addAction("Open")
+        act_open.triggered.connect(self.open_current)
+        menu.addSeparator()
+        act_ren = menu.addAction("Rename…")
+        act_ren.triggered.connect(lambda: self.rename_current(row))
+        act_cp = menu.addAction("Copy as path")
+        act_cp.triggered.connect(lambda: QApplication.clipboard().setText(self.row_path(row)))
+        act_cpf = menu.addAction("Copy file")
+        act_cpf.triggered.connect(self.copy_current_file)
+        menu.addSeparator()
+        act_del = menu.addAction("Move to Recycle Bin")
+        act_del.triggered.connect(lambda: self.delete_current(row))
+        act_prop = menu.addAction("Properties")
+        act_prop.triggered.connect(lambda: show_properties(self.row_path(row)))
+        return menu
+
+    def copy_current_file(self):
+        row = self.current_row()
+        if not row:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(self.row_path(row))])
+        QApplication.clipboard().setMimeData(mime)
+
+    def rename_current(self, row):
+        new, ok = QInputDialog.getText(self, "Rename", "New name:", text=row["name"])
+        if not ok or not new.strip() or new == row["name"]:
+            return
+        new = new.strip()
+        old_path = self.row_path(row)
+        parent = row["parent"]
+        new_path = join_path(parent, new)
+        if len(new_path) <= 3:
+            QMessageBox.warning(self, APP_NAME, "That name is not allowed.")
+            return
+        try:
+            os.rename(real_dir(old_path), real_dir(new_path))
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Rename failed:\n{exc}")
+            return
+        conn = thread_conn()
+        try:
+            idr = conn.execute("SELECT id FROM files WHERE parent=? AND name=?",
+                               (parent, row["name"])).fetchone()
+            if idr:
+                conn.execute(
+                    "UPDATE files SET name=?, ext=?, category=?, kind=? WHERE id=?",
+                    (new, ext_of(new), category_for(new, row["is_dir"]),
+                     kind_for(new, row["is_dir"]), idr[0]))
+                fts_touch(conn, idr[0], new)
+            if row["is_dir"]:
+                conn.execute(
+                    "UPDATE files SET parent = ? || substr(parent, ?) "
+                    "WHERE parent LIKE ? ESCAPE '#'",
+                    (new_path, len(old_path) + 1, like_escape(old_path) + "\\%"))
+            conn.commit()
+        except sqlite3.Error:
+            pass
+        self.refresh_view()
+
+    def delete_current(self, row):
+        path = self.row_path(row)
+        kind = "folder and everything inside it" if row["is_dir"] else "file"
+        if QMessageBox.question(
+                self, "Move to Recycle Bin",
+                f"Move “{row['name']}” ({kind}) to the Recycle Bin?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        if not recycle_path(path):
+            QMessageBox.warning(self, APP_NAME, "Could not move to the Recycle Bin.")
+            return
+        try:
+            delete_tree(thread_conn(), path)
+        except sqlite3.Error:
+            pass
+        self.refresh_view()
+
+    def escape_pressed(self):
+        edit = self.titlebar.search.edit
+        if edit.text():
+            edit.clear()
+            self.refresh_view()
+
+    # ---- indexing ------------------------------------------------------------
+    def start_indexer(self, rebuild):
+        if self._indexer and self._indexer.isRunning():
+            return
+        self._indexer = IndexerThread(rebuild=rebuild)
+        self._indexer.progress.connect(self.on_index_progress)
+        self._indexer.done.connect(self.on_index_done)
+        self._indexer.start()
+        self.rescan_btn.setEnabled(False)
+        self._spinner.start()
+
+    def confirm_rebuild(self):
+        if QMessageBox.question(
+                self, "Rebuild index",
+                "Delete the current catalog and re-index every drive from scratch?\n"
+                "This can take several minutes.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self.start_indexer(True)
+
+    def on_index_progress(self, path, count):
+        self._indexing_path = path
+        self._count = count
+
+    def _tick_spinner(self):
+        self._spin_i = (self._spin_i + 1) % len(self._spin_frames)
+        if self._indexer and self._indexer.isRunning():
+            self.status_right.setText(
+                f"{self._spin_frames[self._spin_i]} Indexing: {self._indexing_path}  ·  "
+                f"{getattr(self, '_count', 0):,} items this run")
+
+    def on_index_done(self, total, err):
+        self._spinner.stop()
+        self.rescan_btn.setEnabled(True)
+        if err and err != "stopped":
+            self.status_right.setText(f"Index error: {err}")
+            return
+        stamp = time.strftime("%H:%M")
+        if total >= 0:
+            self.status_right.setText(f"{total:,} items indexed · updated {stamp}")
+            set_meta(thread_conn(), "total", total)
+        else:
+            self.status_right.setText("Indexing was interrupted")
+        self.refresh_view()
+        if self.view_mode == "graph":
+            self.refresh_graph()
+
+
+class ClickableLabel(QLabel):
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
+class DetailsPane(QFrame):
+    preview_ready = Signal(int, str, object)
+    PREVIEW_H = 200
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("details")
+        self.setFixedWidth(280)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 20)
+        lay.setSpacing(6)
+
+        self.preview_label = ClickableLabel(self)
+        self.preview_label.setObjectName("previewLabel")
+        self.preview_label.setFixedHeight(self.PREVIEW_H)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setCursor(Qt.PointingHandCursor)
+        self.preview_label.setToolTip("Click to open with the default app")
+        self.preview_label.clicked.connect(lambda: self.parent().open_current())
+        self.preview_label.hide()
+        lay.addWidget(self.preview_label)
+
+        self.text_preview = QLabel(self)
+        self.text_preview.setObjectName("textPreview")
+        self.text_preview.setWordWrap(True)
+        self.text_preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.text_preview.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.text_preview.setMaximumHeight(self.PREVIEW_H + 40)
+        self.text_preview.hide()
+        lay.addWidget(self.text_preview)
+
+        self.icon_label = QLabel(self)
+        self.icon_label.setFixedSize(72, 72)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        wrap = QHBoxLayout()
+        wrap.addStretch(1)
+        wrap.addWidget(self.icon_label)
+        wrap.addStretch(1)
+        lay.addLayout(wrap)
+
+        self.name_label = QLabel(self)
+        self.name_label.setObjectName("dName")
+        self.name_label.setAlignment(Qt.AlignCenter)
+        self.name_label.setWordWrap(False)
+        self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.name_label)
+
+        self.kind_label = QLabel(self)
+        self.kind_label.setObjectName("dKind")
+        self.kind_label.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.kind_label)
+
+        lay.addSpacing(10)
+        grid = QGridLayout()
+        grid.setVerticalSpacing(7)
+        grid.setHorizontalSpacing(10)
+        self.meta = {}
+        self.meta_keys = {}
+        for i, key in enumerate(("Size", "Items", "Where", "Modified")):
+            k = QLabel(key, self)
+            k.setObjectName("dKey")
+            v = QLabel(self)
+            v.setObjectName("dVal")
+            v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(k, i, 0, Qt.AlignTop)
+            grid.addWidget(v, i, 1)
+            self.meta[key] = v
+            self.meta_keys[key] = k
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.btn_show = QPushButton("Show in Folder", self)
+        self.btn_show.setObjectName("btnPrimary")
+        self.btn_show.setCursor(Qt.PointingHandCursor)
+        self.btn_show.clicked.connect(lambda: self.parent().reveal_current())
+        self.btn_open = QPushButton("Open", self)
+        self.btn_open.setObjectName("btnSecondary")
+        self.btn_open.setCursor(Qt.PointingHandCursor)
+        self.btn_open.clicked.connect(lambda: self.parent().open_current())
+        self.btn_more = QPushButton("⋯", self)
+        self.btn_more.setObjectName("dots")
+        self.btn_more.setFixedWidth(34)
+        self.btn_more.setCursor(Qt.PointingHandCursor)
+        self.btn_more.setToolTip("More actions")
+        self.btn_more.clicked.connect(self.more_menu)
+        btns.addWidget(self.btn_show, 1)
+        btns.addWidget(self.btn_open)
+        btns.addWidget(self.btn_more)
+        lay.addLayout(btns)
+
+        self._row = None
+        self._preview_seq = 0
+        self.preview_ready.connect(self.on_preview)
+        self.placeholder = "Select an item to see its details"
+        self.show_row(None)
+
+    def more_menu(self):
+        row = self.parent().current_row()
+        if not row:
+            return
+        menu = self.parent().build_menu(row)
+        menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
+
+    def show_row(self, row):
+        self._row = row
+        self._preview_seq += 1
+        self.preview_label.hide()
+        self.preview_label.clear()
+        self.text_preview.hide()
+        self.text_preview.clear()
+        self.icon_label.show()
+        if not row:
+            self.icon_label.hide()
+            self.name_label.setText(self.placeholder)
+            self.kind_label.setText("")
+            for v in self.meta.values():
+                v.setText("")
+            self.meta_keys["Items"].hide()
+            self.meta["Items"].hide()
+            self.btn_show.setEnabled(False)
+            self.btn_open.setEnabled(False)
+            self.btn_more.setEnabled(False)
+            return
+        pm = category_icon(row["category"]).pixmap(64, 64)
+        self.icon_label.setPixmap(pm)
+        fm = QFontMetrics(self.name_label.font())
+        self.name_label.setText(fm.elidedText(row["name"], Qt.ElideMiddle, 230))
+        self.name_label.setToolTip(row["name"])
+        self.kind_label.setText(row["kind"])
+        self.meta["Size"].setText("—" if row["is_dir"] else human_size(row["size"]))
+        where = row["parent"] if row["is_dir"] else row["parent"] + "\\" + row["name"]
+        if len(where) == 2:
+            where += "\\"
+        wfm = QFontMetrics(self.meta["Where"].font())
+        self.meta["Where"].setText(wfm.elidedText(where, Qt.ElideMiddle, 190))
+        self.meta["Where"].setToolTip(where)
+        self.meta["Modified"].setText(fmt_date(row["mtime"]))
+        if row["is_dir"]:
+            try:
+                n = thread_conn().execute(
+                    "SELECT COUNT(*) FROM files WHERE parent=? COLLATE NOCASE",
+                    (join_path(row["parent"], row["name"]),)).fetchone()[0]
+            except sqlite3.Error:
+                n = 0
+            self.meta["Items"].setText(f"{n:,}" if n else "—")
+            self.meta["Items"].show()
+            self.meta_keys["Items"].show()
+        else:
+            self.meta["Items"].hide()
+            self.meta_keys["Items"].hide()
+            self._start_preview(row)
+        self.btn_show.setEnabled(True)
+        self.btn_open.setEnabled(True)
+        self.btn_more.setEnabled(True)
+
+    # ---- previews -----------------------------------------------------------
+    def _start_preview(self, row):
+        seq = self._preview_seq
+        path = join_path(row["parent"], row["name"])
+        if len(path) == 2:
+            path += "\\"
+        threading.Thread(
+            target=self._load_preview,
+            args=(seq, path, row["category"], ext_of(row["name"])),
+            daemon=True).start()
+
+    def _load_preview(self, seq, path, cat, ext):
+        """Runs on a worker thread; emits the result back to the UI thread."""
+        payload = None
+        try:
+            if cat == "img":
+                img = QImage(path)
+                if img.isNull():
+                    img = shell_thumbnail(path, 512)
+                if img is not None and not img.isNull():
+                    payload = ("image", img)
+            elif cat == "vid":
+                img = shell_thumbnail(path, 512)
+                if img is not None and not img.isNull():
+                    payload = ("video", img)
+            elif ext in TEXT_EXTS:
+                with open(path, "rb") as f:
+                    raw = f.read(12000)
+                if b"\x00" not in raw:  # skip binary files that look like text
+                    payload = ("text", raw.decode("utf-8", "replace"))
+        except Exception:
+            payload = None
+        self.preview_ready.emit(seq, path, payload)
+
+    def on_preview(self, seq, path, payload):
+        row = self._row
+        if not row or seq != self._preview_seq:
+            return
+        cur = join_path(row["parent"], row["name"])
+        if len(cur) == 2:
+            cur += "\\"
+        if cur != path:
+            return
+        if payload is None:
+            return  # keep the painted icon
+        kind, data = payload
+        if kind in ("image", "video"):
+            img = data.scaled(236, self.PREVIEW_H - 8,
+                              Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pm = rounded_pixmap(QPixmap.fromImage(img), 8)
+            if kind == "video":
+                pm = with_play_badge(pm)
+            self.preview_label.setPixmap(pm)
+            self.preview_label.show()
+            self.icon_label.hide()
+        else:
+            self.text_preview.setText(data[:3000] + ("…" if len(data) > 3000 else ""))
+            self.text_preview.show()
+            self.icon_label.hide()
+
+
+# ---------------------------------------------------------------------------
+# Spotlight-style quick search
+# ---------------------------------------------------------------------------
+
+class Spotlight(FramelessWindow):
+    W, H = 660, 470
+
+    def __init__(self, worker: SearchWorker):
+        super().__init__()
+        self.setWindowTitle("EzExp Quick Search")
+        self.main = None  # MainWindow, wired in main()
+        self.setMinimumSize(self.W, 300)
+        self.worker = worker
+        self.worker.have.connect(self.on_results)
+        self.spot_seq = 0
+
+        panel = QFrame(self)
+        panel.setObjectName("spotPanel")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        srow = QHBoxLayout()
+        srow.setContentsMargins(18, 14, 18, 14)
+        icon = QLabel(panel)
+        icon.setPixmap(search_glyph().pixmap(22, 22))
+        srow.addWidget(icon)
+        srow.addSpacing(10)
+        self.edit = QLineEdit(panel)
+        self.edit.setObjectName("spotInput")
+        self.edit.setAttribute(Qt.WA_MacShowFocusRect, False)
+        self.edit.setPlaceholderText("Search your entire PC")
+        self.edit.textChanged.connect(self.on_text)
+        srow.addWidget(self.edit, 1)
+        lay.addLayout(srow)
+
+        self.tree = QTreeWidget(panel)
+        self.tree.setColumnCount(1)
+        self.tree.setHeaderHidden(True)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setFocusPolicy(Qt.NoFocus)
+        self.tree.setItemDelegateForColumn(0, SpotDelegate(self.tree))
+        lay.addWidget(self.tree, 1)
+
+        foot = QLabel("  ⏎  Open      Ctrl ⏎  Show in Folder      Esc  Close  ", panel)
+        foot.setObjectName("spotFooter")
+        foot.setFixedHeight(34)
+        lay.addWidget(foot)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(panel)
+        self.resize(self.W, self.H)
+
+    def on_text(self, text):
+        self.spot_seq = self.worker.submit(text, None, "all")
+
+    def on_results(self, seq, q, rows, note):
+        if seq != self.spot_seq:
+            return
+        self.tree.clear()
+        if not q.strip():
+            rows = rows[:8]
+            if rows:
+                self.tree.addTopLevelItem(self._header("Recent"))
+                for r in rows:
+                    self.tree.addTopLevelItem(self._item(r))
+            return
+        if not rows:
+            item = QTreeWidgetItem(["No results"])
+            item.setFlags(Qt.NoItemFlags)
+            self.tree.addTopLevelItem(item)
+            return
+        self.tree.addTopLevelItem(self._header("Top Hit"))
+        self.tree.addTopLevelItem(self._item(rows[0]))
+        groups = [("folder", "Folders"), ("doc", "Documents"), ("img", "Images"),
+                  ("vid", "Video"), ("aud", "Audio"), ("zip", "Archives"),
+                  ("code", "Code"), ("other", "Other")]
+        rest = rows[1:]
+        for cat, label in groups:
+            hits = [r for r in rest if r["category"] == cat][:3]
+            if hits:
+                self.tree.addTopLevelItem(self._header(label))
+                for r in hits:
+                    self.tree.addTopLevelItem(self._item(r))
+        self.tree.setCurrentItem(self.tree.topLevelItem(1))
+
+    def _header(self, text):
+        item = QTreeWidgetItem([text])
+        item.setFlags(Qt.ItemIsEnabled)
+        item.setData(0, Qt.UserRole, {"__header__": True, "text": text})
+        return item
+
+    def _item(self, row):
+        item = QTreeWidgetItem([row["name"]])
+        item.setData(0, Qt.UserRole, row)
+        return item
+
+    def current_row(self):
+        item = self.tree.currentItem()
+        if not item:
+            return None
+        row = item.data(0, Qt.UserRole)
+        if not row or row.get("__header__"):
+            return None
+        return row
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.hide()
+            return
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            row = self.current_row()
+            if row:
+                path = join_path(row["parent"], row["name"])
+                if len(path) == 2:
+                    path += "\\"
+                if e.modifiers() & Qt.ControlModifier:
+                    reveal_in_explorer(path)
+                    self.hide()
+                elif row["is_dir"]:
+                    if self.main is not None:
+                        self.main.show()
+                        self.main.raise_()
+                        self.main.activateWindow()
+                        self.main.drill_to_path(path, row["name"])
+                    self.hide()
+                else:
+                    try:
+                        os.startfile(path)
+                    except OSError:
+                        pass
+                    self.hide()
+            return
+        if e.key() == Qt.Key_Down:
+            self._move_sel(1)
+            return
+        if e.key() == Qt.Key_Up:
+            self._move_sel(-1)
+            return
+        super().keyPressEvent(e)
+
+    def _move_sel(self, delta):
+        cur = self.tree.currentItem()
+        if cur is None:
+            i = 0
+        else:
+            i = self.tree.indexOfTopLevelItem(cur) + delta
+        i = max(0, min(self.tree.topLevelItemCount() - 1, i))
+        item = self.tree.topLevelItem(i)
+        while item and item.data(0, Qt.UserRole) and item.data(0, Qt.UserRole).get("__header__"):
+            i += delta
+            if i < 0 or i >= self.tree.topLevelItemCount():
+                return
+            item = self.tree.topLevelItem(i)
+        if item:
+            self.tree.setCurrentItem(item)
+
+    def open_spotlight(self):
+        self.edit.clear()
+        self.spot_seq = self.worker.submit("", None, "all")
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(scr.x() + (scr.width() - self.W) // 2,
+                  scr.y() + int(scr.height() * 0.16))
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.edit.setFocus()
+
+    def keyReleaseEvent(self, e):
+        super().keyReleaseEvent(e)
+
+    def hideEvent(self, e):
+        self.edit.clear()
+        super().hideEvent(e)
+
+
+class SpotDelegate(QStyledItemDelegate):
+    ROW_H = 40
+    HEAD_H = 28
+
+    def sizeHint(self, option, index):
+        row = index.data(Qt.UserRole)
+        head = row and row.get("__header__")
+        return QSize(200, self.HEAD_H if head else self.ROW_H)
+
+    def paint(self, p, option, index):
+        row = index.data(Qt.UserRole)
+        if not row:
+            return super().paint(p, option, index)
+        p.save()
+        r = option.rect
+        if row.get("__header__"):
+            f = QFont(option.font)
+            f.setPointSizeF(7.5)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor(SUBTLE))
+            p.drawText(r.adjusted(20, 0, -12, -4), Qt.AlignLeft | Qt.AlignBottom, row["text"])
+            p.restore()
+            return
+        selected = bool(option.state & QStyle.State_Selected)
+        if selected:
+            p.fillRect(r.adjusted(8, 1, -8, -1), QColor(ACCENT))
+        icon = category_icon(row["category"])
+        p.drawPixmap(r.left() + 16, r.top() + (r.height() - 26) // 2, icon.pixmap(26, 26))
+        f = QFont(option.font)
+        f.setPointSizeF(row["category"] == "folder" and 10.5 or 10.0)
+        p.setFont(f)
+        p.setPen(QColor("#ffffff") if selected else QColor(TEXT))
+        fm = QFontMetrics(f)
+        name = fm.elidedText(row["name"], Qt.ElideRight, r.width() - 320)
+        p.drawText(r.left() + 54, r.top(), r.width() - 320, r.height(),
+                   Qt.AlignLeft | Qt.AlignVCenter, name)
+        small = QFont(option.font)
+        small.setPointSizeF(8.0)
+        p.setFont(small)
+        p.setPen(QColor("rgba(255,255,255,0.85)") if selected else QColor(SUBTLE))
+        right = row["kind"] + ("" if row["is_dir"] else "  ·  " + human_size(row["size"]))
+        p.drawText(r.right() - 260, r.top(), 248, r.height(),
+                   Qt.AlignRight | Qt.AlignVCenter,
+                   QFontMetrics(small).elidedText(right, Qt.ElideLeft, 248))
+        p.restore()
+
+
+# ---------------------------------------------------------------------------
+# Global hotkey (Alt+Space)
+# ---------------------------------------------------------------------------
+
+WM_HOTKEY = 0x0312
+MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
+HOTKEY_ID = 0xB00B
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def nativeEventFilter(self, event_type, message):
+        try:
+            if str(event_type) == "windows_generic_MSG":
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                    self.callback()
+        except Exception:
+            pass
+        return False, 0
+
+
+def register_hotkey():
+    user32 = ctypes.windll.user32
+    if user32.RegisterHotKey(None, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, 0x20):
+        return "Alt+Space"
+    if user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x20):
+        return "Ctrl+Alt+Space"
+    return None
+
+
+def unregister_hotkey():
+    try:
+        ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Stylesheet
+# ---------------------------------------------------------------------------
+
+QSS = """
+* { font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+QWidget { color: #1d1d1f; font-size: 13px; }
+
+#titlebar { background: #f1f1f4; border-bottom: 1px solid #e3e3e8;
+    border-top-left-radius: 12px; border-top-right-radius: 12px; }
+#title { font-size: 15px; font-weight: 600; color: #26262a; background: transparent; }
+QPushButton#tclose { background: #ff5f57; border: none; border-radius: 6.5px; min-width: 13px; max-width: 13px; min-height: 13px; max-height: 13px; }
+QPushButton#tclose:hover { background: #e0443e; }
+QPushButton#tmin { background: #febc2e; border: none; border-radius: 6.5px; min-width: 13px; max-width: 13px; min-height: 13px; max-height: 13px; }
+QPushButton#tmin:hover { background: #e6a926; }
+QPushButton#tmax { background: #28c840; border: none; border-radius: 6.5px; min-width: 13px; max-width: 13px; min-height: 13px; max-height: 13px; }
+QPushButton#tmax:hover { background: #22ad38; }
+
+#sidebar { background: #f0f0f4; border-right: 1px solid #e3e3e8; }
+#sideSection { color: #98989d; font-size: 11px; font-weight: 600; background: transparent; }
+QPushButton#sideBtn { background: transparent; border: none; border-radius: 7px;
+    padding: 6px 10px; text-align: left; color: #1d1d1f; }
+QPushButton#sideBtn:hover:!checked { background: rgba(0,0,0,0.06); }
+QPushButton#sideBtn:checked { background: #0a84ff; color: #fff; }
+QPushButton#sideBtn:checked:hover { background: #0a84ff; }
+QPushButton#sideAction { background: transparent; border: none; border-radius: 7px;
+    padding: 6px 10px; text-align: left; color: #6e6e73; font-size: 12px; }
+QPushButton#sideAction:hover { background: rgba(0,0,0,0.06); }
+QPushButton#sideAction:disabled { color: #c7c7cc; }
+
+#content { background: #ffffff; }
+#chips { background: #ffffff; }
+#chips QPushButton { background: #f1f1f4; border: none; border-radius: 999px;
+    padding: 5px 12px; font-size: 12px; color: #3a3a3c; }
+#chips QPushButton:hover:!checked { background: #e8e8ed; }
+#chips QPushButton:checked { background: #0a84ff; color: #fff; }
+
+QTreeWidget { background: #ffffff; border: none; outline: none; }
+QTreeWidget::item { border: none; padding: 0; }
+QTreeWidget::item:hover { background: #f6f6f8; }
+QTreeWidget::item:selected { background: #0a84ff; color: #ffffff; }
+QHeaderView::section { background: #fafafa; color: #86868b; font-size: 11px;
+    font-weight: 600; border: none; border-bottom: 1px solid #ececf0;
+    border-right: 1px solid #f4f4f6; padding: 6px 8px; }
+#emptyLabel { color: #98989d; background: #ffffff; }
+
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: #c9c9ce; border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #b6b6bc; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #c9c9ce; border-radius: 4px; min-width: 30px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+#statusbar { background: #f6f6f8; border-top: 1px solid #e7e7ec;
+    border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; }
+#statusText { color: #86868b; font-size: 11px; background: transparent; }
+
+#details { background: #fafafc; border-left: 1px solid #ececf0; }
+#dName { font-size: 15px; font-weight: 600; background: transparent; }
+#dKind { color: #98989d; font-size: 12px; background: transparent; }
+#dKey { color: #98989d; font-size: 12px; background: transparent; }
+#dVal { color: #3a3a3c; font-size: 12px; background: transparent; }
+QPushButton#btnPrimary { background: #0a84ff; color: #fff; border: none;
+    border-radius: 8px; padding: 8px 12px; font-weight: 500; }
+QPushButton#btnPrimary:hover { background: #0071e3; }
+QPushButton#btnPrimary:disabled { background: #b7d7ff; }
+QPushButton#btnSecondary { background: #e9e9ee; border: none; border-radius: 8px; padding: 8px 12px; }
+QPushButton#btnSecondary:hover { background: #e0e0e6; }
+QPushButton#btnSecondary:disabled { color: #c7c7cc; }
+QPushButton#dots { background: #e9e9ee; border: none; border-radius: 8px;
+    font-size: 15px; color: #6e6e73; padding: 6px 0; }
+QPushButton#dots:hover { background: #e0e0e6; }
+
+#searchField { background: #e4e4e9; border-radius: 8px; border: 1px solid transparent; }
+#searchField[focus="true"] { background: #ffffff; border: 1px solid #0a84ff; }
+#searchField QLineEdit { background: transparent; border: none; font-size: 13px; }
+
+#spotPanel { background: #ffffff; border: 1px solid #e6e6ea; border-radius: 16px; }
+#spotInput { font-size: 20px; border: none; background: transparent; }
+#spotFooter { color: #86868b; font-size: 12px; border-top: 1px solid #ececf0;
+    background: #fafafa; border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+
+QMenu { background: #ffffff; border: 1px solid #e3e3e8; border-radius: 10px; padding: 5px; }
+QMenu::item { padding: 6px 24px 6px 12px; border-radius: 6px; background: transparent; }
+QMenu::item:selected { background: #0a84ff; color: #fff; }
+QMenu::separator { height: 1px; background: #ececf0; margin: 4px 8px; }
+
+QToolTip { background: rgba(28,28,30,0.92); color: #fff; border: none;
+    padding: 5px 8px; border-radius: 6px; font-size: 12px; }
+
+#backBtn { background: transparent; border: none; border-radius: 13px;
+    color: #6e6e73; font-size: 16px; }
+#backBtn:hover:!disabled { background: rgba(0,0,0,0.08); }
+#backBtn:disabled { color: #c7c7cc; }
+#textPreview { color: #3a3a3c; font-size: 11px; background: #f4f4f6;
+    border-radius: 8px; padding: 10px; }
+#previewLabel { background: transparent; }
+#graphMsg { color: #98989d; font-size: 13px; background: transparent; }
+
+QMessageBox, QInputDialog { background: #f5f5f7; }
+QPushButton { min-height: 22px; }
+"""
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    QApplication.setStyle("Fusion")
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName("ezexp")
+    app.setWindowIcon(category_icon("folder"))
+    app.setStyleSheet(QSS)
+
+    worker = SearchWorker()
+    worker.start()
+
+    win = MainWindow(worker)
+    win.resize(1180, 720)
+    scr = app.primaryScreen().availableGeometry()
+    win.move(scr.x() + (scr.width() - 1180) // 2, scr.y() + (scr.height() - 720) // 2)
+    win.show()
+
+    spot = Spotlight(worker)
+    spot.main = win
+
+    def toggle_spotlight():
+        if spot.isVisible():
+            spot.hide()
+        else:
+            spot.open_spotlight()
+
+    hotkey_name = register_hotkey()
+    if hotkey_name:
+        filt = HotkeyFilter(toggle_spotlight)
+        app.installNativeEventFilter(filt)
+    else:
+        filt = None
+        win.status_right.setText("Quick search hotkey unavailable (Alt+Space busy)")
+
+    # quietly refresh the index every 10 minutes
+    auto = QTimer()
+    auto.setInterval(10 * 60 * 1000)
+    auto.timeout.connect(lambda: win.start_indexer(False))
+    auto.start()
+
+    rc = app.exec()
+
+    worker.stop()
+    if win._indexer and win._indexer.isRunning():
+        win._indexer.stop()
+        win._indexer.wait(3000)
+    unregister_hotkey()
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
