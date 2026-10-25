@@ -532,6 +532,7 @@ def _ensure_schema(conn):
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_key ON files(parent, name);
         CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
+        CREATE INDEX IF NOT EXISTS idx_files_parent_nc ON files(parent COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive);
         CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
         CREATE INDEX IF NOT EXISTS idx_files_cat ON files(category);
@@ -1999,6 +2000,8 @@ class NameDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
         p.save()
         r = option.rect
+        if selected:
+            p.fillRect(r, QColor(ACCENT))
         icon = category_icon(row["category"])
         pm = icon.pixmap(30, 30)
         p.drawPixmap(r.left() + 12, r.top() + (r.height() - 30) // 2, pm)
@@ -3627,7 +3630,7 @@ class MainWindow(FramelessWindow):
         if note == "truncated":
             left += "  (showing first 600 — refine to narrow)"
         self.status_left.setText(left)
-        if not rows:
+        if not rows and not self._ql_selected:
             self.details.show_row(None)
         else:
             self.tree.setCurrentItem(self.tree.topLevelItem(0))

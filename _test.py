@@ -34,6 +34,10 @@ with open(os.path.join(data, "render_final.mp4"), "w") as f:
 
 conn = ez.db_connect()
 assert ez.FTS_OK, "FTS5 trigram tokenizer should be available"
+plan = " ".join(str(p) for p in conn.execute(
+    "EXPLAIN QUERY PLAN SELECT * FROM files WHERE parent = ?"
+    " COLLATE NOCASE", ("x",)).fetchall())
+assert "idx_files_parent_nc" in plan, plan
 ez.scan_full(conn, [data], lambda p, c: None)
 assert ez.get_meta(conn, "phase") == "full_done"
 
@@ -293,6 +297,9 @@ wait_results()
 assert captured.get("rows") and names(captured["rows"]) == ["meeting-notes.txt"], captured
 assert win.tree.topLevelItemCount() == 1, win.tree.topLevelItemCount()
 assert "meeting-notes" in win.details.name_label.text(), win.details.name_label.text()
+img = win.tree.viewport().grab().toImage()
+px = img.pixelColor(200, 23)   # name-column background of selected row
+assert px.blue() > px.red() + 30, px   # blue selection, not white
 
 # text preview for .txt files loads asynchronously into the details pane
 wait_results(1500)
