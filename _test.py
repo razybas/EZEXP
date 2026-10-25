@@ -99,9 +99,16 @@ try:
     with open(log, encoding="utf-8") as fh:
         assert "ezexp-test-marker" in fh.read()
     # single instance: first acquire holds, second is refused
+    fresh = os.path.join(tempfile.mkdtemp(), "fresh")
+    ez.APP_DIR = fresh
+    assert not os.path.exists(fresh)
     lk = ez.acquire_single_instance()
     assert lk is not None
     assert ez.acquire_single_instance() is None
+    lk.unlock()
+    ez._single_instance_lock = None
+    lk = ez.acquire_single_instance()
+    assert lk is not None
     lk.unlock()
     ez._single_instance_lock = None
 finally:

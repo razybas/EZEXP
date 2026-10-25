@@ -4787,6 +4787,7 @@ def acquire_single_instance():
     detects locks left behind by a crashed process and takes them over.
     Returns the held QLockFile, or None if another instance holds it."""
     global _single_instance_lock
+    os.makedirs(APP_DIR, exist_ok=True)
     lock = QLockFile(os.path.join(APP_DIR, "ezexp.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(100):
