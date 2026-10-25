@@ -348,6 +348,37 @@ wait_results()
 assert win.tree.topLevelItemCount() == 0
 assert not win.empty_label.isHidden()
 
+# --- quick launch -------------------------------------------------------------
+fake_app = os.path.join(data, "fake_app.exe")
+with open(fake_app, "wb") as f:
+    f.write(b"MZ" + b"\x00" * 100)
+
+ez.set_quicklaunch([fake_app])
+assert ez.get_quicklaunch() == [os.path.normpath(fake_app)]
+ez.bump_launch_count(fake_app)
+assert ez.get_launch_counts().get(fake_app, 0) >= 1
+
+win._build_sidebar()
+wait_results(300)
+assert len(win._ql_buttons) >= 1
+ql_btn = win._ql_buttons[0]
+assert ql_btn.path().lower() == os.path.normpath(fake_app).lower()
+
+win.select_app(fake_app, ql_btn)
+assert win._ql_selected == fake_app
+assert win.details.btn_show.isEnabled()
+assert win.details.btn_open.isEnabled()
+assert "fake_app" in win.details.name_label.text().lower()
+
+app_menu = win.build_app_menu(fake_app)
+assert app_menu is not None
+assert len(app_menu.actions()) >= 4
+
+# clear via remove_quicklaunch
+win.remove_quicklaunch(fake_app)
+assert fake_app not in ez.get_quicklaunch()
+assert win._ql_selected is None
+
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")

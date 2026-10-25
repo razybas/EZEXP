@@ -15,8 +15,10 @@ EzExp just always knows where everything is.
 import os
 import sys
 import re
+import json
 import math
 import time
+import zlib
 import ctypes
 import threading
 import subprocess
@@ -66,6 +68,50 @@ def get_vaults():
 def set_vaults(paths):
     s = QSettings("ezexp", "EzExp")
     s.setValue("vaults", [os.path.normpath(p) for p in paths])
+    s.sync()
+
+
+# ---------------------------------------------------------------------------
+# Quick Launch (frequently-used + manually pinned apps)
+# ---------------------------------------------------------------------------
+
+APP_EXTS = {"exe", "lnk", "bat", "cmd", "msi"}
+
+
+def get_quicklaunch():
+    v = QSettings("ezexp", "EzExp").value("quicklaunch", [])
+    if isinstance(v, str):
+        v = [v]
+    return [os.path.normpath(p) for p in (v or [])
+            if isinstance(p, str) and p]
+
+
+def set_quicklaunch(paths):
+    s = QSettings("ezexp", "EzExp")
+    s.setValue("quicklaunch", [os.path.normpath(p) for p in paths])
+    s.sync()
+
+
+def get_launch_counts():
+    v = QSettings("ezexp", "EzExp").value("launch_counts", "")
+    try:
+        d = json.loads(v) if isinstance(v, str) and v else (v or {})
+    except (ValueError, TypeError):
+        d = {}
+    out = {}
+    for k, c in (d.items() if isinstance(d, dict) else []):
+        try:
+            out[k] = int(c)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def bump_launch_count(path):
+    s = QSettings("ezexp", "EzExp")
+    d = get_launch_counts()
+    d[path] = d.get(path, 0) + 1
+    s.setValue("launch_counts", json.dumps(d))
     s.sync()
 
 ACCENT = "#0a84ff"
@@ -1065,6 +1111,7 @@ def build_vault_graph(conn, vault, max_nodes=4000):
 
     # displayed tree: vault root + top-level folder bubbles + root notes
     nodes = [{"label": vp.rsplit("\\", 1)[-1] or vp, "kind": "folder",
+              "category": "folder",
               "weight": total, "sub": f"{total:,} notes", "path": vp,
               "parent_path": None, "file": None, "has_children": True}]
     edges = []
@@ -1075,9 +1122,9 @@ def build_vault_graph(conn, vault, max_nodes=4000):
         full = join_path(vp, name)
         fl = full.lower()
         n = sum(1 for p in note_paths if p.lower().startswith(fl + "\\"))
-        nodes.append({"label": name, "kind": "folder", "weight": n,
-                      "sub": f"{n:,} notes", "path": full, "parent_path": vp,
-                      "file": name, "has_children": n > 0})
+        nodes.append({"label": name, "kind": "folder", "category": "folder",
+                      "weight": n, "sub": f"{n:,} notes", "path": full,
+                      "parent_path": vp, "file": name, "has_children": n > 0})
         edges.append([root_idx, len(nodes) - 1])
     for parent, name in rows:
         if parent.lower() != vp.lower():
@@ -1085,8 +1132,8 @@ def build_vault_graph(conn, vault, max_nodes=4000):
         stem = name[:-3] if name.lower().endswith(".md") else name
         p = join_path(parent, name)
         d = degree.get(p.lower(), 0)
-        nodes.append({"label": stem, "kind": "note", "weight": d,
-                      "sub": f"{d} links" if d else None, "path": p,
+        nodes.append({"label": stem, "kind": "note", "category": "doc",
+                      "weight": d, "sub": f"{d} links" if d else None, "path": p,
                       "parent_path": vp, "file": name, "has_children": False})
         edges.append([root_idx, len(nodes) - 1])
     return {"nodes": nodes, "edges": edges, "mode": "vault",
@@ -1201,6 +1248,7 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
             po = orig_of[pl]
             idx_of[pl] = len(nodes)
             nodes.append({"label": po.rsplit("\\", 1)[-1], "kind": "folder",
+                          "category": "folder",
                           "weight": total.get(pl, 0),
                           "sub": f"{total.get(pl, 0):,} items", "path": po,
                           "parent_path": orig_of.get(parent_of.get(pl, "")),
@@ -1231,7 +1279,9 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
                 " ORDER BY name COLLATE NOCASE LIMIT 250", (r,)).fetchall()
             for name, size in rows:
                 idx = len(nodes)
-                nodes.append({"label": name, "kind": "file", "weight": size or 0,
+                nodes.append({"label": name, "kind": "file",
+                              "category": category_for(name, False),
+                              "weight": size or 0,
                               "sub": human_size(size), "path": join_path(r, name),
                               "parent_path": r, "file": name, "has_children": False})
                 edges.append((ri, idx))
@@ -1411,6 +1461,72 @@ def search_glyph():
     icon = QIcon(pm)
     _icon_cache[key] = icon
     return icon
+
+
+def app_icon(size=18):
+    """Quick-launch glyph: a rounded tile with a play wedge."""
+    key = "glyph:app:%d" % size
+    if key in _icon_cache:
+        return _icon_cache[key]
+    pm, p = _painter_on(size)
+    s = size / 18.0
+    p.setPen(QPen(QColor(ACCENT), 1.6 * s))
+    p.setBrush(Qt.NoBrush)
+    p.drawRoundedRect(2 * s, 2 * s, 14 * s, 14 * s, 4 * s, 4 * s)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(ACCENT))
+    tri = QPainterPath()
+    tri.moveTo(7 * s, 6 * s)
+    tri.lineTo(7 * s, 12 * s)
+    tri.lineTo(13 * s, 9 * s)
+    tri.closeSubpath()
+    p.drawPath(tri)
+    p.end()
+    icon = QIcon(pm)
+    _icon_cache[key] = icon
+    return icon
+
+
+def app_logo_pixmap(size=256):
+    """EzExp logo: mac-style tile, folder + magnifier, purple vault spark."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    s = size / 256.0
+    tile = QRectF(16 * s, 16 * s, 224 * s, 224 * s)
+    tile_path = QPainterPath()
+    tile_path.addRoundedRect(tile, 52 * s, 52 * s)
+    grad = QLinearGradient(0, 16 * s, 0, 240 * s)
+    grad.setColorAt(0, QColor("#fbfbfd"))
+    grad.setColorAt(1, QColor("#e6e8ee"))
+    p.fillPath(tile_path, grad)
+    p.setPen(QPen(QColor("#d2d5dc"), 2 * s))
+    p.drawPath(tile_path)
+    # folder
+    p.setPen(Qt.NoPen)
+    fgrad = QLinearGradient(0, 70 * s, 0, 200 * s)
+    fgrad.setColorAt(0, QColor("#6cb5ff"))
+    fgrad.setColorAt(1, QColor("#0a84ff"))
+    p.setBrush(QColor("#3f9bff"))
+    p.drawRoundedRect(QRectF(50 * s, 78 * s, 66 * s, 26 * s), 9 * s, 9 * s)
+    p.setBrush(fgrad)
+    p.drawRoundedRect(QRectF(50 * s, 92 * s, 152 * s, 106 * s), 16 * s, 16 * s)
+    # magnifier
+    pen = QPen(QColor("#8b9198"), 15 * s)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(QPointF(158 * s, 158 * s), 42 * s, 42 * s)
+    pen.setWidthF(19 * s)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.drawLine(QPointF(188 * s, 188 * s), QPointF(214 * s, 214 * s))
+    # vault spark on the glass
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#8b5cf6"))
+    p.drawEllipse(QPointF(146 * s, 146 * s), 11 * s, 11 * s)
+    p.end()
+    return pm
 
 
 def rounded_pixmap(pm, radius=8):
@@ -1862,6 +1978,7 @@ class GraphNode(QGraphicsObject):
         self.sub = sub
         self.show_label = True
         self.can_expand = False
+        self.icon_pm = None
         self.state = 0      # 0 normal, 1 neighbor/hover, 2 selected, 3 dimmed
         self._hover = False
         self._dragging = False
@@ -1891,6 +2008,10 @@ class GraphNode(QGraphicsObject):
         p.setBrush(fill)
         p.setPen(QPen(border, 1.4))
         p.drawEllipse(QPointF(0, 0), self.radius, self.radius)
+        if self.icon_pm is not None and not self.icon_pm.isNull():
+            iw = self.icon_pm.width()
+            ih = self.icon_pm.height()
+            p.drawPixmap(QPointF(-iw / 2.0, -ih / 2.0), self.icon_pm)
         if self.can_expand:
             bx, by = self.radius * 0.82, -self.radius * 0.82
             p.setBrush(QColor("#8b5cf6"))
@@ -1990,6 +2111,7 @@ class GraphView(QGraphicsView):
         self._roots_idx = []
         self._link_src_dst = []      # vault mode: resolved note-link paths
         self._link_lines = []        # vault mode: (line_item, a_idx, b_idx)
+        self._pm_cache = {}          # (category, size) -> QPixmap for nodes
         self._zoom = 1.0
         self._settle = 0
         self._fitted = False
@@ -2106,6 +2228,19 @@ class GraphView(QGraphicsView):
         self.kick()
 
     # ---- structure mode: progressive disclosure --------------------------------
+    def node_icon_pm(self, cat, radius):
+        size = max(14, min(34, int(radius * 1.7)))
+        key = (cat, size)
+        if key not in self._pm_cache:
+            if cat == "drive":
+                base = place_icon("drive")
+            elif cat == "app":
+                base = app_icon()
+            else:
+                base = category_icon(cat)
+            self._pm_cache[key] = base.pixmap(size, size)
+        return self._pm_cache[key]
+
     def _add_visible(self, i, parent_idx=None):
         nd = self._data_nodes[i]
         kind = nd.get("kind", "folder")
@@ -2117,6 +2252,17 @@ class GraphView(QGraphicsView):
             r = 7.0 + min(13.0, math.log10((nd.get("weight") or 0) + 1) * 3.4)
         item = GraphNode(self, i, nd.get("label") or "", r, nd.get("parent_path"),
                          nd.get("file"), nd.get("path"), kind, nd.get("sub"))
+        cat = nd.get("category")
+        if cat is None:
+            if kind == "drive":
+                cat = "drive"
+            elif kind == "note":
+                cat = "doc"
+            elif kind == "folder":
+                cat = "folder"
+            elif nd.get("file"):
+                cat = category_for(nd["file"], False)
+        item.icon_pm = self.node_icon_pm(cat or "other", r)
         item.setToolTip((nd.get("label") or "")
                         + (("\n" + nd["sub"]) if nd.get("sub") else ""))
         self.scene().addItem(item)
@@ -2298,6 +2444,14 @@ class GraphView(QGraphicsView):
                 mid = ang + w / 2
                 rad = ring * depth / max_depth
                 it = self._items[i]
+                if depth > 0:
+                    # a little deterministic "floating" so the tree doesn't
+                    # look mechanically perfect (±4% radius, ±15% of wedge)
+                    h = zlib.crc32(it.label.encode("utf-8"))
+                    j1 = ((h & 0xFFFF) / 0xFFFF - 0.5)
+                    j2 = (((h >> 16) & 0xFFFF) / 0xFFFF - 0.5)
+                    rad *= 1.0 + j1 * 0.08
+                    mid += w * j2 * 0.3
                 it.setPos(rad * math.cos(mid), rad * math.sin(mid))
                 it.show_label = small or depth <= 2 or it.kind == "drive"
                 kids = children.get(i)
@@ -2585,6 +2739,29 @@ class GraphView(QGraphicsView):
 # Main window
 # ---------------------------------------------------------------------------
 
+class QLaunchButton(QPushButton):
+    """Sidebar quick-launch entry: click = inspect, double-click = launch."""
+    launch = Signal()
+
+    def __init__(self, path, parent):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        super().__init__("  " + stem, parent)
+        self._path = path
+        self.setObjectName("sideBtn")
+        self.setIcon(app_icon())
+        self.setIconSize(QSize(16, 16))
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setToolTip(path)
+
+    def path(self):
+        return self._path
+
+    def mouseDoubleClickEvent(self, e):
+        self.launch.emit()
+
+
 class MainWindow(FramelessWindow):
     graph_ready = Signal(int, dict, object)
     graph_progress = Signal(int, str)
@@ -2609,6 +2786,9 @@ class MainWindow(FramelessWindow):
         self._graph_seq = 0
         self._analyzer_running = False
         self._indexer = None
+        self._ql_buttons = []
+        self._ql_selected = None
+        self.graph_scope_path = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -2748,8 +2928,12 @@ class MainWindow(FramelessWindow):
 
     def select_place(self, btn, path, name, vault=False):
         self._push_history()
+        self._ql_selected = None
+        self.graph_scope_path = None
         for b in self._side_buttons:
             b.setChecked(b is btn)
+        for b in self._ql_buttons:
+            b.setChecked(False)
         self.current_place = path
         self.current_place_name = name
         self.titlebar.setTitle(name)
@@ -2758,6 +2942,62 @@ class MainWindow(FramelessWindow):
             self.ensure_indexed(path)
         if self.view_mode == "graph":
             self.refresh_graph()
+
+    # ---- quick launch ---------------------------------------------------------
+    def select_app(self, path, btn):
+        self._ql_selected = path
+        self.graph_scope_path = os.path.dirname(path)
+        for b in self._side_buttons:
+            b.setChecked(False)
+        for b in self._ql_buttons:
+            b.setChecked(b is btn)
+        self.details.show_app(path)
+        if self.view_mode == "graph":
+            self.refresh_graph()
+
+    def add_quicklaunch_app(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Add application to Quick Launch", "",
+            "Programs (*.exe *.lnk *.bat *.cmd);;All files (*.*)")
+        if not f:
+            return
+        apps = get_quicklaunch()
+        if not any(a.lower() == f.lower() for a in apps):
+            apps.append(f)
+            set_quicklaunch(apps)
+        self._build_sidebar()
+
+    def remove_quicklaunch(self, path):
+        set_quicklaunch([p for p in get_quicklaunch()
+                         if p.lower() != path.lower()])
+        if self._ql_selected and self._ql_selected.lower() == path.lower():
+            self._ql_selected = None
+            self.details.show_row(None)
+        self._build_sidebar()
+
+    def build_app_menu(self, path):
+        folder = os.path.dirname(path)
+        menu = QMenu(self)
+        menu.addAction("Launch", lambda: self.launch_path(path))
+        menu.addAction("Browse Folder",
+                       lambda: self.drill_to_path(folder, os.path.basename(folder) or folder))
+        menu.addAction("Show in Explorer", lambda: reveal_in_explorer(path))
+        menu.addAction("Copy as path", lambda: QApplication.clipboard().setText(path))
+        menu.addAction("Remove from Quick Launch",
+                       lambda: self.remove_quicklaunch(path))
+        return menu
+
+    def launch_path(self, path):
+        """Open with the default app; remember how often programs are used so
+        the Quick Launch section can surface favourites."""
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not open:\n{exc}")
+            return
+        if ext_of(path) in APP_EXTS:
+            bump_launch_count(path)
+            self._build_sidebar()
 
     # ---- sidebar ----------------------------------------------------------
     def _build_sidebar(self):
@@ -2798,6 +3038,29 @@ class MainWindow(FramelessWindow):
 
         section("Library")
         self.btn_all = place_btn("All Files", None, "grid")
+        section("Quick Launch")
+        self._ql_buttons = []
+        manual = get_quicklaunch()
+        existing = {m.lower() for m in manual}
+        counts = get_launch_counts()
+        frequent = sorted(
+            (p for p, c in counts.items()
+             if c and ext_of(p) in APP_EXTS and os.path.isfile(p)
+             and p.lower() not in existing),
+            key=lambda p: -counts[p])[:6]
+        for p in manual + frequent:
+            b = QLaunchButton(p, self.sidebar)
+            b.clicked.connect(lambda checked, btn=b, pp=p: self.select_app(pp, btn))
+            b.launch.connect(lambda pp=p: self.launch_path(pp))
+            if self._ql_selected and p.lower() == self._ql_selected.lower():
+                b.setChecked(True)
+            sbar.addWidget(b)
+            self._ql_buttons.append(b)
+        ql_add = QPushButton("  ＋ Add App…", self.sidebar)
+        ql_add.setObjectName("sideAction")
+        ql_add.setCursor(Qt.PointingHandCursor)
+        ql_add.clicked.connect(self.add_quicklaunch_app)
+        sbar.addWidget(ql_add)
         section("Favourites")
         for nice, path in shell_folders():
             icons = {"Desktop": "monitor", "Documents": "files", "Downloads": "download",
@@ -2905,6 +3168,10 @@ class MainWindow(FramelessWindow):
 
     def drill_to_path(self, path, name):
         self._push_history()
+        self._ql_selected = None
+        self.graph_scope_path = None
+        for b in self._ql_buttons:
+            b.setChecked(False)
         self.current_place = path.rstrip("\\")
         self.current_place_name = name
         self.titlebar.setTitle(name)
@@ -2964,7 +3231,7 @@ class MainWindow(FramelessWindow):
         """Scope follows the current view: a vault tab → its link graph;
         anything else (All Files, a drive, a favourite, a folder) → that
         place's structure graph, read straight from the index."""
-        place = self.current_place
+        place = self.graph_scope_path or self.current_place
         vault = active_vault_for(place) if place else None
         is_vault_root = bool(vault) and place.rstrip("\\").lower() == vault.lower()
         self._graph_seq += 1
@@ -3063,6 +3330,9 @@ class MainWindow(FramelessWindow):
     def on_node_clicked(self, node):
         if node is None:
             return
+        self._ql_selected = None
+        for b in self._ql_buttons:
+            b.setChecked(False)
         try:
             r = thread_conn().execute(
                 "SELECT parent, name, is_dir, size, mtime, category, kind FROM files"
@@ -3099,12 +3369,15 @@ class MainWindow(FramelessWindow):
                         (join_path(parent_path, name),)).fetchone()[0]
                 except sqlite3.Error:
                     n = 0
-                out.append({"label": name, "kind": "folder", "weight": n,
-                            "sub": f"{n:,} items", "path": join_path(parent_path, name),
+                out.append({"label": name, "kind": "folder", "category": "folder",
+                            "weight": n, "sub": f"{n:,} items",
+                            "path": join_path(parent_path, name),
                             "parent_path": parent_path, "file": name,
                             "has_children": n > 0})
             else:
-                out.append({"label": name, "kind": "file", "weight": size or 0,
+                out.append({"label": name, "kind": "file",
+                            "category": category_for(name, False),
+                            "weight": size or 0,
                             "sub": human_size(size), "path": join_path(parent_path, name),
                             "parent_path": parent_path, "file": name,
                             "has_children": False})
@@ -3166,6 +3439,10 @@ class MainWindow(FramelessWindow):
 
     def on_selection(self):
         item = self.tree.currentItem()
+        if item:
+            self._ql_selected = None
+            for b in self._ql_buttons:
+                b.setChecked(False)
         self.details.show_row(item.data(0, Qt.UserRole) if item else None)
 
     def current_row(self):
@@ -3178,11 +3455,17 @@ class MainWindow(FramelessWindow):
 
     # ---- actions -----------------------------------------------------------
     def reveal_current(self):
+        if self._ql_selected:
+            reveal_in_explorer(self._ql_selected)
+            return
         row = self.current_row()
         if row:
             reveal_in_explorer(self.row_path(row))
 
     def open_current(self):
+        if self._ql_selected:
+            self.launch_path(self._ql_selected)
+            return
         row = self.current_row()
         if row:
             try:
@@ -3448,11 +3731,58 @@ class DetailsPane(QFrame):
         self.show_row(None)
 
     def more_menu(self):
+        if getattr(self.parent(), "_ql_selected", None):
+            menu = self.parent().build_app_menu(self.parent()._ql_selected)
+            menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
+            return
         row = self.parent().current_row()
         if not row:
             return
         menu = self.parent().build_menu(row)
         menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
+
+    def show_app(self, path):
+        self._row = None
+        self._preview_seq += 1
+        self.preview_label.hide()
+        self.preview_label.clear()
+        self.text_preview.hide()
+        self.text_preview.clear()
+        self.icon_label.show()
+        if not path:
+            self.show_row(None)
+            return
+        name = os.path.basename(path)
+        stem = os.path.splitext(name)[0]
+        folder = os.path.dirname(path)
+        ext = ext_of(path)
+        pm = app_icon(64).pixmap(64, 64)
+        self.icon_label.setPixmap(pm)
+        fm = QFontMetrics(self.name_label.font())
+        self.name_label.setText(fm.elidedText(stem, Qt.ElideMiddle, 230))
+        self.name_label.setToolTip(name)
+        self.kind_label.setText(f"{ext.upper()} Application" if ext in APP_EXTS else "Application")
+        size = 0
+        mtime = 0
+        try:
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
+                mtime = os.path.getmtime(path)
+        except OSError:
+            pass
+        self.meta["Size"].setText(human_size(size) if size else "—")
+        where = folder
+        if len(where) == 2:
+            where += "\\"
+        wfm = QFontMetrics(self.meta["Where"].font())
+        self.meta["Where"].setText(wfm.elidedText(where, Qt.ElideMiddle, 190))
+        self.meta["Where"].setToolTip(where)
+        self.meta["Modified"].setText(fmt_date(mtime) if mtime else "—")
+        self.meta["Items"].hide()
+        self.meta_keys["Items"].hide()
+        self.btn_show.setEnabled(True)
+        self.btn_open.setEnabled(True)
+        self.btn_more.setEnabled(True)
 
     def show_row(self, row):
         self._row = row

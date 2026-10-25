@@ -35,6 +35,12 @@ its own data folder. Works the same on any PC it's run on.
   button (or right-click → Show in Explorer) reveals any result in Explorer;
   **Open** launches it with its default app; `Ctrl+Enter` in the list does
   the same.
+- **Quick Launch**: pin your favourite applications or scripts (`.exe`, `.lnk`,
+  `.bat`, `.cmd`) with **＋ Add App…** in the sidebar, or let EzExp surface your
+  most-frequently launched programs automatically. Single-click inspects the app
+  in the details panel (with its folder scoped for graph browsing); double-click
+  launches it. Right-click any app button to browse its folder, reveal in Explorer,
+  copy path, or unpin.
 - **Obsidian vault**: click **＋ Add Obsidian Vault…** under Favourites and
   give it your vault path (e.g. `G:/mydrive/obsidian`). It becomes a pinned
   favourite — browse every folder in it and search across it like any other
