@@ -21,6 +21,7 @@ import ctypes
 import threading
 import subprocess
 import sqlite3
+from collections import deque
 from ctypes import wintypes
 
 from PySide6.QtCore import (
@@ -895,9 +896,12 @@ def active_vault_for(place):
     return None
 
 
-def build_vault_graph(conn, vault, max_nodes=4000, max_read=1_000_000):
+def build_vault_graph(conn, vault, max_nodes=4000, max_read=512_000,
+                      time_budget=10.0, progress=None):
     """Nodes = markdown notes in the vault; edges = resolved [[wikilinks]].
-    Pure function (no Qt) so it can run on a worker thread and be unit-tested."""
+    Pure function (no Qt) so it can run on a worker thread and be unit-tested.
+    Reading is time-budgeted (cloud-drive placeholders can be very slow) and
+    reports progress through the optional callback."""
     vp = vault.rstrip("\\")
     rows = conn.execute(
         "SELECT parent, name FROM files WHERE (parent = ? COLLATE NOCASE"
@@ -942,12 +946,20 @@ def build_vault_graph(conn, vault, max_nodes=4000, max_read=1_000_000):
         return None
 
     edge_set = set()
+    t0 = time.time()
+    analyzed = 0
     for i, nd in enumerate(nodes):
+        if progress and i % 40 == 0:
+            progress(f"Parsed {i}/{len(nodes)} notes…")
+        if time.time() - t0 > time_budget:
+            break  # never hang on slow/network drives; graph shows what we got
         try:
             with open(nd["path"], "rb") as f:
                 text = f.read(max_read).decode("utf-8", "replace")
         except OSError:
+            analyzed += 1
             continue
+        analyzed += 1
         for t in parse_wikilinks(text):
             j = resolve(t, nd["parent"])
             if j is not None and j != i:
@@ -959,7 +971,144 @@ def build_vault_graph(conn, vault, max_nodes=4000, max_read=1_000_000):
         degree[b] += 1
     for nd, d in zip(nodes, degree):
         nd["degree"] = d
-    return {"nodes": nodes, "edges": edges, "total_md": total, "vault": vp}
+    return {"nodes": nodes, "edges": edges, "total_md": total, "vault": vp,
+            "analyzed": analyzed}
+
+
+def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
+    """Folder-containment graph built purely from the index (no file reads,
+    so it is instant even for whole drives). place=None → one node per fixed
+    drive with two levels of folders; otherwise the place's own subtree,
+    three levels deep, with its direct files as leaf nodes. Node 'weight' is
+    the number of indexed items in the folder's subtree."""
+    if place:
+        roots = [place.rstrip("\\")]
+        depth_cap = 3
+    else:
+        roots = [r.rstrip("\\") for r in (roots or fixed_drives())]
+        depth_cap = 2
+
+    cond_parts, args = [], []
+    for r in roots:
+        cond_parts.append("(files.parent = ? COLLATE NOCASE OR files.parent LIKE ? ESCAPE '#')")
+        args += [r, like_escape(r) + "\\%"]
+    where = "(" + " OR ".join(cond_parts) + ")"
+
+    # direct item count per directory
+    counts = {}
+    for parent, cnt in conn.execute(
+            f"SELECT parent, COUNT(*) FROM files WHERE {where} GROUP BY parent COLLATE NOCASE",
+            args):
+        counts[parent.lower()] = cnt
+
+    kids = {}  # parent_path_lower -> [(name, full_lower, full_orig)]
+    orig_of = {r.lower(): r for r in roots}
+    for parent, name in conn.execute(
+            f"SELECT parent, name FROM files WHERE {where} AND is_dir = 1", args):
+        pl = parent.lower()
+        full = join_path(parent, name)
+        kids.setdefault(pl, []).append((name, full.lower(), full))
+
+    # walk the directory tree (BFS keeps parents before children)
+    order = []        # non-root dirs, BFS order (lower-case keys)
+    parent_of = {}
+    depth_of = {}
+    dq = deque()
+    for r in roots:
+        for name, fl, fo in kids.get(r.lower(), []):
+            dq.append((fl, fo, r.lower(), 1))
+    seen = set()
+    while dq:
+        pl, po, par, depth = dq.popleft()
+        if pl in seen:
+            continue
+        seen.add(pl)
+        orig_of[pl] = po
+        order.append(pl)
+        parent_of[pl] = par
+        depth_of[pl] = depth
+        for name, fl, fo in kids.get(pl, []):
+            if fl not in seen:
+                dq.append((fl, fo, pl, depth + 1))
+
+    # subtree totals: accumulate deepest-first
+    total = {p.lower(): counts.get(p.lower(), 0) for p in roots}
+    for pl in order:
+        total[pl] = counts.get(pl, 0)
+    for pl in reversed(order):
+        par = parent_of.get(pl)
+        if par is not None:
+            total[par] = total.get(par, 0) + total[pl]
+
+    # pick which dirs become nodes: every level-1 dir, then heavier dirs per
+    # level until the budget is spent
+    kept = {r.lower() for r in roots}
+    budget = max_nodes
+    by_level = {}
+    for pl in order:
+        by_level.setdefault(depth_of[pl], []).append(pl)
+    for depth in range(1, depth_cap + 1):
+        lvl = by_level.get(depth, [])
+        lvl.sort(key=lambda pl: -total.get(pl, 0))
+        room = max(0, budget - len(kept))
+        for pl in lvl[:room]:
+            kept.add(pl)
+        if len(kept) >= budget:
+            break
+
+    # nodes: roots, then kept dirs level by level (deterministic order)
+    nodes = []
+    idx_of = {}
+    for r in roots:
+        rl = r.lower()
+        if len(r) == 2:
+            label, kind = drive_label(r + "\\"), "drive"
+        else:
+            label, kind = r.rsplit("\\", 1)[-1] or r, "folder"
+        idx_of[rl] = len(nodes)
+        nodes.append({"label": label, "kind": kind, "weight": total.get(rl, 0),
+                      "sub": f"{total.get(rl, 0):,} items", "path": r,
+                      "parent_path": None, "file": None})
+    for depth in range(1, depth_cap + 1):
+        for pl in sorted((p for p in kept if depth_of.get(p) == depth),
+                         key=lambda p: orig_of[p].lower()):
+            po = orig_of[pl]
+            idx_of[pl] = len(nodes)
+            nodes.append({"label": po.rsplit("\\", 1)[-1], "kind": "folder",
+                          "weight": total.get(pl, 0),
+                          "sub": f"{total.get(pl, 0):,} items", "path": po,
+                          "parent_path": orig_of.get(parent_of.get(pl, "")),
+                          "file": None})
+
+    # edges: each kept dir connects to its nearest kept ancestor
+    edges = []
+    for pl in idx_of:
+        if pl in {r.lower() for r in roots}:
+            continue
+        anc = parent_of.get(pl)
+        while anc is not None and anc not in idx_of:
+            anc = parent_of.get(anc)
+        if anc is not None:
+            edges.append((idx_of[anc], idx_of[pl]))
+
+    # direct files of each root as leaf nodes
+    truncated = False
+    for r in roots:
+        ri = idx_of[r.lower()]
+        rows = conn.execute(
+            "SELECT name, size FROM files WHERE parent = ? COLLATE NOCASE AND is_dir = 0"
+            " ORDER BY name COLLATE NOCASE LIMIT 250", (r,)).fetchall()
+        for name, size in rows:
+            idx = len(nodes)
+            nodes.append({"label": name, "kind": "file", "weight": size or 0,
+                          "sub": human_size(size), "path": join_path(r, name),
+                          "parent_path": r, "file": name})
+            edges.append((ri, idx))
+        if len(rows) == 250:
+            truncated = True
+
+    return {"nodes": nodes, "edges": edges, "mode": "structure",
+            "roots": roots, "truncated_files": truncated}
 
 
 # ---------------------------------------------------------------------------
@@ -1561,7 +1710,15 @@ def make_row_item(row):
 # ---------------------------------------------------------------------------
 
 class GraphNode(QGraphicsObject):
-    def __init__(self, view, index, label, radius, parent_path, file_name, path):
+    KIND_COLORS = {
+        "drive": (QColor("#9aa0a7"), QColor("#787e86")),
+        "folder": (QColor("#b9bfc6"), QColor("#989ea6")),
+        "file": (QColor("#cdd2d7"), QColor("#b0b6bc")),
+        "note": (QColor("#b9bfc6"), QColor("#989ea6")),
+    }
+
+    def __init__(self, view, index, label, radius, parent_path, file_name, path,
+                 kind="note", sub=None):
         super().__init__()
         self.view = view
         self.index = index
@@ -1570,6 +1727,8 @@ class GraphNode(QGraphicsObject):
         self.parent_path = parent_path
         self.file = file_name
         self.path = path
+        self.kind = kind
+        self.sub = sub
         self.state = 0      # 0 normal, 1 neighbor/hover, 2 selected, 3 dimmed
         self._hover = False
         self._dragging = False
@@ -1579,25 +1738,35 @@ class GraphNode(QGraphicsObject):
         self.setZValue(1)
 
     def boundingRect(self):
-        return QRectF(-118, -self.radius - 6, 236, self.radius * 2 + 24)
+        extra = 14 if self.sub else 0
+        return QRectF(-118, -self.radius - 6, 236, self.radius * 2 + 24 + extra)
 
     def paint(self, p, option, widget):
         st = self.state
         if st == 0 and self._hover:
             st = 1
-        fill, border, text = {
-            0: (QColor("#b9bfc6"), QColor("#989ea6"), QColor("#6e6e73")),
-            1: (QColor("#9ba2a9"), QColor("#7c828a"), QColor("#3a3a3c")),
-            2: (QColor("#8b5cf6"), QColor("#7c3aed"), QColor("#6d28d9")),
-            3: (QColor("#dfe2e6"), QColor("#e4e7ea"), QColor("#c7c7cc")),
-        }[st]
+        if st == 0:
+            fill, border = self.KIND_COLORS.get(self.kind, self.KIND_COLORS["note"])
+            text = QColor("#6e6e73")
+        elif st == 1:
+            fill, border, text = QColor("#9ba2a9"), QColor("#7c828a"), QColor("#3a3a3c")
+        elif st == 2:
+            fill, border, text = QColor("#8b5cf6"), QColor("#7c3aed"), QColor("#6d28d9")
+        else:
+            fill, border, text = QColor("#dfe2e6"), QColor("#e4e7ea"), QColor("#c7c7cc")
         p.setBrush(fill)
         p.setPen(QPen(border, 1.4))
         p.drawEllipse(QPointF(0, 0), self.radius, self.radius)
+        fm = QFontMetrics(self.view.label_font)
         p.setPen(QPen(text, 1))
         p.drawText(QRectF(-110, self.radius + 3, 220, 14),
                    Qt.AlignHCenter | Qt.AlignTop,
-                   QFontMetrics(self.view.label_font).elidedText(self.label, Qt.ElideRight, 200))
+                   fm.elidedText(self.label, Qt.ElideRight, 200))
+        if self.sub:
+            p.setPen(QPen(QColor("#a6acb2") if st != 3 else QColor("#d5d8dc"), 1))
+            p.drawText(QRectF(-110, self.radius + 16, 220, 12),
+                       Qt.AlignHCenter | Qt.AlignTop,
+                       fm.elidedText(self.sub, Qt.ElideRight, 200))
 
     def hoverEnterEvent(self, e):
         self._hover = True
@@ -1705,13 +1874,25 @@ class GraphView(QGraphicsView):
     def set_graph(self, data):
         self.clear_graph()
         nodes, edges = data["nodes"], data["edges"]
+        mode = data.get("mode", "links")
         if not nodes:
-            self.show_message("No markdown notes found in this vault.")
+            self.show_message("Nothing to graph here yet.")
             return
         scene = self.scene()
         for i, nd in enumerate(nodes):
-            r = 6.0 + min(12.0, (nd["degree"] ** 0.5) * 2.4)
-            item = GraphNode(self, i, nd["name"], r, nd["parent"], nd["file"], nd["path"])
+            if mode == "structure":
+                if nd.get("kind") == "drive":
+                    r = 15.0
+                elif nd.get("kind") == "file":
+                    r = 5.0
+                else:
+                    r = 7.0 + min(13.0, math.log10((nd.get("weight") or 0) + 1) * 3.4)
+            else:
+                r = 6.0 + min(12.0, (nd.get("degree", 0) ** 0.5) * 2.4)
+            item = GraphNode(self, i, nd.get("label") or nd.get("name", ""), r,
+                             nd.get("parent_path") or nd.get("parent"),
+                             nd.get("file"), nd.get("path"),
+                             nd.get("kind", "note"), nd.get("sub"))
             ang = i * 2.39996          # golden-angle spiral start
             rad = 30.0 * ((i + 1) ** 0.62)
             item.setPos(rad * math.cos(ang), rad * math.sin(ang))
@@ -1919,7 +2100,8 @@ class GraphView(QGraphicsView):
 # ---------------------------------------------------------------------------
 
 class MainWindow(FramelessWindow):
-    graph_ready = Signal(int, str, object)
+    graph_ready = Signal(int, dict, object)
+    graph_progress = Signal(int, str)
 
     def __init__(self, worker: SearchWorker):
         super().__init__()
@@ -1927,6 +2109,7 @@ class MainWindow(FramelessWindow):
         self.worker = worker
         self.worker.have.connect(self.on_results)
         self.graph_ready.connect(self.on_graph_ready)
+        self.graph_progress.connect(self.on_graph_progress)
         self.view_seq = 0
         self.current_place = None
         self.current_place_name = "All Files"
@@ -1990,7 +2173,9 @@ class MainWindow(FramelessWindow):
         self.btn_graph.setCheckable(True)
         self.btn_graph.setCursor(Qt.PointingHandCursor)
         self.btn_graph.setFocusPolicy(Qt.NoFocus)
-        self.btn_graph.setToolTip("Force-directed graph of the current vault's notes and links")
+        self.btn_graph.setToolTip(
+            "Graph of the current view: link graph for a selected vault, "
+            "structure diagram for everything else")
         self.btn_graph.clicked.connect(lambda checked: self.toggle_graph(checked))
         chips.addWidget(self.btn_graph)
         chips.addStretch(1)
@@ -2283,39 +2468,63 @@ class MainWindow(FramelessWindow):
         self.refresh_graph()
 
     def refresh_graph(self):
-        vault = active_vault_for(self.current_place)
-        if not vault:
-            self.graph_view.show_message(
-                "Graph view shows an Obsidian vault.\n\n"
-                "Pick a vault in the sidebar (or any folder inside one), "
-                "then open the Graph tab again.")
-            self.status_left.setText("No vault selected")
-            return
+        """Scope follows the current view: a vault tab → its link graph;
+        anything else (All Files, a drive, a favourite, a folder) → that
+        place's structure graph, read straight from the index."""
+        place = self.current_place
+        vault = active_vault_for(place) if place else None
+        is_vault_root = bool(vault) and place.rstrip("\\").lower() == vault.lower()
         self._graph_seq += 1
         seq = self._graph_seq
-        self.graph_view.show_message(f"Building graph of “{os.path.basename(vault)}”…")
-        threading.Thread(target=self._build_graph_job, args=(seq, vault), daemon=True).start()
+        if is_vault_root:
+            self.graph_view.show_message(
+                f"Building link graph of “{os.path.basename(vault)}”…")
+            spec = {"mode": "links", "vault": vault}
+        else:
+            self.graph_view.show_message("Building structure graph from the index…")
+            spec = {"mode": "structure", "place": place}
+        threading.Thread(target=self._graph_job, args=(seq, spec), daemon=True).start()
 
-    def _build_graph_job(self, seq, vault):
+    def _graph_job(self, seq, spec):
         try:
-            data = build_vault_graph(thread_conn(), vault)
+            if spec["mode"] == "links":
+                data = build_vault_graph(
+                    thread_conn(), spec["vault"],
+                    progress=lambda text: self.graph_progress.emit(seq, text))
+            else:
+                data = build_structure_graph(thread_conn(), spec.get("place"))
+            data["mode"] = spec["mode"]
         except Exception as exc:
             data = {"error": str(exc)}
-        self.graph_ready.emit(seq, vault, data)
+        self.graph_ready.emit(seq, spec, data)
 
-    def on_graph_ready(self, seq, vault, data):
+    def on_graph_progress(self, seq, text):
+        if seq == self._graph_seq and self.view_mode == "graph":
+            self.graph_view.show_message(text)
+
+    def on_graph_ready(self, seq, spec, data):
         if seq != self._graph_seq or self.view_mode != "graph":
             return
         if "error" in data:
             self.graph_view.show_message(f"Could not build the graph:\n{data['error']}")
             return
         self.graph_view.set_graph(data)
-        extra = ""
-        if data["total_md"] > len(data["nodes"]):
-            extra = f" (first {len(data['nodes'])} of {data['total_md']})"
-        self.status_left.setText(
-            f"{len(data['nodes'])} notes · {len(data['edges'])} links · "
-            f"{os.path.basename(vault)}{extra}")
+        if data.get("mode") == "structure":
+            place = spec.get("place")
+            scope = "all drives" if not place else (place.rsplit("\\", 1)[-1] or place)
+            n_folders = sum(1 for nd in data["nodes"] if nd["kind"] == "folder")
+            extra = " · file lists truncated" if data.get("truncated_files") else ""
+            self.status_left.setText(
+                f"Structure of {scope}: {n_folders} folders · "
+                f"{len(data['edges'])} connections{extra}")
+        else:
+            v = spec["vault"]
+            analyzed = data.get("analyzed", data["total_md"])
+            ann = "" if analyzed >= data["total_md"] else \
+                f" · analyzed {analyzed}/{data['total_md']} notes (time-limited)"
+            self.status_left.setText(
+                f"{len(data['nodes'])} notes · {len(data['edges'])} links · "
+                f"{os.path.basename(v)}{ann}")
 
     def on_node_clicked(self, node):
         if node is None:

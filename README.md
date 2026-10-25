@@ -41,13 +41,23 @@ its own data folder. Works the same on any PC it's run on.
   place. It's remembered between launches and scanned automatically on each
   start (works even if the vault lives on a removable drive). Right-click a
   vault in the sidebar to remove it.
-- **Graph tab**: with a vault selected, the **Graph** chip at the right end
-  of the ribbon shows an Obsidian-style force-directed graph of the vault —
-  one node per markdown note, one line per resolved `[[wikilink]]`. Drag
-  nodes, drag the background to pan, scroll to zoom; click a node to see
-  that note (and its preview) in the details pane, double-click to open it,
-  right-click for quick actions. It rebuilds itself whenever the index
-  refreshes or you switch vaults/folders.
+- **Graph tab**: the **Graph** chip shows the graph of whatever view you're
+  in — the scope always follows the current tab:
+  - **All Files** → a structure diagram of the whole PC: one node per drive,
+    folders hanging off them (two levels deep), sized by how many items they
+    contain.
+  - **A drive or any folder** (sidebar favourite, drilled-down folder, or a
+    folder inside a vault) → that place's own structure: its subfolders
+    (three levels) plus its direct files, each folder labelled with its item
+    count.
+  - **A vault selected in the sidebar** → the Obsidian-style link graph of
+    that vault: one node per note, one line per resolved `[[wikilink]]`.
+  Structure graphs are read straight from the index so they open instantly.
+  Link graphs analyze notes with a time budget and live progress, so slow or
+  cloud-synced drives (Google Drive, OneDrive) can never hang the app — the
+  status bar reports how many notes were analyzed. Interactions: drag nodes,
+  pan the background, scroll to zoom; click a node for its details pane
+  entry, double-click to open it, right-click for quick actions.
 - **Three-dots button** (details pane, bottom right) or **right-click** any
   result: Open, Show in Explorer, Rename, Copy as path, Copy file,
   Move to Recycle Bin, Properties.

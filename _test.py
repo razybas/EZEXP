@@ -148,6 +148,31 @@ assert len(g["edges"]) == 2, g["edges"]
 degs = {n["name"]: n["degree"] for n in g["nodes"]}
 assert degs == {"alpha": 2, "beta": 1, "gamma": 1}, degs
 
+# --- structure graphs (no file reads) -----------------------------------------
+st = ez.build_structure_graph(conn, place=data)
+labels = {n["label"] for n in st["nodes"]}
+assert "data" in labels and "Documents" in labels and "code" in labels, labels
+assert "render_final.mp4" in labels, labels            # direct file of the root
+assert "meeting-notes.txt" not in labels, labels        # lives inside Documents
+kinds = {n["label"]: n["kind"] for n in st["nodes"]}
+assert kinds["data"] == "folder" and kinds["render_final.mp4"] == "file"
+# root + 3 subdirs + 1 direct file, each connected to its parent
+assert len(st["nodes"]) == 5, st["nodes"]
+assert len(st["edges"]) == 4, st["edges"]
+assert all(n["sub"] and "items" in n["sub"] for n in st["nodes"] if n["kind"] != "file")
+
+# drilled one level deeper, the folder's own files appear
+st_docs = ez.build_structure_graph(conn, place=os.path.join(data, "Documents"))
+labels_d = {n["label"] for n in st_docs["nodes"]}
+assert {"Documents", "meeting-notes.txt", "Q3 Financial Report.pdf",
+        "renamed-clip.mp4"} <= labels_d, labels_d
+
+st2 = ez.build_structure_graph(conn, None, roots=["C:"])
+assert st2["nodes"] and st2["nodes"][0]["kind"] == "drive", st2["nodes"][:1]
+assert "(C:)" in st2["nodes"][0]["label"], st2["nodes"][0]["label"]
+# depth-capped: only the drive root is close enough to the temp data to show
+assert all(n["kind"] in ("drive", "folder") or n["parent_path"] == "C:" for n in st2["nodes"])
+
 # --- GUI smoke test ----------------------------------------------------------
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
@@ -211,6 +236,18 @@ alpha = [n for n in win.graph_view.nodes if n.label == "alpha"][0]
 win.graph_view.select_node(alpha)
 wait_results(300)
 assert "alpha" in win.details.name_label.text().lower()
+win.enter_list_mode("all")
+wait_results(300)
+assert win.view_mode == "list" and not win.graph_view.isVisible()
+
+# a plain folder (inside the vault) gets a STRUCTURE graph: root + its files
+sub_path = os.path.normpath(os.path.join(gdir, "sub"))
+win.drill_to_path(sub_path, "sub")
+win.enter_graph_mode()
+wait_results(4000)
+assert win.view_mode == "graph"
+assert len(win.graph_view.nodes) == 2, [n.label for n in win.graph_view.nodes]
+assert {n.kind for n in win.graph_view.nodes} == {"folder", "file"}
 win.enter_list_mode("all")
 wait_results(300)
 assert win.view_mode == "list" and not win.graph_view.isVisible()
