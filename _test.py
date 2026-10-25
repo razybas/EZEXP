@@ -533,6 +533,41 @@ assert os.path.isfile(os.path.join(data, "created-by-test.txt"))
 assert any(r["name"] == "created-by-test.txt" for r in win.current_rows)
 os.remove(os.path.join(data, "created-by-test.txt"))
 
+mvA = os.path.join(data, "mvA")
+mvB = os.path.join(data, "mvB")
+os.makedirs(mvA)
+os.makedirs(mvB)
+srcf = os.path.join(mvA, "move-me.txt")
+with open(srcf, "w") as fh:
+    fh.write("x")
+conn_mv = ez.thread_conn()
+ez.index_add_path(conn_mv, mvA)
+ez.index_add_path(conn_mv, mvB)
+conn_mv.commit()
+# engine: move keeps disk + index in sync
+assert win.move_or_copy([srcf], mvB, copy=False) is True
+assert os.path.isfile(os.path.join(mvB, "move-me.txt"))
+assert not os.path.exists(srcf)
+assert conn_mv.execute("SELECT COUNT(*) FROM files WHERE parent=? AND name=?",
+                       (mvB, "move-me.txt")).fetchone()[0] == 1
+assert conn_mv.execute("SELECT COUNT(*) FROM files WHERE parent=? AND name=?",
+                       (mvA, "move-me.txt")).fetchone()[0] == 0
+# copy into the same folder collides -> Explorer-style " (2)" name
+assert win.move_or_copy([os.path.join(mvB, "move-me.txt")], mvB,
+                        copy=True) is True
+assert os.path.isfile(os.path.join(mvB, "move-me (2).txt"))
+# clipboard cut/paste round trip through the window methods
+win.set_clipboard_files([os.path.join(mvB, "move-me.txt")], True)
+paths, cut = win.clipboard_files()
+assert cut is True and len(paths) == 1
+win.paste_into(mvA)
+assert os.path.isfile(os.path.join(mvA, "move-me.txt"))
+assert not os.path.exists(os.path.join(mvB, "move-me.txt"))
+# same-folder move via handle_drop is a no-op
+win.handle_drop([os.path.join(mvA, "move-me.txt")], mvA, copy=False)
+assert os.path.isfile(os.path.join(mvA, "move-me.txt"))
+assert not os.path.exists(os.path.join(mvA, "move-me (2).txt"))
+
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")

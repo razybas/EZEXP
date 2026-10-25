@@ -23,6 +23,7 @@ import zlib
 import ctypes
 import threading
 import subprocess
+import shutil
 import sqlite3
 from collections import deque
 from ctypes import wintypes
@@ -35,6 +36,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient,
     QPainter, QPainterPath, QPolygonF, QPixmap, QPen, QShortcut, QGuiApplication,
+    QDrag,
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFileIconProvider, QFrame, QGraphicsItem,
@@ -647,6 +649,43 @@ def _row_dict(r):
         "parent": r[0], "name": r[1], "is_dir": r[2], "size": r[3],
         "mtime": r[4], "category": r[5], "kind": r[6],
     }
+
+
+def _unique_dest(folder, name):
+    """A destination path that never overwrites: 'name (2).ext',
+    'name (3).ext', ... (Explorer-style)."""
+    dest = join_path(folder, name)
+    if not os.path.exists(dest):
+        return dest
+    stem, ext = os.path.splitext(name)
+    n = 2
+    while True:
+        cand = join_path(folder, f"{stem} ({n}){ext}")
+        if not os.path.exists(cand):
+            return cand
+        n += 1
+
+def index_add_path(conn, path):
+    """Insert a file, or a folder and its whole subtree, into the
+    index using the scanner's own row builder."""
+    st = os.stat(path)
+    parent = os.path.dirname(path)
+    if not os.path.isdir(path):
+        insert_rows(conn, [_make_row(parent, os.path.basename(path),
+                                     False, st, path[:2])])
+        return
+    rows = [_make_row(parent, os.path.basename(path), True, st,
+                      path[:2])]
+    for base, dirs, files in os.walk(path):
+        for nm in dirs + files:
+            p = os.path.join(base, nm)
+            try:
+                s2 = os.stat(p)
+            except OSError:
+                continue
+            rows.append(_make_row(base, nm, os.path.isdir(p), s2,
+                                  path[:2]))
+    insert_rows(conn, rows)
 
 
 def sort_rows(rows, mode):
@@ -2051,8 +2090,30 @@ class ResultsTree(QTreeWidget):
             self.setColumnWidth(col, w)
         self.setVerticalScrollMode(QTreeWidget.ScrollPerItem)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
 
     def keyPressEvent(self, e):
+        win = self.window()
+        if e.modifiers() & Qt.ControlModifier and hasattr(win, "cut_current"):
+            if e.key() == Qt.Key_X:
+                win.cut_current()
+                return
+            if e.key() == Qt.Key_C:
+                win.copy_current_file()
+                return
+            if e.key() == Qt.Key_V:
+                row = win.current_row()
+                if row and row["is_dir"]:
+                    folder = win.row_path(row)
+                elif row:
+                    folder = row["parent"]
+                else:
+                    folder = win.current_place
+                win.paste_into(folder)
+                return
         if e.key() in (Qt.Key_Return, Qt.Key_Enter):
             if e.modifiers() & Qt.ControlModifier:
                 self.open_requested.emit()
@@ -2061,10 +2122,55 @@ class ResultsTree(QTreeWidget):
             return
         super().keyPressEvent(e)
 
+    def startDrag(self, supportedActions):
+        win = self.window()
+        rows = [it.data(0, Qt.UserRole) for it in self.selectedItems()]
+        if not rows or not hasattr(win, "row_path"):
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(win.row_path(r)) for r in rows])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.MoveAction | Qt.CopyAction, Qt.MoveAction)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        md = e.mimeData()
+        if not md.hasUrls():
+            super().dropEvent(e)
+            return
+        win = self.window()
+        item = self.itemAt(e.position().toPoint())
+        if item is not None:
+            row = item.data(0, Qt.UserRole)
+            folder = win.row_path(row) if row["is_dir"] else row["parent"]
+        else:
+            folder = getattr(win, "current_place", None)
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if folder and paths and hasattr(win, "handle_drop"):
+            internal = e.source() is self
+            copy = (not internal) or bool(
+                e.keyboardModifiers() & Qt.ControlModifier) or \
+                e.proposedAction() == Qt.CopyAction
+            win.handle_drop(paths, folder, copy)
+            e.acceptProposedAction()
+
 
 def make_row_item(row):
     item = QTreeWidgetItem()
     item.setData(0, Qt.UserRole, row)
+    item.setFlags(item.flags() | Qt.ItemIsDragEnabled)
     item.setText(1, "—" if row["is_dir"] else human_size(row["size"]))
     item.setText(2, row["kind"])
     item.setText(3, fmt_date(row["mtime"]))
@@ -3731,7 +3837,105 @@ class MainWindow(FramelessWindow):
         act.triggered.connect(lambda: self.create_new_entry(folder, False))
         act = menu.addAction("New Folder…")
         act.triggered.connect(lambda: self.create_new_entry(folder, True))
+        act = menu.addAction("Paste")
+        act.triggered.connect(lambda: self.paste_into(folder))
         return menu
+
+    def selected_rows(self):
+        return [it.data(0, Qt.UserRole)
+                for it in self.tree.selectedItems()]
+
+    def move_or_copy(self, paths, dest_dir, copy):
+        """Move/copy files or folders into dest_dir and keep the index
+        in sync per item. Never overwrites (see _unique_dest); dropping
+        a folder into itself is refused per item. Returns True if
+        anything changed."""
+        errors = []
+        conn = thread_conn()
+        changed = False
+        for src in paths:
+            if not os.path.exists(src):
+                continue
+            name = os.path.basename(src)
+            if os.path.isdir(src) and (dest_dir == src or dest_dir.startswith(src + os.sep)):
+                errors.append(f"Cannot move “{name}” into itself.")
+                continue
+            dest = _unique_dest(dest_dir, name)
+            try:
+                if copy:
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dest)
+                    else:
+                        shutil.copy2(src, dest)
+                else:
+                    shutil.move(src, dest)
+            except (OSError, shutil.Error) as exc:
+                errors.append(f"{name}: {exc}")
+                continue
+            if not copy:
+                if os.path.isdir(dest):
+                    delete_tree(conn, src)
+                else:
+                    conn.execute(
+                        "DELETE FROM files WHERE parent=? AND name=?",
+                        (os.path.dirname(src), name))
+            try:
+                index_add_path(conn, dest)
+            except Exception:
+                pass  # the next rescan will pick it up regardless
+            changed = True
+        if changed:
+            conn.commit()
+        if errors:
+            QMessageBox.warning(
+                self, APP_NAME,
+                ("Some items could not be copied:\n"
+                 if copy else "Some items could not be moved:\n")
+                + "\n".join(errors[:6]))
+        if changed:
+            self.refresh_view()
+        return changed
+
+    def handle_drop(self, paths, folder, copy):
+        if not copy:  # a move within the same folder is a no-op
+            paths = [p for p in paths
+                     if os.path.dirname(p) != folder]
+        if paths:
+            self.move_or_copy(paths, folder, copy)
+
+    def set_clipboard_files(self, paths, cut):
+        """Explorer-compatible clipboard: file URLs plus the Windows
+        'Preferred DropEffect' (2 = move for Cut, 1 = copy)."""
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        mime.setData("Preferred DropEffect",
+                     bytes([2 if cut else 1, 0, 0, 0]))
+        QApplication.clipboard().setMimeData(mime)
+
+    def cut_current(self):
+        rows = self.selected_rows()
+        if rows:
+            self.set_clipboard_files([self.row_path(r) for r in rows],
+                                      True)
+
+    def clipboard_files(self):
+        md = QApplication.clipboard().mimeData()
+        if not md or not md.hasUrls():
+            return [], False
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        cut = False
+        if md.hasFormat("Preferred DropEffect"):
+            data = bytes(md.data("Preferred DropEffect"))
+            if len(data) >= 4 and int.from_bytes(data[:4], "little") == 2:
+                cut = True
+        return paths, cut
+
+    def paste_into(self, folder):
+        paths, cut = self.clipboard_files()
+        if not paths or not folder:
+            return
+        if self.move_or_copy(paths, folder, copy=not cut) and cut:
+            QApplication.clipboard().clear()
 
     def build_menu(self, row):
         menu = QMenu(self)
@@ -3754,6 +3958,11 @@ class MainWindow(FramelessWindow):
         act_cp.triggered.connect(lambda: QApplication.clipboard().setText(self.row_path(row)))
         act_cpf = menu.addAction("Copy file")
         act_cpf.triggered.connect(self.copy_current_file)
+        act_cut = menu.addAction("Cut")
+        act_cut.triggered.connect(self.cut_current)
+        _pf = self.row_path(row) if row["is_dir"] else row["parent"]
+        act_paste = menu.addAction("Paste")
+        act_paste.triggered.connect(lambda f=_pf: self.paste_into(f))
         menu.addSeparator()
         act_del = menu.addAction("Move to Recycle Bin")
         act_del.triggered.connect(lambda: self.delete_current(row))
@@ -3762,12 +3971,13 @@ class MainWindow(FramelessWindow):
         return menu
 
     def copy_current_file(self):
-        row = self.current_row()
-        if not row:
-            return
-        mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(self.row_path(row))])
-        QApplication.clipboard().setMimeData(mime)
+        rows = self.selected_rows()
+        if not rows:
+            row = self.current_row()
+            rows = [row] if row else []
+        if rows:
+            self.set_clipboard_files([self.row_path(r) for r in rows],
+                                      False)
 
     def rename_current(self, row):
         new, ok = QInputDialog.getText(self, "Rename", "New name:", text=row["name"])
