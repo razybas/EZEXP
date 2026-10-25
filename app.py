@@ -860,14 +860,23 @@ def scan_delta(conn, roots, progress=None, should_run=None):
                                 stack.append(join_path(d, name))  # still check deeper levels
                             continue
                     if old:
-                        fts_drop_ids(conn, [old[0]])
-                        conn.execute("DELETE FROM files WHERE id=?", (old[0],))
+                        if old[1]:
+                            # was a folder: remove its whole subtree, not
+                            # just the row, or its contents stay as orphans
+                            delete_tree(conn, join_path(d, name))
+                        else:
+                            fts_drop_ids(conn, [old[0]])
+                            conn.execute("DELETE FROM files WHERE id=?", (old[0],))
                     new_rows.append(_make_row(d, name, is_dir, st, drive))
                     changed_items += 1
             for name, old in prev.items():
                 if name not in seen:
-                    fts_drop_ids(conn, [old[0]])
-                    conn.execute("DELETE FROM files WHERE id=?", (old[0],))
+                    if old[1]:
+                        # deleted folder: its contents must go too
+                        delete_tree(conn, join_path(d, name))
+                    else:
+                        fts_drop_ids(conn, [old[0]])
+                        conn.execute("DELETE FROM files WHERE id=?", (old[0],))
                     changed_items += 1
             if new_rows:
                 insert_rows(conn, new_rows)

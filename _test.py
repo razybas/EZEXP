@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import tempfile
+import shutil
 
 tmp = tempfile.mkdtemp(prefix="ezexp_test_")
 os.environ["EZEXP_DB_DIR"] = os.path.join(tmp, "db")
@@ -115,6 +116,23 @@ assert rows == [], rows
 
 total = ez.update_total(conn)
 assert total == 8, total
+
+# --- delta: deleting a FOLDER removes its contents from the index too -------
+doomed = os.path.join(data, "doomed")
+os.makedirs(doomed)
+with open(os.path.join(doomed, "ghost-file.txt"), "w") as f:
+    f.write("x")
+os.utime(data)
+ez.scan_delta(conn, [data], lambda p, c: None)
+rows, _ = ez.do_search(conn, "ghost-file")
+assert names(rows) == ["ghost-file.txt"], rows
+shutil.rmtree(doomed)
+os.utime(data)
+ez.scan_delta(conn, [data], lambda p, c: None)
+rows, _ = ez.do_search(conn, "ghost-file")
+assert rows == [], rows          # contents must not survive as orphans
+rows, _ = ez.do_search(conn, "doomed")
+assert rows == [], rows
 
 # --- Obsidian vault settings -------------------------------------------------
 vault = os.path.join(tmp, "vault")
