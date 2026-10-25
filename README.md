@@ -1,242 +1,279 @@
 # EzExp
 
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4.svg)](https://microsoft.com/windows)
-[![Python](https://img.shields.io/badge/python-3.10+-3776ab.svg)](https://python.org)
-[![Qt](https://img.shields.io/badge/GUI-PySide6%20(Qt%206)-41cd52.svg)](https://pyside.org)
-[![Database](https://img.shields.io/badge/storage-SQLite%20WAL%20%2B%20FTS5-003b57.svg)](https://sqlite.org)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](file:///d:/exp/ezexp)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+**A Mac-style universal file finder for Windows.** EzExp catalogs *every file
+on every fixed drive* into a fast local index, so anything on your PC is one
+search away — no more digging through folders. Finder-style browsing,
+Spotlight-style quick search, real previews, Quick Launch for your apps,
+Obsidian vault support with a link graph, and full file management (create,
+rename, move, drag-and-drop) in a single portable exe.
 
-A Mac-style (clean white & grey, Finder/Spotlight-inspired) universal file finder and knowledge graph explorer for Windows. EzExp catalogs **every file on every fixed drive** into an instant local index, allowing you to search millions of files in milliseconds and jump straight to what you need — without digging through folders.
+- **Fully local.** No account, no cloud, no telemetry — the code contains no
+  network calls at all. Your index never leaves your PC.
+- **Portable.** One exe (~46 MB). No installer, no admin rights. It keeps its
+  data in `%LOCALAPPDATA%\EzExp` and its settings in the registry, and works
+  the same on any Windows 10/11 PC.
+- **Fast at real scale.** Developed and verified against a live index of
+  **2,179,340 files**: searches and folder opens come back in milliseconds
+  because everything is served from the index, never by walking the disk.
 
-The executable is fully portable: single binary, zero external installers, no admin privileges required, storing everything cleanly inside its own application directory.
+## Getting EzExp
 
----
+### Option A — build it yourself from this repo (recommended)
 
-## Table of Contents
+1. Click the green **Code** button → **Download ZIP** (or `git clone`).
+2. Extract the ZIP anywhere and double-click **`build.bat`**.
+   - If the PC has no Python, build.bat installs it automatically via
+     **winget** (built into Windows 10/11), then installs the build
+     dependencies (PySide6, PyInstaller, Pillow), generates the app icon,
+     and builds. Total: a few minutes, fully automatic.
+3. Run **`dist\ezexp.exe`**.
+   - Windows SmartScreen may say *"Windows protected your PC"* on first
+     run — the exe is not code-signed. Click **More info → Run anyway**
+     (one time only).
 
-- [Core Highlights](#core-highlights)
-- [Sharing EzExp with a Friend](#sharing-ezexp-with-a-friend)
-- [Feature Walkthrough](#feature-walkthrough)
-  - [1. Universal Instant Search](#1-universal-instant-search)
-  - [2. Quick Search (Spotlight Bar)](#2-quick-search-spotlight-bar)
-  - [3. Progressive Disclosure Graph](#3-progressive-disclosure-graph)
-  - [4. Quick Launch & App Dock](#4-quick-launch--app-dock)
-  - [5. File Organization (Cut, Copy, Paste & Drag-and-Drop)](#5-file-organization-cut-copy-paste--drag-and-drop)
-  - [6. Details Pane & Rich Previews](#6-details-pane--rich-previews)
-  - [7. Obsidian Vault Integration](#7-obsidian-vault-integration)
-- [Architecture & Technical Design](#architecture--technical-design)
-  - [Database & Storage Engine](#database--storage-engine)
-  - [Two-Phase Schema & Lock Contention Defense](#two-phase-schema--lock-contention-defense)
-  - [Scan Pipeline (Full vs. Incremental Delta)](#scan-pipeline-full-vs-incremental-delta)
-  - [Single Instance & Exception Logging](#single-instance--exception-logging)
-  - [Windows Shell & Clipboard Integration](#windows-shell--clipboard-integration)
-- [Building from Source](#building-from-source)
-- [Running Tests](#running-tests)
-- [Troubleshooting & FAQ](#troubleshooting--faq)
-- [Source Code Layout](#source-code-layout)
+### Option B — get the exe from someone who built it
 
----
+Send/receive the single file `ezexp.exe` — nothing else is needed.
+Same SmartScreen note as above.
 
-## Core Highlights
+## First launch & the index
 
-* **Sub-Millisecond Search Velocity**: Uses SQLite FTS5 with an ngram/trigram tokenizer to match prefixes, substrings, and extensions across millions of paths instantaneously.
-* **Mac Finder Aesthetic**: Frosted titlebars, subtle borders, high-contrast row selection (`#0a84ff`), human-readable file sizes, and color-coded category badges.
-* **Global Spotlight (`Alt+Space`)**: Summon an omnibar anywhere in Windows. Jump to files or launch apps without context switching.
-* **Interactive Radial Knowledge Graph**: Visualize your filesystem and Obsidian notes as an interactive radial tidy-tree with progressive disclosure — click nodes to expand deeper branches without UI lag.
-* **Explorer-Compatible Moving**: True Windows shell clipboard integration (`Preferred DropEffect`) for Cut, Copy, and Paste between EzExp and Windows Explorer, alongside native drag-and-drop.
-* **Non-Destructive Operations**: Automatic Windows-style duplicate collision handling (`name (2).ext`) prevents accidental file overwrites.
+- On first launch EzExp **indexes your entire PC in the background** —
+  watch the spinner and counter in the status bar. A few minutes on an
+  SSD; longer on a hard drive or a machine with millions of files.
+- **Search and browsing already work while the first scan runs**, and
+  closing the app mid-scan is safe: the scan's completion flag is only
+  written at the very end, so the next launch simply resumes and
+  finishes the job.
+- Later launches take a quick **incremental (delta) scan** — seconds —
+  and the app re-checks quietly **every 10 minutes** while it runs.
+- **Rescan now** (sidebar) forces an incremental pass; **Rebuild index**
+  wipes the catalog and re-indexes from scratch (with a confirmation).
+- The index lives at `%LOCALAPPDATA%\EzExp\index.db` (SQLite, WAL mode).
+  Expect a few hundred MB up to ~2 GB on a big PC — one row per file.
+  Deleting that folder resets EzExp to a fresh first launch.
 
----
+## Features
 
-## Sharing EzExp with a Friend
+### Instant search
+- Type in the search bar (top right) — results appear as you type,
+  best matches first. Matching is powered by an **FTS5 trigram
+  index**, so any substring of a name matches too (`eeti` or `notes`
+  both find `meeting-notes.txt`), with prefix matches ranked first.
+- Search combines freely with the sidebar place and the filter chips.
+- Views show up to **600 results** per query; the status bar says so
+  when a view is truncated ("refine to narrow").
 
-Distributing EzExp is as simple as sending `ezexp.exe` from the `dist/` directory:
+### Browsing
+- Double-click (or press Enter on) a folder to open it *inside* EzExp;
+  the **‹** title-bar button walks back through your history.
+- **Sidebar places**: All Files, your real Desktop / Documents /
+  Downloads / Pictures / Music / Videos (resolved through the Windows
+  shell, so OneDrive-redirected folders land correctly), every fixed
+  drive, your Obsidian vaults, and Quick Launch.
+- **Filter chips**: All, Folders, Documents, Images, Videos, Music,
+  Archives, Code — plus the **Graph** chip (below).
+- **Sort control**: Default, Name (A–Z), Newest first, Oldest first,
+  Largest first, Smallest first. *All Files → All* defaults to
+  most-recently-modified first; a folder defaults to folders-first,
+  then A–Z.
 
-1. **No Dependencies Needed**: The user does not need Python, Visual C++ runtimes, or administrative rights. Everything is bundled into the single standalone executable.
-2. **Windows SmartScreen Notice**: Because the executable is not code-signed with an expensive commercial EV certificate, Windows SmartScreen may present a *"Windows protected your PC"* prompt on first launch. Click **More info → Run anyway**. This is a standard one-time prompt for unsigned open-source binaries.
-3. **First Launch Cataloging**: On first launch, EzExp quietly catalogs all fixed drives (`C:`, `D:`, etc.) in a background worker thread. Search is responsive immediately, even while this initial indexing proceeds.
-4. **Where Data Lives**: All index metadata and diagnostic logs are stored strictly under:
-   ```
-   %LOCALAPPDATA%\EzExp\
-   ├── index.db       (SQLite index & FTS5 database)
-   ├── ezexp.lock     (Single-instance mutex file)
-   └── error.log      (Crash traceback capture)
-   ```
-   Deleting `%LOCALAPPDATA%\EzExp` resets the application to a pristine state.
+### Details & previews
+Selecting anything fills the details pane (right side):
+- **Images** render in full; **videos** show a real thumbnail frame
+  from the Windows shell (play badge — Open plays it); **text, code
+  and Markdown** files show their first lines; **folders** show their
+  item count; **apps** show name, kind, and location with
+  *Show in Folder* / *Open* buttons.
+- Real file icons throughout, taken from the Windows shell — including
+  for shortcuts, where EzExp shows the **target app's own icon**
+  (without the little shortcut-arrow overlay).
 
-Technical friends can clone this repository and run `build.bat` — it automatically installs Python via `winget` if missing, installs dependencies, and builds the executable.
+### Quick Launch
+- Pin favourite applications or scripts (`.exe`, `.lnk`, `.bat`,
+  `.cmd`) with **＋ Add App…**, and EzExp also surfaces your
+  most-frequently launched programs automatically.
+- **Single-press** an app to inspect it in the details pane *and* open
+  its folder in the main panel — for shortcuts the **target's** folder
+  is opened, not the shortcut's location. **Double-press** launches it.
+- Right-click an app button: browse its folder, reveal in Explorer,
+  copy path, or remove it from Quick Launch (removing works for
+  auto-surfaced frequent apps too).
 
----
+### File management
+Right-click any result — or use the **⋯** button in the details pane:
+- **New File… / New Folder…** — created in the selected folder (or the
+  open folder when nothing is selected) and indexed immediately, so it
+  shows up at once. Name collisions and invalid names are refused with
+  a message.
+- **Open**, **Show in Explorer**, **Rename…**, **Copy as path**,
+  **Copy file**, **Properties**.
+- **Cut / Copy / Paste** — in the menus and via **Ctrl+X / Ctrl+C /
+  Ctrl+V**. The clipboard uses the standard Windows format, so a Cut
+  in EzExp pastes as a move in Explorer and vice versa. Multi-select
+  is supported.
+- **Drag-and-drop** — drag rows onto a folder to move them, hold
+  **Ctrl** to copy, and drag files *in* from Explorer to copy them
+  into the open folder. Dropping onto a file targets its folder;
+  dropping onto empty space targets the open folder.
+- Moves and copies are **index-synced**: the catalog updates in the
+  same operation, so a moved file is searchable at its new home
+  instantly — no rescan needed. EzExp **never overwrites**: a name
+  collision produces the Explorer-style `name (2)` copy, and dropping
+  a folder into itself is refused.
+- **Move to Recycle Bin** (with confirmation) for deletes — nothing is
+  ever deleted permanently or silently.
 
-## Feature Walkthrough
+### Obsidian vaults
+- **＋ Add Obsidian Vault…** pins any folder as a vault favourite:
+  browsed and searched like any other place, remembered between
+  launches, and scanned on every start (even on removable drives).
+- `[[wikilinks]]` are parsed in the background after indexing and kept
+  incrementally up to date — the vault's link graph (below) is built
+  from that persisted analysis, never by re-reading your notes on the
+  spot.
 
-### 1. Universal Instant Search
-The search bar at the top-right triggers asynchronous queries on every keystroke:
-* **Category Filter Chips**: Narrow searches instantly to **Folders**, **Documents**, **Images**, **Videos**, **Music**, **Archives**, or **Code**.
-* **Place Scoping**: Click any sidebar location (Drive, Desktop, Documents, or Obsidian Vault) to constrain searches within that subtree.
-* **Client-Side Sorting**: Toggle sort modes on the fly: Name (A→Z), Newest Modified, Oldest Modified, Largest Size, or Smallest Size.
+### Graph view
+The **Graph** chip graphs whatever you're looking at — the scope
+follows the current tab:
+- **All Files** → "This PC" and your drives; **a drive or folder** →
+  that place's folder tree; **a vault** → the Obsidian-style link
+  graph (folder bubbles sized by note count, resolved wikilinks drawn
+  between visible notes; links from collapsed folders attach to the
+  bubble so no connection is lost).
+- **Progressive disclosure**: only the large nodes appear first;
+  click a node to expand just that branch (a purple **+** badge marks
+  expandable nodes), right-click to collapse. Everything is read from
+  the index, so expanding is instant at any depth, and the view
+  re-lays itself into a clean radial tree after every click, with a
+  gentle idle float. Nodes carry real icons.
+- Interactions: drag nodes, pan, scroll to zoom, click for details,
+  double-click to open, right-click for Expand / Collapse / Open /
+  Show in Explorer / Copy path.
 
-### 2. Quick Search (Spotlight Bar)
-Press **`Alt+Space`** anywhere in Windows (or **`Ctrl+Alt+Space`** if another application binds `Alt+Space`) to summon the floating Spotlight omnibar:
-* **`Enter`**: Launch the selected file or executable.
-* **`Enter` on Folder**: Closes the bar and opens the folder inside the main EzExp window.
-* **`Ctrl+Enter`**: Reveal the file highlighted in Windows Explorer.
-* **`Esc`**: Dismiss the search bar.
+### Spotlight quick search
+- **Alt+Space** anywhere in Windows summons the quick-search bar
+  (falls back to **Ctrl+Alt+Space** if Alt+Space is taken; if both are
+  taken, the main window's status bar says so and everything else
+  still works).
+- **Enter** opens the top match, folders jump into the main window,
+  **Ctrl+Enter** reveals in Explorer, **Esc** closes.
 
-### 3. Progressive Disclosure Graph
-Click the **Graph** chip to switch from list browsing to the interactive radial tree view:
-* **Progressive Disclosure**: Only high-level nodes are rendered initially. Nodes with unexpanded children display a violet `+` badge. Click a node to expand just that branch; right-click to collapse.
-* **Radial Layout**: Automatic radial distribution (depth determines ring radius, angle sorts alphabetically, node radius indicates item count).
-* **Obsidian Wikilink Visualizer**: When an Obsidian vault is scoped, document nodes visualize resolved `[[wikilinks]]` between visible notes, clustering interconnected knowledge organically.
-* **Canvas Controls**: Left-click to select and view details; double-click to open; scroll to zoom; drag to pan.
+### Small print that matters
+- **Single instance**: launching EzExp twice just tells you it's
+  already running (and a lock left behind by a crashed process is
+  detected and taken over automatically).
+- **Crash log**: if anything ever goes wrong, the traceback is
+  appended to `%LOCALAPPDATA%\EzExp\error.log` — send that file with
+  a bug report.
+- **Version**: 1.0.0 (stamped into the exe's file properties).
 
-### 4. Quick Launch & App Dock
-Pin your most critical tools (`.exe`, `.lnk`, `.bat`, `.cmd`) in the sidebar:
-* **Add Apps**: Click **＋ Add App…** to pin any program or script.
-* **Shortcut Target Resolution**: EzExp automatically resolves `.lnk` shortcuts to their actual targets and extracts native Windows shell icons without shortcut arrow overlays.
-* **Adaptive Frequency**: Frequently launched items automatically surface in your launch dock.
-* **Single-click / Double-click**: Single-click scopes the app's folder in the details pane and graph view; double-click launches the application.
+## How it works
 
-### 5. File Organization (Cut, Copy, Paste & Drag-and-Drop)
-EzExp provides a complete file management engine that keeps the SQLite index in sync with disk operations:
-* **Cut (`Ctrl+X`) & Copy (`Ctrl+C`)**: Multi-item selection with Explorer-compatible clipboard integration. Cutting in EzExp and pasting in Windows Explorer performs a move.
-* **Paste (`Ctrl+V`)**: Paste into the selected folder or the currently browsed folder via shortcut or context menu.
-* **Drag-and-Drop**:
-  * Drag items within the tree to move them.
-  * Hold **`Ctrl`** while dragging to copy.
-  * Dragging files from Windows Explorer into EzExp copies them into the target directory.
-* **Non-Destructive Collision Resolution**: If a destination file exists, EzExp renames the incoming file to `name (2).ext`, matching Windows Explorer behavior and preventing accidental data loss.
-* **Directory Loop Guard**: Prevents moving a folder into its own subtree.
+EzExp is a **single-file PySide6 application** (`app.py`, ~4,900
+lines) built into a portable exe with PyInstaller. Around that file:
 
-### 6. Details Pane & Rich Previews
-Selecting an item opens the right-hand inspection sidebar:
-* **Images**: High-fidelity scaled visual previews.
-* **Videos**: Real video thumbnail extraction with an overlaid playback badge (clicking or pressing Open starts video playback in your default media player).
-* **Text / Code / Markdown**: Live asynchronous syntax/text preview of the file head.
-* **Folders**: Instant calculation of total direct subfolder and child file counts.
-* **Quick Actions**: **Open**, **Show in Folder**, **Rename…**, **Copy as path**, **Copy file**, **Cut**, **Move to Recycle Bin**, and Windows **Properties**.
+- **Index engine (SQLite).** One row per file in a `files` table
+  (parent, name, kind, size, mtime, drive, category), a full-text
+  `fts` table (FTS5, trigram tokenizer, external-content over
+  `files`), a `meta` table (scan phase, totals), and a `note_links`
+  table for wikilink analysis. The database runs in **WAL mode** with
+  a 30 s busy timeout on every connection; connections **retry on
+  transient locks** instead of failing.
+- **Instant folder opens.** Folder browsing filters by parent path
+  case-insensitively, served by a dedicated
+  `parent COLLATE NOCASE` index (built once, lazily, by the indexer
+  thread so startup connections never queue behind it) — measured at
+  **~0.8 ms** for a folder query against a 400k-row index.
+- **Threads.** An **indexer thread** performs full and delta scans
+  (committing per directory batch, so the catalog is never locked for
+  long); a **search worker thread** answers queries off the UI thread;
+  a **link analyzer** parses wikilinks in budgeted background passes.
+- **Delta scans.** Each directory's stored mtime decides whether it
+  needs a rescan; new, changed and deleted entries are reconciled —
+  including the whole subtree when a folder disappears.
+- **Settings.** Quick Launch pins, launch counts and vault favourites
+  live in the registry via `QSettings` (`HKCU\Software\ezexp\EzExp`);
+  everything else is the index folder above.
 
-### 7. Obsidian Vault Integration
-* Add vaults via **＋ Add Obsidian Vault…** in the sidebar.
-* Vaults are preserved in user settings and automatically monitored on launch.
-* Background workers scan `[[wikilink]]` references in `.md` files without freezing the user interface, persisting relationships in the `note_links` database table.
+## Building from source
 
----
+**Requirements:** Windows 10/11. That's it — `build.bat` bootstraps
+the rest:
 
-## Architecture & Technical Design
+1. `build.bat` finds a working Python 3.10+ (launcher, per-user
+   installs, or PATH — every candidate must answer `--version`, so
+   the Microsoft Store stub can't fool it). If none exists, it
+   installs Python via **winget**, then re-detects.
+2. It pip-installs **PySide6, PyInstaller and Pillow**.
+3. `make_icon.py` renders the app icon (`ezexp.ico`) from the app's
+   own artwork at 16–256 px.
+4. PyInstaller builds a one-file, windowed exe with the icon and the
+   version info from `version_info.txt` →
+   **`dist\ezexp.exe`** (~46 MB).
 
-```mermaid
-flowchart TD
-    UI[PySide6 UI / ResultsTree / Spotlight] -->|Search Query| Worker[SearchWorker Thread]
-    Worker -->|FTS5 Trigram Query| DB[(index.db)]
-    
-    Indexer[IndexerThread / Auto-Scanner] -->|Scan Drives| Filesystem[Windows Filesystem]
-    Indexer -->|Insert / Delta Updates| DB
-    
-    UI -->|Cut / Copy / Drop| MoveEngine[move_or_copy Engine]
-    MoveEngine -->|shutil / OS Ops| Filesystem
-    MoveEngine -->|index_add_path / delete_tree| DB
-    
-    App[ezexp.exe] -->|Acquire Lock| QLockFile[ezexp.lock]
-    App -->|Crash Hook| ErrorLog[error.log]
-```
-
-### Database & Storage Engine
-EzExp uses SQLite 3 compiled with the FTS5 extension:
-* **WAL Mode (`PRAGMA journal_mode=WAL`)**: Enables concurrent readers while the background indexer thread writes.
-* **Trigram Tokenizer**: The full-text index tokenizes file names into 3-character sliding windows (`tokenize='trigram'`), allowing instantaneous matching of mid-word substrings (e.g. `report` matches `2026_financial_report_final.pdf`).
-* **Database Location**: Stored at `%LOCALAPPDATA%\EzExp\index.db`.
-
-### Two-Phase Schema & Lock Contention Defense
-To guarantee that the UI never hangs on launch:
-1. **`_ensure_schema(conn)`**: Runs synchronously on every database connection. It creates only the essential tables (`files`, `meta`, `note_links`, `fts`) and the single unique constraint index `idx_files_key ON files(parent, name)`. This takes <1 ms.
-2. **`ensure_indexes(conn)`**: Performance indexes (`idx_files_parent_nc` with `COLLATE NOCASE`, `idx_files_parent`, `idx_files_drive`, `idx_files_mtime`, `idx_files_cat`, `idx_links_key`) are built asynchronously by the background `IndexerThread`.
-3. **Lock Retry Strategy**: `db_connect()` includes a 180-second deadline loop that catches transient `sqlite3.OperationalError: database is locked` exceptions, sleeping 1 second between retries instead of crashing.
-4. **Indexer Auto-Retry**: If the indexer thread encounters a lock, `MainWindow.on_index_done` reports *"Index busy — retrying in 5 s…"* and schedules an automatic retry.
-
-### Scan Pipeline (Full vs. Incremental Delta)
-* **Initial Full Scan**: Traverses all fixed Windows drives using `os.scandir`. System volumes (`$Recycle.Bin`, `System Volume Information`, `pagefile.sys`, `hiberfil.sys`) and NTFS junctions/symlinks are automatically skipped to avoid circular recursion.
-* **Incremental Delta Scan**: Every 10 minutes (and on manual *"Rescan now"*), EzExp checks directory modification timestamps (`mtime`) against indexed rows. Only modified directories are traversed, completing in seconds.
-* **State Persistence**: Scan state (`phase=full_done`) is committed only upon complete scan completion. Interrupted first-scans cleanly resume on the next launch.
-
-### Single Instance & Exception Logging
-* **Single Instance Mutex**: `QLockFile` (`%LOCALAPPDATA%\EzExp\ezexp.lock`) with `setStaleLockTime(0)` ensures that secondary launches display an *"EzExp is already running"* notification and exit gracefully without database corruption.
-* **Crash Log Hook**: `install_crash_log()` wraps `sys.excepthook` to append unhandled exceptions and stack traces with ISO timestamps to `%LOCALAPPDATA%\EzExp\error.log`.
-
-### Windows Shell & Clipboard Integration
-* **File Operations**: Delete operations route through `shell32.SHFileOperationW` (with `FO_DELETE` and `FOF_ALLOWUNDO`) so items are safely sent to the Windows Recycle Bin rather than permanently erased.
-* **Windows Clipboard**: Implements `Preferred DropEffect` format (`0x02` for Move/Cut, `0x01` for Copy), enabling seamless interoperability with Windows Explorer.
-
----
-
-## Building from Source
-
-### Prerequisites
-* Windows 10 or 11 (64-bit)
-* Python 3.10+ (If not installed, `build.bat` will install Python 3.12 automatically via `winget`)
-
-### Automated Build (`build.bat`)
-Simply run the included build script:
-```cmd
-build.bat
-```
-The script performs the following actions automatically:
-1. Detects Python (`py`, per-user Python in `%LOCALAPPDATA%`, or triggers `winget install --id Python.Python.3.12`).
-2. Installs required build dependencies: `PySide6`, `pyinstaller`, `pillow`.
-3. Executes `make_icon.py` to generate the multi-resolution `ezexp.ico` (16x16 to 256x256).
-4. Packages the application into a single standalone executable using PyInstaller and `version_info.txt`.
-5. Emits the final binary at `dist\ezexp.exe`.
-
-### Manual Build
-If you prefer building manually in your virtual environment:
-```cmd
-pip install PySide6 pyinstaller pillow
-python make_icon.py
-pyinstaller --noconfirm --onefile --windowed --name ezexp --icon ezexp.ico --version-file version_info.txt app.py
-```
-
----
-
-## Running Tests
-
-EzExp includes a test suite covering the database engine, FTS5 queries, delta scanner, GUI components, graph building, moving/copying, and lock resilience:
-
-```cmd
-py _test.py
-```
-Expected output:
-```
-ALL TESTS PASSED
-```
-
----
-
-## Troubleshooting & FAQ
-
-### Search returns empty results or status bar says "Index error: database is locked"
-Another background process or anti-virus scanner is holding a lock on `%LOCALAPPDATA%\EzExp\index.db`. 
-* EzExp automatically retries index operations.
-* If the database was corrupted by an abrupt power termination, close EzExp and delete `%LOCALAPPDATA%\EzExp\index.db`. Relaunching will rebuild the catalog cleanly.
-
-### `Alt+Space` does not open the Quick Search bar
-Another utility (such as PowerToys Run or an existing window manager) may have registered `Alt+Space`. EzExp detects this on startup, displays a notice in the status bar, and falls back to **`Ctrl+Alt+Space`**.
-
-### How can I exclude a drive or folder from indexing?
-By default, EzExp catalogs all fixed physical drives. To remove or add specific roots, Obsidian vaults can be managed in the sidebar. Full folder ignore patterns can be configured by filtering system attributes.
-
-### How do I report a bug?
-If EzExp encounters an unexpected issue, attach `%LOCALAPPDATA%\EzExp\error.log` when creating an issue report.
-
----
-
-## Source Code Layout
+## Repository layout
 
 | File | Purpose |
-| :--- | :--- |
-| [`app.py`](file:///d:/exp/ezexp/app.py) | Complete application: UI, widgets, scanner, move engine, graph canvas, and SQLite layer |
-| [`_test.py`](file:///d:/exp/ezexp/_test.py) | Comprehensive test suite for backend, UI, clipboard, and lock resilience |
-| [`build.bat`](file:///d:/exp/ezexp/build.bat) | Self-installing Windows batch script to build `dist/ezexp.exe` |
-| [`make_icon.py`](file:///d:/exp/ezexp/make_icon.py) | Multi-resolution icon builder (`ezexp.ico`) |
-| [`version_info.txt`](file:///d:/exp/ezexp/version_info.txt) | Windows PE version resource definition (`1.0.0.0`) |
-| [`assets/logo/`](file:///d:/exp/ezexp/assets/logo) | High-resolution logo source files (SVG, ICO, PNG) and visual designs |
+|---|---|
+| `app.py` | The entire application: UI, index engine, search, graph, actions |
+| `_test.py` | Self-contained test suite — run `py _test.py` |
+| `build.bat` | One-click build (bootstraps Python via winget if missing) |
+| `make_icon.py` | Generates `ezexp.ico` from the app's artwork |
+| `version_info.txt` | Windows version resource stamped into the exe |
+| `ezexp.spec` | PyInstaller spec (reference; `build.bat` drives PyInstaller by flags) |
+| `README.md` | This file |
+
+## Tests
+
+`py _test.py` runs the whole suite and prints `ALL TESTS PASSED`:
+index/scanner behaviour (including delta-scan edge cases like a
+deleted folder's children and a folder replaced by a file), FTS
+search ranking, wikilink parsing and the persisted link analysis,
+structure/vault graph construction, Quick Launch behaviour (pin,
+launch counts, remove, shortcut resolution), sorting, file creation,
+cut/copy/paste and the move engine, the single-instance lock, the
+crash log, and a rendered-pixel check that the selected row is
+actually visible. The suite uses an isolated temporary database —
+your real index is never touched.
+
+## Troubleshooting
+
+- **"Windows protected your PC"** — the exe is unsigned; **More info
+  → Run anyway**, once. (Removing this permanently would require a
+  paid code-signing certificate.)
+- **First launch feels slow to fill up** — it's indexing; search
+  works meanwhile. HDDs and multi-million-file PCs take longer.
+- **"Index error: database is locked"** — fixed in the current build
+  (connections retry and the indexer auto-retries). If you ever see
+  it on an old build: close *every* EzExp window/process, relaunch.
+  Deleting `%LOCALAPPDATA%\EzExp` forces a clean rebuild.
+- **The exe's icon looks like a plain folder in Explorer** — Windows
+  icon cache; rename the exe once or restart Explorer.
+- **Alt+Space does nothing** — another app owns it; EzExp falls back
+  to Ctrl+Alt+Space and notes it in the status bar.
+- **Something crashed** — check `%LOCALAPPDATA%\EzExp\error.log`.
+
+## Limitations (honest list)
+
+- **Windows only** — EzExp is built on Windows shell APIs throughout.
+- **Search matches file and folder *names*** (and paths via browse),
+  not file contents.
+- **Results are capped at 600 per view** — narrow with places, chips
+  or a longer query.
+- Content-only edits (same file, new size) are picked up on the next
+  rescan, not instantly; junctions/symlinks are not double-indexed
+  (loop protection), and system locations (`$Recycle.Bin`, `System
+  Volume Information`, page/hibernation files) are skipped by design.
+
+## Privacy & safety
+
+- **No network code, no telemetry, no accounts.** Everything happens
+  on your machine.
+- EzExp **never moves, renames or deletes your files on its own** —
+  every destructive action is one you explicitly chose, and deletes
+  go to the Recycle Bin behind a confirmation.
+
+## License
+
+No license file yet — all rights reserved by the author by default.
