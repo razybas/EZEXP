@@ -646,6 +646,28 @@ def _row_dict(r):
     }
 
 
+def sort_rows(rows, mode):
+    """Client-side ordering for the list view (fetch is capped at 600)."""
+    if mode == "name":
+        return sorted(rows, key=lambda r: (not r["is_dir"],
+                                           r["name"].lower()))
+    if mode == "newest":
+        return sorted(rows, key=lambda r: (-(r["mtime"] or 0),
+                                           r["name"].lower()))
+    if mode == "oldest":
+        return sorted(rows, key=lambda r: ((r["mtime"] or 0),
+                                           r["name"].lower()))
+    if mode == "largest":
+        return sorted(rows, key=lambda r: (r["is_dir"],
+                                           -(r["size"] or 0),
+                                           r["name"].lower()))
+    if mode == "smallest":
+        return sorted(rows, key=lambda r: (r["is_dir"],
+                                           (r["size"] or 0),
+                                           r["name"].lower()))
+    return rows
+
+
 def do_search(conn, query, place=None, cat="all", limit=600):
     """Returns (rows, note). Empty query = browse the current place by date."""
     q = (query or "").strip()
@@ -1573,6 +1595,16 @@ def real_file_icon(path):
     return app_icon()
 
 
+def app_icon_for(path):
+    """Icon for a Quick Launch entry: for a .lnk, the TARGET app's own
+    icon (no shortcut overlay); otherwise the file's real icon."""
+    if path and path.lower().endswith(".lnk"):
+        target = resolve_lnk_target(path)
+        if target:
+            return real_file_icon(target)
+    return real_file_icon(path)
+
+
 def app_logo_pixmap(size=256):
     """EzExp logo: mac-style tile, folder + magnifier, purple vault spark."""
     pm = QPixmap(size, size)
@@ -1980,7 +2012,7 @@ class NameDelegate(QStyledItemDelegate):
         small = QFont(option.font)
         small.setPointSizeF(7.5)
         p.setFont(small)
-        p.setPen(QColor("rgba(255,255,255,0.8)") if selected else QColor(SUBTLE))
+        p.setPen(QColor(255, 255, 255, 204) if selected else QColor(SUBTLE))
         path = row["parent"] + ("\\" + row["name"] if not row["is_dir"] else "")
         if len(path) == 2:
             path = path + "\\"
@@ -2863,7 +2895,7 @@ class QLaunchButton(QPushButton):
         super().__init__("  " + stem, parent)
         self._path = path
         self.setObjectName("sideBtn")
-        self.setIcon(real_file_icon(path))
+        self.setIcon(app_icon_for(path))
         self.setIconSize(QSize(16, 16))
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -2964,6 +2996,11 @@ class MainWindow(FramelessWindow):
             "structure diagram for everything else")
         self.btn_graph.clicked.connect(lambda checked: self.toggle_graph(checked))
         chips.addWidget(self.btn_graph)
+        self._sort_mode = "default"
+        self.btn_sort = QPushButton("Sort: Default", main)
+        self.btn_sort.setCursor(Qt.PointingHandCursor)
+        self.btn_sort.clicked.connect(self.show_sort_menu)
+        chips.addWidget(self.btn_sort)
         chips.addStretch(1)
         chipsw = QWidget(main)
         chipsw.setObjectName("chips")
@@ -3328,6 +3365,28 @@ class MainWindow(FramelessWindow):
         if row["is_dir"]:
             self.drill_in(row)
 
+    _SORT_LABELS = (("default", "Default"), ("name", "Name (A–Z)"),
+                    ("newest", "Newest first"), ("oldest", "Oldest first"),
+                    ("largest", "Largest first"),
+                    ("smallest", "Smallest first"))
+
+    def show_sort_menu(self):
+        menu = QMenu(self)
+        for key, label in self._SORT_LABELS:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self._sort_mode == key)
+            act.triggered.connect(
+                lambda checked, k=key: self.set_sort_mode(k))
+        menu.exec(self.btn_sort.mapToGlobal(
+            self.btn_sort.rect().bottomLeft()))
+
+    def set_sort_mode(self, mode):
+        self._sort_mode = mode
+        label = dict(self._SORT_LABELS).get(mode, "Default")
+        self.btn_sort.setText("Sort: " + label)
+        self.refresh_view()
+
     def select_cat(self, cat):
         self.enter_list_mode(cat)
 
@@ -3540,6 +3599,8 @@ class MainWindow(FramelessWindow):
     def on_results(self, seq, q, rows, note):
         if seq != self.view_seq:
             return
+        if getattr(self, "_sort_mode", "default") != "default" and rows:
+            rows = sort_rows(rows, self._sort_mode)
         self.current_rows = rows
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
@@ -3618,12 +3679,69 @@ class MainWindow(FramelessWindow):
         menu = self.build_menu(row)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
+    def create_new_entry(self, folder, is_dir):
+        kind = "folder" if is_dir else "file"
+        name, ok = QInputDialog.getText(
+            self, APP_NAME, f"New {kind} name:",
+            text="New Folder" if is_dir else "untitled.txt")
+        if not ok:
+            return
+        name = name.strip()
+        if (not name or name in (".", "..")
+                or os.path.basename(name) != name):
+            QMessageBox.warning(self, APP_NAME,
+                                "That name is not allowed.")
+            return
+        path = join_path(folder, name)
+        try:
+            if is_dir:
+                os.mkdir(path)
+            else:
+                with open(path, "x"):
+                    pass
+        except FileExistsError:
+            QMessageBox.warning(self, APP_NAME,
+                                f"“{name}” already exists here.")
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME,
+                                f"Could not create:\n{exc}")
+            return
+        try:
+            st = os.stat(path)
+            conn = thread_conn()
+            insert_rows(conn, [_make_row(folder, name, is_dir, st,
+                                         folder[:2])])
+            conn.commit()
+        except Exception:
+            pass  # the next rescan will pick it up regardless
+        self.refresh_view()
+
+    def build_place_menu(self):
+        if not self.current_place:
+            return None
+        menu = QMenu(self)
+        folder = self.current_place
+        act = menu.addAction("New File…")
+        act.triggered.connect(lambda: self.create_new_entry(folder, False))
+        act = menu.addAction("New Folder…")
+        act.triggered.connect(lambda: self.create_new_entry(folder, True))
+        return menu
+
     def build_menu(self, row):
         menu = QMenu(self)
         act_reveal = menu.addAction("Show in Explorer")
         act_reveal.triggered.connect(self.reveal_current)
         act_open = menu.addAction("Open")
         act_open.triggered.connect(self.open_current)
+        menu.addSeparator()
+        _nf = self.row_path(row) if row["is_dir"] else row["parent"]
+        act_newf = menu.addAction("New File…")
+        act_newf.triggered.connect(
+            lambda f=_nf: self.create_new_entry(f, False))
+        act_newd = menu.addAction("New Folder…")
+        act_newd.triggered.connect(
+            lambda f=_nf: self.create_new_entry(f, True))
         menu.addSeparator()
         act_ren = menu.addAction("Rename…")
         act_ren.triggered.connect(lambda: self.rename_current(row))
@@ -3873,6 +3991,10 @@ class DetailsPane(QFrame):
             return
         row = self.parent().current_row()
         if not row:
+            menu = self.parent().build_place_menu()
+            if menu is not None:
+                menu.exec(self.btn_more.mapToGlobal(
+                    self.btn_more.rect().bottomLeft()))
             return
         menu = self.parent().build_menu(row)
         menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
@@ -3892,7 +4014,7 @@ class DetailsPane(QFrame):
         stem = os.path.splitext(name)[0]
         folder = os.path.dirname(path)
         ext = ext_of(path)
-        pm = real_file_icon(path).pixmap(64, 64)
+        pm = app_icon_for(path).pixmap(64, 64)
         self.icon_label.setPixmap(pm)
         fm = QFontMetrics(self.name_label.font())
         self.name_label.setText(fm.elidedText(stem, Qt.ElideMiddle, 230))
@@ -4251,7 +4373,7 @@ class SpotDelegate(QStyledItemDelegate):
         small = QFont(option.font)
         small.setPointSizeF(8.0)
         p.setFont(small)
-        p.setPen(QColor("rgba(255,255,255,0.85)") if selected else QColor(SUBTLE))
+        p.setPen(QColor(255, 255, 255, 217) if selected else QColor(SUBTLE))
         right = row["kind"] + ("" if row["is_dir"] else "  ·  " + human_size(row["size"]))
         p.drawText(r.right() - 260, r.top(), 248, r.height(),
                    Qt.AlignRight | Qt.AlignVCenter,

@@ -90,6 +90,23 @@ assert rows[0]["name"] == "main.py", rows
 rows, _ = ez.do_search(conn, "ai")        # 2 chars → LIKE path
 assert names(rows) == ["main.py"], rows
 
+# --- list sorting -----------------------------------------------------------
+sort_sample = [
+    {"name": "bdir", "is_dir": 1, "size": None, "mtime": 50},
+    {"name": "big.txt", "is_dir": 0, "size": 900, "mtime": 10},
+    {"name": "afile.txt", "is_dir": 0, "size": 5, "mtime": 99},
+    {"name": "mid.txt", "is_dir": 0, "size": 100, "mtime": 60},
+]
+assert [r["name"] for r in ez.sort_rows(sort_sample, "name")] == \
+    ["bdir", "afile.txt", "big.txt", "mid.txt"]
+assert [r["name"] for r in ez.sort_rows(sort_sample, "newest")] == \
+    ["afile.txt", "mid.txt", "bdir", "big.txt"]
+assert [r["name"] for r in ez.sort_rows(sort_sample, "largest")] == \
+    ["big.txt", "mid.txt", "afile.txt", "bdir"]
+assert [r["name"] for r in ez.sort_rows(sort_sample, "smallest")] == \
+    ["afile.txt", "mid.txt", "big.txt", "bdir"]
+assert ez.sort_rows(sort_sample, "default") == sort_sample
+
 # --- delta: additions, deletions -------------------------------------------
 time.sleep(0.05)
 with open(os.path.join(docs, "brand-new-file.mp4"), "w") as f:
@@ -451,7 +468,39 @@ wait_results(300)
 win.select_app(lnk, win._ql_buttons[0])
 wait_results(500)
 assert win.current_place == os.path.dirname(fake_app), win.current_place
+
+# icon identity for shortcuts
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+lnk_pm = ez.app_icon_for(lnk).pixmap(32, 32)
+tgt_pm = ez.real_file_icon(fake_app).pixmap(32, 32)
+assert not lnk_pm.isNull()
+assert not tgt_pm.isNull()
+assert not win._ql_buttons[0].icon().isNull()
+
+
+def _pm_png(pm):
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.WriteOnly)
+    pm.save(buf, "PNG")
+    return bytes(ba.data())
+
+
+assert _pm_png(lnk_pm) == _pm_png(tgt_pm)
 win.remove_quicklaunch(lnk)
+
+# (2) Creation
+_orig_txt = ez.QInputDialog.getText
+ez.QInputDialog.getText = staticmethod(
+    lambda *a, **k: ("created-by-test.txt", True))
+try:
+    win.create_new_entry(data, False)
+finally:
+    ez.QInputDialog.getText = _orig_txt
+wait_results(500)
+assert os.path.isfile(os.path.join(data, "created-by-test.txt"))
+assert any(r["name"] == "created-by-test.txt" for r in win.current_rows)
+os.remove(os.path.join(data, "created-by-test.txt"))
 
 worker.stop()
 worker.wait(3000)
