@@ -27,7 +27,8 @@ from collections import deque
 from ctypes import wintypes
 
 from PySide6.QtCore import (
-    Qt, QTimer, QThread, QUrl, QSize, QPointF, QRectF, QLineF, QMimeData,
+    Qt, QFileInfo, QTimer, QThread, QUrl, QSize, QPointF, QRectF, QLineF,
+    QMimeData,
     QEvent, QSettings, Signal, QAbstractNativeEventFilter,
 )
 from PySide6.QtGui import (
@@ -35,7 +36,8 @@ from PySide6.QtGui import (
     QPainter, QPainterPath, QPolygonF, QPixmap, QPen, QShortcut, QGuiApplication,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QGraphicsItem, QGraphicsLineItem,
+    QApplication, QFileDialog, QFileIconProvider, QFrame, QGraphicsItem,
+    QGraphicsLineItem,
     QGraphicsObject,
     QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QStyle,
@@ -1496,6 +1498,24 @@ def app_icon(size=18):
     return icon
 
 
+_icon_provider = None
+
+
+def real_file_icon(path):
+    """The file's real shell icon (embedded exe/lnk icon on Windows);
+    the painted generic app glyph when none is available."""
+    global _icon_provider
+    try:
+        if _icon_provider is None:
+            _icon_provider = QFileIconProvider()
+        icon = _icon_provider.icon(QFileInfo(path))
+        if icon is not None and not icon.isNull():
+            return icon
+    except Exception:
+        pass
+    return app_icon()
+
+
 def app_logo_pixmap(size=256):
     """EzExp logo: mac-style tile, folder + magnifier, purple vault spark."""
     pm = QPixmap(size, size)
@@ -2786,7 +2806,7 @@ class QLaunchButton(QPushButton):
         super().__init__("  " + stem, parent)
         self._path = path
         self.setObjectName("sideBtn")
-        self.setIcon(app_icon())
+        self.setIcon(real_file_icon(path))
         self.setIconSize(QSize(16, 16))
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -2895,6 +2915,7 @@ class MainWindow(FramelessWindow):
 
         self.tree = ResultsTree(main)
         self.tree.itemSelectionChanged.connect(self.on_selection)
+        self.tree.itemClicked.connect(self.on_tree_clicked)
         self.tree.itemDoubleClicked.connect(
             lambda item, col: self.open_in_app(item.data(0, Qt.UserRole)))
         self.tree.reveal_requested.connect(lambda: self.open_in_app())
@@ -2983,8 +3004,14 @@ class MainWindow(FramelessWindow):
 
     # ---- quick launch ---------------------------------------------------------
     def select_app(self, path, btn):
+        folder = os.path.dirname(path)
+        if (self.view_mode == "list" and folder
+                and os.path.normcase(folder)
+                != os.path.normcase(self.current_place or "")):
+            self.drill_to_path(folder,
+                               os.path.basename(folder) or folder)
         self._ql_selected = path
-        self.graph_scope_path = os.path.dirname(path)
+        self.graph_scope_path = folder
         for b in self._side_buttons:
             b.setChecked(False)
         for b in self._ql_buttons:
@@ -3477,11 +3504,15 @@ class MainWindow(FramelessWindow):
             self.tree.setCurrentItem(self.tree.topLevelItem(0))
 
     def on_selection(self):
+        if self._ql_selected:
+            return
         item = self.tree.currentItem()
-        if item:
-            self._ql_selected = None
-            for b in self._ql_buttons:
-                b.setChecked(False)
+        self.details.show_row(item.data(0, Qt.UserRole) if item else None)
+
+    def on_tree_clicked(self, item, col=0):
+        self._ql_selected = None
+        for b in self._ql_buttons:
+            b.setChecked(False)
         self.details.show_row(item.data(0, Qt.UserRole) if item else None)
 
     def current_row(self):
@@ -3795,7 +3826,7 @@ class DetailsPane(QFrame):
         stem = os.path.splitext(name)[0]
         folder = os.path.dirname(path)
         ext = ext_of(path)
-        pm = app_icon(64).pixmap(64, 64)
+        pm = real_file_icon(path).pixmap(64, 64)
         self.icon_label.setPixmap(pm)
         fm = QFontMetrics(self.name_label.font())
         self.name_label.setText(fm.elidedText(stem, Qt.ElideMiddle, 230))

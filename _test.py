@@ -399,6 +399,21 @@ try:
 finally:
     ez.QFileDialog.getOpenFileName = _orig_dlg
 assert os.path.normpath(fake_app) in ez.get_quicklaunch()
+ql_btn = win._ql_buttons[0]
+
+# single-press on an app opens its containing folder in the main panel
+win.drill_to_path(os.path.join(data, "Documents"), "Documents")
+wait_results(300)
+assert win.current_place == os.path.join(data, "Documents")
+win.select_app(fake_app, ql_btn)
+wait_results(300)
+assert win.current_place == os.path.dirname(fake_app), win.current_place
+assert win._ql_selected == fake_app
+assert "fake_app" in win.details.name_label.text().lower()
+# real icons: button and details icon must be present (the shell supplies
+# the actual glyph on Windows; non-null is the assertable part)
+assert not ql_btn.icon().isNull()
+assert not win.details.icon_label.pixmap().isNull()
 win.remove_quicklaunch(fake_app)
 
 worker.stop()
