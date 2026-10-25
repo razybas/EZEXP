@@ -1139,7 +1139,7 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
         tot = sum(total.get(r.lower(), 0) for r in roots)
         nodes.append({"label": "This PC", "kind": "drive", "weight": tot,
                       "sub": f"{tot:,} items", "path": None,
-                      "parent_path": None, "file": None})
+                      "parent_path": None, "file": None, "has_children": True})
         virtual = len(nodes) - 1
     for r in roots:
         rl = r.lower()
@@ -1150,7 +1150,7 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
         idx_of[rl] = len(nodes)
         nodes.append({"label": label, "kind": kind, "weight": total.get(rl, 0),
                       "sub": f"{total.get(rl, 0):,} items", "path": r,
-                      "parent_path": None, "file": None})
+                      "parent_path": None, "file": None, "has_children": True})
     for depth in range(1, depth_cap + 1):
         for pl in sorted((p for p in kept if depth_of.get(p) == depth),
                          key=lambda p: orig_of[p].lower()):
@@ -1160,7 +1160,8 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
                           "weight": total.get(pl, 0),
                           "sub": f"{total.get(pl, 0):,} items", "path": po,
                           "parent_path": orig_of.get(parent_of.get(pl, "")),
-                          "file": None})
+                          "file": po.rsplit("\\", 1)[-1],
+                          "has_children": counts.get(pl, 0) > 0})
 
     # edges: each kept dir connects to its nearest kept ancestor
     edges = []
@@ -1188,7 +1189,7 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
                 idx = len(nodes)
                 nodes.append({"label": name, "kind": "file", "weight": size or 0,
                               "sub": human_size(size), "path": join_path(r, name),
-                              "parent_path": r, "file": name})
+                              "parent_path": r, "file": name, "has_children": False})
                 edges.append((ri, idx))
             if len(rows) == 250:
                 truncated = True
@@ -1816,6 +1817,7 @@ class GraphNode(QGraphicsObject):
         self.kind = kind
         self.sub = sub
         self.show_label = True
+        self.can_expand = False
         self.state = 0      # 0 normal, 1 neighbor/hover, 2 selected, 3 dimmed
         self._hover = False
         self._dragging = False
@@ -1826,8 +1828,8 @@ class GraphNode(QGraphicsObject):
 
     def boundingRect(self):
         show_text = self.show_label or self._hover or self.state == 2
-        extra = (14 if self.sub else 0) + (20 if show_text else 0)
-        return QRectF(-118, -self.radius - 6, 236, self.radius * 2 + 4 + extra)
+        extra = (14 if self.sub else 0) + (20 if show_text else 0) + 10
+        return QRectF(-118, -self.radius - 10, 236, self.radius * 2 + 10 + extra)
 
     def paint(self, p, option, widget):
         st = self.state
@@ -1845,6 +1847,14 @@ class GraphNode(QGraphicsObject):
         p.setBrush(fill)
         p.setPen(QPen(border, 1.4))
         p.drawEllipse(QPointF(0, 0), self.radius, self.radius)
+        if self.can_expand:
+            bx, by = self.radius * 0.82, -self.radius * 0.82
+            p.setBrush(QColor("#8b5cf6"))
+            p.setPen(QPen(QColor("#7c3aed"), 1))
+            p.drawEllipse(QPointF(bx, by), 6.5, 6.5)
+            p.setPen(QPen(QColor("#ffffff"), 1.5))
+            p.drawLine(QPointF(bx - 3, by), QPointF(bx + 3, by))
+            p.drawLine(QPointF(bx, by - 3), QPointF(bx, by + 3))
         if not (self.show_label or self._hover or self.state == 2):
             return
         fm = QFontMetrics(self.view.label_font)
@@ -1922,6 +1932,18 @@ class GraphView(QGraphicsView):
         self.sel_index = None
         self._mode = "links"
         self._simulating = False
+        # structure mode: progressive disclosure bookkeeping
+        self.child_provider = None   # set by MainWindow (on-demand expansion)
+        self._items = {}             # node idx -> visible GraphNode
+        self._visible = set()
+        self._tree_children = {}     # idx -> [visible child idxs]
+        self._edge_lines = {}        # child idx -> its line to the parent
+        self._parent_of = {}         # child idx -> parent idx (visible tree)
+        self._data_nodes = []
+        self._children_data = {}     # idx -> [child idxs] (built + on-demand)
+        self._parent_of_data = {}
+        self._data_key = {}          # (parent_lower, file_lower) -> node idx
+        self._roots_idx = []
         self._zoom = 1.0
         self._settle = 0
         self._fitted = False
@@ -1944,6 +1966,16 @@ class GraphView(QGraphicsView):
         self._fitted = False
         self._settle = 0
         self._simulating = False
+        self._items = {}
+        self._visible = set()
+        self._tree_children = {}
+        self._edge_lines = {}
+        self._parent_of = {}
+        self._data_nodes = []
+        self._children_data = {}
+        self._parent_of_data = {}
+        self._data_key = {}
+        self._roots_idx = []
         self.scene().clear()
         if self._msg is not None:
             self._msg.deleteLater()
@@ -1974,35 +2006,41 @@ class GraphView(QGraphicsView):
             self.show_message("Nothing to graph here yet.")
             return
         scene = self.scene()
+        if self._mode == "structure":
+            self._data_nodes = [dict(nd) for nd in nodes]
+            incoming = set()
+            for a, b in edges:
+                self._children_data.setdefault(a, []).append(b)
+                self._parent_of_data[b] = a
+                incoming.add(b)
+            self._roots_idx = [i for i in range(len(nodes)) if i not in incoming]
+            for i, nd in enumerate(self._data_nodes):
+                if nd.get("file"):
+                    self._data_key[(nd.get("parent_path") or "").lower(),
+                                   nd["file"].lower()] = i
+            visible = set(self._roots_idx)
+            for r in self._roots_idx:
+                for c in self._children_data.get(r, []):
+                    visible.add(c)
+            for i in sorted(visible):
+                self._add_visible(i, self._parent_of_data.get(i))
+            self._apply_radial_layout()
+            return
         small = len(nodes) <= 120
-        groups = {}
         for i, nd in enumerate(nodes):
-            if self._mode == "structure":
-                if nd.get("kind") == "drive":
-                    r = 15.0
-                elif nd.get("kind") == "file":
-                    r = 5.0
-                else:
-                    r = 7.0 + min(13.0, math.log10((nd.get("weight") or 0) + 1) * 3.4)
-            else:
-                r = 6.0 + min(12.0, (nd.get("degree", 0) ** 0.5) * 2.4)
+            r = 6.0 + min(12.0, (nd.get("degree", 0) ** 0.5) * 2.4)
             item = GraphNode(self, i, nd.get("label") or nd.get("name", ""), r,
                              nd.get("parent_path") or nd.get("parent"),
                              nd.get("file"), nd.get("path"),
                              nd.get("kind", "note"), nd.get("sub"))
-            if self._mode == "structure":
-                item.show_label = small or nd.get("kind") in ("drive", "folder")
-            else:
-                item.show_label = small or nd.get("degree", 0) >= 3
+            item.show_label = small or nd.get("degree", 0) >= 3
             item.setToolTip((nd.get("label") or nd.get("name", ""))
                             + (("\n" + nd["sub"]) if nd.get("sub") else ""))
             scene.addItem(item)
             self.nodes.append(item)
             self.vx.append(0.0)
             self.vy.append(0.0)
-            self.folder_of.append(
-                (nd.get("parent_path") or nd.get("parent") or "").lower()
-                if self._mode == "links" else "")
+            self.folder_of.append((nd.get("parent_path") or nd.get("parent") or "").lower())
         pen = QPen(QColor("#e3e5e8"), 1.4)
         for a, b in edges:
             li = QGraphicsLineItem(0, 0, 0, 0)
@@ -2012,37 +2050,102 @@ class GraphView(QGraphicsView):
             self.edge_items.append((li, a, b))
             self.edge_pairs.append((a, b))
         self.apply_highlights()
-        if self._mode == "structure":
-            self._apply_radial_layout()   # static, deterministic, zero lag
-        else:
-            self._cluster_init()          # start notes near their folder group
-            self.kick()
+        self._cluster_init()
+        self.kick()
 
-    def _cluster_init(self):
-        """Place notes near their folder's group centre so the link graph
-        forms communities instead of one hairball."""
-        groups = {}
-        for i, key in enumerate(self.folder_of):
-            groups.setdefault(key, []).append(i)
-        for gi, key in enumerate(sorted(groups.keys())):
-            ga = gi * 2.39996
-            gr = 70.0 * ((gi + 1) ** 0.6)
-            cx, cy = gr * math.cos(ga), gr * math.sin(ga)
-            for k, i in enumerate(groups[key]):
-                a2 = k * 2.39996
-                rr = 26.0 * ((k + 1) ** 0.5)
-                self.nodes[i].setPos(cx + rr * math.cos(a2), cy + rr * math.sin(a2))
+    # ---- structure mode: progressive disclosure --------------------------------
+    def _add_visible(self, i, parent_idx=None):
+        nd = self._data_nodes[i]
+        kind = nd.get("kind", "folder")
+        if kind == "drive":
+            r = 15.0
+        elif kind == "file":
+            r = 5.0
+        else:
+            r = 7.0 + min(13.0, math.log10((nd.get("weight") or 0) + 1) * 3.4)
+        item = GraphNode(self, i, nd.get("label") or "", r, nd.get("parent_path"),
+                         nd.get("file"), nd.get("path"), kind, nd.get("sub"))
+        item.setToolTip((nd.get("label") or "")
+                        + (("\n" + nd["sub"]) if nd.get("sub") else ""))
+        self.scene().addItem(item)
+        self._items[i] = item
+        self._visible.add(i)
+        if parent_idx is not None and parent_idx in self._visible:
+            li = QGraphicsLineItem(0, 0, 0, 0)
+            li.setPen(QPen(QColor("#e3e5e8"), 1.4))
+            li.setZValue(0)
+            self.scene().addItem(li)
+            self._edge_lines[i] = li
+            self._parent_of[i] = parent_idx
+            self._tree_children.setdefault(parent_idx, []).append(i)
+        item.can_expand = (bool(nd.get("has_children"))
+                           and not self._tree_children.get(i))
+
+    def expand_node(self, idx):
+        """Reveal the direct children of this node — from the built data when
+        available, otherwise fetched live from the index, so any depth of any
+        drive can be explored."""
+        if self._mode != "structure":
+            return
+        parent_path = self._data_nodes[idx].get("path")
+        if parent_path and self.child_provider:
+            for nd in self.child_provider(parent_path):
+                key = ((nd.get("parent_path") or "").lower(),
+                       (nd.get("file") or "").lower())
+                if key in self._data_key:
+                    continue
+                ni = len(self._data_nodes)
+                self._data_nodes.append(nd)
+                self._data_key[key] = ni
+                self._children_data.setdefault(idx, []).append(ni)
+        added = False
+        for c in self._children_data.get(idx, []):
+            if c in self._visible:
+                continue
+            self._add_visible(c, parent_idx=idx)
+            added = True
+        item = self._items.get(idx)
+        if item:
+            item.can_expand = False
+            item.update()
+        if added:
+            self._apply_radial_layout()
+
+    def collapse_node(self, idx):
+        if self._mode != "structure":
+            return
+
+        def rm(i):
+            for c in list(self._tree_children.get(i, [])):
+                rm(c)
+            it = self._items.pop(i, None)
+            if it is not None:
+                self.scene().removeItem(it)
+            li = self._edge_lines.pop(i, None)
+            if li is not None:
+                self.scene().removeItem(li)
+            self._visible.discard(i)
+            self._tree_children.pop(i, None)
+
+        for c in list(self._tree_children.get(idx, [])):
+            rm(c)
+        self._tree_children.pop(idx, None)
+        if self.sel_index not in self._visible:
+            self.sel_index = None
+        item = self._items.get(idx)
+        if item:
+            item.can_expand = True
+            item.update()
+        self._apply_radial_layout()
 
     def _apply_radial_layout(self):
-        """Deterministic radial tidy-tree: the place at the centre, its
-        sub-branches fanning out clockwise in A→Z order, ring radius by
-        depth, angular width by subtree size. No simulation involved."""
-        children = {}
-        has_parent = set()
-        for a, b in self.edge_pairs:
-            children.setdefault(a, []).append(b)
-            has_parent.add(b)
-        roots_idx = [i for i in range(len(self.nodes)) if i not in has_parent]
+        """Deterministic radial tidy-tree over the visible nodes: centre root,
+        branches clockwise A→Z, ring radius by depth, angular width by subtree
+        size. No simulation involved."""
+        if self._mode != "structure" or not self._items:
+            return
+        children = {i: list(c) for i, c in self._tree_children.items() if c}
+        roots_idx = [i for i in self._visible if i not in self._edge_lines]
         if not roots_idx:
             return
         depth_of = {}
@@ -2060,46 +2163,90 @@ class GraphView(QGraphicsView):
             depth_of[node] = depth
             stack.append((node, depth, True))
             for c in children.get(node, []):
-                if c not in visited:
+                if c not in visited and c in self._visible:
                     stack.append((c, depth + 1, False))
-        disp_leaf = [1] * len(self.nodes)
-        for node in post:  # children already accumulated
-            kids = children.get(node)
+        disp_leaf = {i: 1 for i in self._visible}
+        for node in post:  # children accumulate before parents
+            kids = [c for c in children.get(node, []) if c in self._visible]
             if kids:
                 disp_leaf[node] = sum(disp_leaf[c] for c in kids)
         total_leaves = max(1, sum(disp_leaf[r] for r in roots_idx))
-        max_depth = max(1, max(depth_of.values()))
+        max_depth = max([1] + list(depth_of.values()))
         ring = min(9000.0, max(320.0, total_leaves * 30.0 / (2 * math.pi)))
+        small = len(self._visible) <= 120
 
         def assign(idxs, a0, a1, depth):
             total = sum(disp_leaf[i] for i in idxs)
             ang = a0
-            for i in sorted(idxs, key=lambda x: self.nodes[x].label.lower()):
+            for i in sorted(idxs, key=lambda x: self._items[x].label.lower()):
                 w = (a1 - a0) * disp_leaf[i] / total
                 mid = ang + w / 2
                 rad = ring * depth / max_depth
-                self.nodes[i].setPos(rad * math.cos(mid), rad * math.sin(mid))
-                self.nodes[i].show_label = (small_global or depth <= 2
-                                            or self.nodes[i].kind == "drive")
+                it = self._items[i]
+                it.setPos(rad * math.cos(mid), rad * math.sin(mid))
+                it.show_label = small or depth <= 2 or it.kind == "drive"
                 kids = children.get(i)
                 if kids:
                     assign(kids, ang, ang + w, depth + 1)
                 ang += w
 
-        small_global = len(self.nodes) <= 120
         assign(roots_idx, 0.0, 2 * math.pi, 0)
-        for li, a, b in self.edge_items:
-            self._update_line(li, a, b)
-        self.nodes[roots_idx[0]].show_label = True
+        for c, li in self._edge_lines.items():
+            self._update_line(li, self._parent_of[c], c)
         self._fitted = True
         self.fit_view()
+
+    def _cluster_init(self):
+        """Place notes near their folder's group centre so the link graph
+        forms communities instead of one hairball."""
+        groups = {}
+        for i, key in enumerate(self.folder_of):
+            groups.setdefault(key, []).append(i)
+        for gi, key in enumerate(sorted(groups.keys())):
+            ga = gi * 2.39996
+            gr = 70.0 * ((gi + 1) ** 0.6)
+            cx, cy = gr * math.cos(ga), gr * math.sin(ga)
+            for k, i in enumerate(groups[key]):
+                a2 = k * 2.39996
+                rr = 26.0 * ((k + 1) ** 0.5)
+                self.nodes[i].setPos(cx + rr * math.cos(a2), cy + rr * math.sin(a2))
 
     def select_node(self, node):
         self.sel_index = None if node.index == self.sel_index else node.index
         self.apply_highlights()
         self.node_clicked.emit(node if self.sel_index is not None else None)
+        if self._mode == "structure" and self.sel_index is not None and node.can_expand:
+            self.expand_node(node.index)
 
     def apply_highlights(self):
+        pen_norm = QPen(QColor("#e3e5e8"), 1.4)
+        pen_hot = QPen(QColor("#a7adb4"), 2.0)
+        pen_dim = QPen(QColor("#f0f1f4"), 1.2)
+        if self._mode == "structure":
+            neigh = set()
+            if self.sel_index is not None:
+                neigh.update(self._tree_children.get(self.sel_index, []))
+                par = self._parent_of.get(self.sel_index)
+                if par is not None:
+                    neigh.add(par)
+            for i, it in self._items.items():
+                if self.sel_index is None:
+                    it.state = 0
+                elif i == self.sel_index:
+                    it.state = 2
+                elif i in neigh:
+                    it.state = 1
+                else:
+                    it.state = 3
+                it.update()
+            for c, li in self._edge_lines.items():
+                if self.sel_index is None:
+                    li.setPen(pen_norm)
+                elif c == self.sel_index or self._parent_of.get(c) == self.sel_index:
+                    li.setPen(pen_hot)
+                else:
+                    li.setPen(pen_dim)
+            return
         neigh = set()
         if self.sel_index is not None:
             for a, b in self.edge_pairs:
@@ -2117,9 +2264,6 @@ class GraphView(QGraphicsView):
             else:
                 it.state = 3
             it.update()
-        pen_norm = QPen(QColor("#e3e5e8"), 1.4)
-        pen_hot = QPen(QColor("#a7adb4"), 2.0)
-        pen_dim = QPen(QColor("#f0f1f4"), 1.2)
         for li, a, b in self.edge_items:
             if self.sel_index is None:
                 li.setPen(pen_norm)
@@ -2138,12 +2282,21 @@ class GraphView(QGraphicsView):
             self._timer.start()
 
     def update_edges_for(self, idx):
+        if self._mode == "structure":
+            li = self._edge_lines.get(idx)
+            if li is not None:
+                self._update_line(li, self._parent_of[idx], idx)
+            return
         for li, a, b in self.edge_items:
             if a == idx or b == idx:
                 self._update_line(li, a, b)
 
     def _update_line(self, li, a, b):
-        pa, pb = self.nodes[a].pos(), self.nodes[b].pos()
+        if self._mode == "structure":
+            pa = self._items[a].pos()
+            pb = self._items[b].pos()
+        else:
+            pa, pb = self.nodes[a].pos(), self.nodes[b].pos()
         li.setLine(QLineF(pa.x(), pa.y(), pb.x(), pb.y()))
 
     def _tick(self):
@@ -2417,6 +2570,7 @@ class MainWindow(FramelessWindow):
         self.graph_view.node_clicked.connect(self.on_node_clicked)
         self.graph_view.node_activated.connect(self.on_node_activated)
         self.graph_view.show_node_menu.connect(self.show_node_menu)
+        self.graph_view.child_provider = self.graph_child_provider
         mbar.addWidget(self.graph_view, 1)
         body.addWidget(main, 1)
 
@@ -2793,16 +2947,56 @@ class MainWindow(FramelessWindow):
             self.details.show_row(_row_dict(r))
 
     def on_node_activated(self, node):
+        if not node.path:
+            return
         try:
             os.startfile(node.path)
         except OSError as exc:
             QMessageBox.warning(self, APP_NAME, f"Could not open:\n{exc}")
 
+    def graph_child_provider(self, parent_path):
+        """Direct children of a folder, fetched live from the index for
+        on-demand graph expansion (any depth)."""
+        out = []
+        try:
+            rows = thread_conn().execute(
+                "SELECT name, is_dir, size FROM files WHERE parent = ? COLLATE NOCASE"
+                " ORDER BY is_dir DESC, name COLLATE NOCASE LIMIT 400",
+                (parent_path,)).fetchall()
+        except sqlite3.Error:
+            return out
+        for name, is_dir, size in rows:
+            if is_dir:
+                try:
+                    n = thread_conn().execute(
+                        "SELECT COUNT(*) FROM files WHERE parent = ? COLLATE NOCASE",
+                        (join_path(parent_path, name),)).fetchone()[0]
+                except sqlite3.Error:
+                    n = 0
+                out.append({"label": name, "kind": "folder", "weight": n,
+                            "sub": f"{n:,} items", "path": join_path(parent_path, name),
+                            "parent_path": parent_path, "file": name,
+                            "has_children": n > 0})
+            else:
+                out.append({"label": name, "kind": "file", "weight": size or 0,
+                            "sub": human_size(size), "path": join_path(parent_path, name),
+                            "parent_path": parent_path, "file": name,
+                            "has_children": False})
+        return out
+
     def show_node_menu(self, node, gpos):
         menu = QMenu(self)
-        menu.addAction("Open", lambda: self.on_node_activated(node))
-        menu.addAction("Show in Explorer", lambda: reveal_in_explorer(node.path))
-        menu.addAction("Copy as path", lambda: QApplication.clipboard().setText(node.path))
+        gv = self.graph_view
+        if gv._mode == "structure":
+            if node.can_expand:
+                menu.addAction("Expand", lambda: gv.expand_node(node.index))
+            if gv._tree_children.get(node.index):
+                menu.addAction("Collapse branch", lambda: gv.collapse_node(node.index))
+            menu.addSeparator()
+        if node.path:
+            menu.addAction("Open", lambda: self.on_node_activated(node))
+            menu.addAction("Show in Explorer", lambda: reveal_in_explorer(node.path))
+            menu.addAction("Copy as path", lambda: QApplication.clipboard().setText(node.path))
         menu.exec(gpos)
 
     def on_search_changed(self, text):

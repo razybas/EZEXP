@@ -42,27 +42,26 @@ its own data folder. Works the same on any PC it's run on.
   start (works even if the vault lives on a removable drive). Right-click a
   vault in the sidebar to remove it.
 - **Graph tab**: the **Graph** chip shows the graph of whatever view you're
-  in — the scope always follows the current tab:
-  - **All Files** → a structure diagram of the whole PC: one node per drive,
-    folders hanging off them (two levels deep), sized by how many items they
-    contain.
-  - **A drive or any folder** (sidebar favourite, drilled-down folder, or a
-    folder inside a vault) → that place's own structure: its subfolders
-    (three levels) plus its direct files, each folder labelled with its item
-    count.
+  in — the scope always follows the current tab, and everything uses
+  **progressive disclosure**: only the big nodes are shown at first, and
+  clicking a node expands just that node (a purple "+" badge marks what can
+  be expanded; right-click a branch to collapse it again).
+  - **All Files** → "This PC" and your drives; press **C:** to unfold C:'s
+    folders, press any folder to unfold deeper — down to individual files
+    (press a folder in Pictures and every picture appears as a node).
+  - **A drive or any folder** → that place's own tree, same expand-by-click
+    behaviour.
   - **A vault selected in the sidebar** → the Obsidian-style link graph of
-    that vault: one node per note, one line per resolved `[[wikilink]]`.
-  Structure graphs are read straight from the index so they open instantly.
-  Link graphs are too: after the index is built, EzExp analyzes every note's
-  `[[wikilinks]]` **once** in the background and stores them in the index —
-  it keeps chewing through cloud-synced notes (Google Drive, OneDrive) in
-  small passes until every note is done, and afterwards only re-analyzes
-  notes that actually changed. The graph therefore always shows the complete
-  set of notes immediately and its links are complete as soon as the first
-  analysis has finished; the status bar reports coverage while that runs.
-  Interactions: drag nodes, pan the background, scroll to zoom; click a node
-  for its details pane entry, double-click to open it, right-click for quick
-  actions.
+    that vault: one node per note, one line per resolved `[[wikilink]]`,
+    clustered by folder. Link data is parsed once in the background (right
+    after the index builds) and kept incrementally up to date afterwards.
+  Everything is read straight from the index, so expanding is instant at any
+  depth and the layout re-sorts itself into a clean radial tree (branches
+  clockwise A→Z, ring radius by depth, size by item count) after every
+  click. Link data comes from the one-time background analysis described
+  below, so it never blocks the UI. Interactions: drag nodes, pan, scroll
+  to zoom; click for details, double-click to open, right-click for
+  Expand/Collapse/Open/Show in Explorer/Copy path.
 - **Three-dots button** (details pane, bottom right) or **right-click** any
   result: Open, Show in Explorer, Rename, Copy as path, Copy file,
   Move to Recycle Bin, Properties.

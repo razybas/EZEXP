@@ -277,10 +277,33 @@ win.drill_to_path(sub_path, "sub")
 win.enter_graph_mode()
 wait_results(4000)
 assert win.view_mode == "graph"
-assert len(win.graph_view.nodes) == 2, [n.label for n in win.graph_view.nodes]
-assert {n.kind for n in win.graph_view.nodes} == {"folder", "file"}
+assert len(win.graph_view._items) == 2, list(win.graph_view._items)
+assert {it.kind for it in win.graph_view._items.values()} == {"folder", "file"}
 assert not win.graph_view._timer.isActive(), "structure graphs must be static"
-assert (win.graph_view.nodes[0].pos() - win.graph_view.nodes[1].pos()).manhattanLength() > 50
+its = list(win.graph_view._items.values())
+assert (its[0].pos() - its[1].pos()).manhattanLength() > 50
+win.enter_list_mode("all")
+wait_results(300)
+assert win.view_mode == "list" and not win.graph_view.isVisible()
+
+# progressive disclosure: pressing a folder reveals one level of children;
+# collapsing the root folds everything back
+win.drill_to_path(data, "data")
+win.enter_graph_mode()
+wait_results(3000)
+gv = win.graph_view
+assert len(gv._items) == 5, len(gv._items)          # data + 3 dirs + 1 file
+doc_idx = [i for i, it in gv._items.items() if it.label == "Documents"][0]
+assert gv._items[doc_idx].can_expand
+gv.expand_node(doc_idx)
+wait_results(300)
+assert len(gv._items) == 8, len(gv._items)          # + its 3 files
+assert not gv._items[doc_idx].can_expand
+data_idx = [i for i, it in gv._items.items() if it.label == "data"][0]
+gv.collapse_node(data_idx)
+wait_results(300)
+assert len(gv._items) == 1, len(gv._items)
+assert gv._items[data_idx].can_expand
 win.enter_list_mode("all")
 wait_results(300)
 assert win.view_mode == "list" and not win.graph_view.isVisible()
