@@ -276,4 +276,4 @@ your real index is never touched.
 
 ## License
 
-No license file yet — all rights reserved by the author by default.
+MIT — see [LICENSE](LICENSE).

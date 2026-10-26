@@ -1,4 +1,4 @@
-"""Generate ezexp.ico from the app's own folder glyph (run by build.bat)."""
+"""Generate ezexp.ico from the app's app_logo_pixmap (run by build.bat)."""
 import os
 import sys
 
@@ -13,7 +13,7 @@ import app as ezexp
 
 app = QApplication(sys.argv)
 icon = QIcon()
-base = ezexp.category_icon("folder").pixmap(256, 256)
+base = ezexp.app_logo_pixmap(256)
 for size in (16, 20, 24, 32, 48, 64, 128, 256):
     icon.addPixmap(base.scaled(QSize(size, size)))
 tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ezexp.png")

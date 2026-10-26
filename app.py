@@ -6159,7 +6159,7 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("ezexp")
-    app.setWindowIcon(category_icon("folder"))
+    app.setWindowIcon(QIcon(app_logo_pixmap()))
     app.setStyleSheet(QSS)
 
     if acquire_single_instance() is None:
