@@ -42,7 +42,7 @@ from PySide6.QtGui import (
     QDrag, QDesktopServices,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFileIconProvider, QFrame, QGraphicsItem,
+    QApplication, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsObject,
     QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
@@ -193,6 +193,25 @@ def save_agent_config(cfg):
             json.dump(full_cfg, fh, indent=2)
     except Exception:
         pass
+
+
+def agent_status(cfg=None):
+    if cfg is None:
+        cfg = load_agent_config()
+    backend = (cfg.get("backend") or "endpoint").lower()
+    if backend == "harness":
+        avail, err = harness_available(cfg)
+        if not avail:
+            return False, f"Organism Harness not available: {err}. Set the harness folder via 'Endpoint…' above."
+        grant_dir = (cfg.get("grant_dir") or "").strip()
+        if not grant_dir:
+            return False, "Set a grant folder via 'Endpoint…' above — it becomes the harness workspace."
+        return True, f"Organism Harness ready · workspace: {grant_dir}"
+    else:
+        api_key = (cfg.get("api_key") or "").strip()
+        if not api_key:
+            return False, "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key."
+        return True, ""
 
 
 class AgentSettingsDialog(QDialog):
@@ -5150,7 +5169,11 @@ class HarnessWorker(QThread):
                     self.failed.emit(msg)
                     return
 
-                res = h.run(self.task, mode="pipeline")
+                run_kwargs = {"mode": "pipeline"}
+                llm = getattr(client, "llm_client", None)
+                if llm is not None:
+                    run_kwargs["llm_client"] = llm
+                res = h.run(self.task, **run_kwargs)
             finally:
                 client.confirm_bridge = orig_bridge
 
@@ -5303,25 +5326,11 @@ class Spotlight(FramelessWindow):
             self.foot.setText("  ⏎  Send      Esc  Close  ")
             self.edit.setPlaceholderText("Ask the agent...")
             cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
-            backend = (cfg.get("backend") or "endpoint").lower()
-            if backend == "harness":
-                avail, err = harness_available(cfg)
-                if not avail:
-                    if not self.transcript.toPlainText().strip():
-                        self.transcript.appendPlainText(
-                            f"Setup required: Organism Harness not available ({err}). Click 'Endpoint…' above to configure the Harness folder."
-                        )
-                elif not (cfg.get("grant_dir") or "").strip():
-                    if not self.transcript.toPlainText().strip():
-                        self.transcript.appendPlainText(
-                            "Setup required: No grant folder configured. The grant folder IS the harness workspace; set one first in 'Endpoint…'."
-                        )
-            else:
-                if not (cfg.get("api_key") or "").strip():
-                    if not self.transcript.toPlainText().strip():
-                        self.transcript.appendPlainText(
-                            "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key."
-                        )
+            ready, status_msg = agent_status(cfg)
+            if not self.agent_messages:
+                self.transcript.clear()
+                if status_msg:
+                    self.transcript.setPlainText(status_msg)
         else:
             self.btn_search.setChecked(True)
             self.btn_agent.setChecked(False)
@@ -5351,20 +5360,14 @@ class Spotlight(FramelessWindow):
         if not text:
             return
         cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+        ready, status_msg = agent_status(cfg)
+        if not ready:
+            if status_msg:
+                self.transcript.appendPlainText(status_msg + "\n")
+            return
+
         backend = (cfg.get("backend") or "endpoint").lower()
         if backend == "harness":
-            avail, err = harness_available(cfg)
-            if not avail:
-                self.transcript.appendPlainText(
-                    f"Error: Organism Harness not available ({err}). Please configure the Harness folder in Endpoint settings.\n"
-                )
-                return
-            grant_dir = (cfg.get("grant_dir") or "").strip()
-            if not grant_dir:
-                self.transcript.appendPlainText(
-                    "Error: No grant folder configured. The grant folder IS the harness workspace; set one first in Endpoint settings.\n"
-                )
-                return
             self.edit.clear()
             if not self._harness_banner_shown:
                 self.transcript.appendPlainText(
@@ -5373,6 +5376,7 @@ class Spotlight(FramelessWindow):
                 self._harness_banner_shown = True
             self.transcript.appendPlainText(f"You: {text}\n")
             self.agent_messages.append({"role": "user", "content": text})
+            grant_dir = (cfg.get("grant_dir") or "").strip()
             hp = (cfg.get("harness_path") or "").strip()
             self._start_harness_task(text, grant_dir, hp)
         else:

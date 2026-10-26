@@ -1359,8 +1359,114 @@ try:
 finally:
     ez.APP_DIR = _orig_ez_app_dir
 
-# 3. Case A: Run wiring, public tool injection, schema equality, and Case A banner
+# 2a. Dialog construction and round-trip widget population
+dlg_test_dir = tempfile.mkdtemp(prefix="ez_dlg_test_")
+_orig_app_dir_dlg = ez.APP_DIR
+ez.APP_DIR = dlg_test_dir
+try:
+    dlg = ez.AgentSettingsDialog(spot)
+    assert hasattr(dlg, "combo_backend"), "Dialog must have combo_backend"
+    backend_items = [dlg.combo_backend.itemText(i) for i in range(dlg.combo_backend.count())]
+    assert backend_items == ["Endpoint", "Organism Harness"], f"Expected ['Endpoint', 'Organism Harness'], got: {backend_items}"
+
+    # Verify all widgets exist
+    assert hasattr(dlg, "edit_url") and dlg.edit_url is not None
+    assert hasattr(dlg, "edit_key") and dlg.edit_key is not None
+    assert hasattr(dlg, "edit_model") and dlg.edit_model is not None
+    assert hasattr(dlg, "edit_harness") and dlg.edit_harness is not None
+    assert hasattr(dlg, "edit_grant") and dlg.edit_grant is not None
+
+    # Fill every field and accept via _on_save
+    dlg.combo_backend.setCurrentIndex(1)
+    dlg.edit_harness.setText(fake_harness_root)
+    dlg.edit_url.setText("https://test.endpoint/v1")
+    dlg.edit_model.setText("test-custom-model")
+    dlg.edit_key.setText("test-secret-key-456")
+    dlg.edit_grant.setText(dlg_test_dir)
+    dlg._on_save()
+
+    # Verify persisted in agent.json
+    persisted = ez.load_agent_config()
+    assert persisted["backend"] == "harness"
+    assert persisted["harness_path"] == fake_harness_root
+    assert persisted["base_url"] == "https://test.endpoint/v1"
+    assert persisted["model"] == "test-custom-model"
+    assert persisted["api_key"] == "test-secret-key-456"
+    assert persisted["grant_dir"] == dlg_test_dir
+
+    # Construct second dialog and assert widgets show persisted values
+    dlg2 = ez.AgentSettingsDialog(spot)
+    assert dlg2.combo_backend.currentIndex() == 1
+    assert dlg2.edit_harness.text() == fake_harness_root
+    assert dlg2.edit_url.text() == "https://test.endpoint/v1"
+    assert dlg2.edit_model.text() == "test-custom-model"
+    assert dlg2.edit_key.text() == "test-secret-key-456"
+    assert dlg2.edit_grant.text() == dlg_test_dir
+finally:
+    ez.APP_DIR = _orig_app_dir_dlg
+
 grant_temp = tempfile.mkdtemp(prefix="ez_grant_test_")
+
+# 2b. agent_status unit coverage for all five states
+# State 1: endpoint, no key
+st1_ok, st1_msg = ez.agent_status({"backend": "endpoint", "api_key": ""})
+assert st1_ok is False
+assert st1_msg == "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key."
+
+# State 2: endpoint, key present
+st2_ok, st2_msg = ez.agent_status({"backend": "endpoint", "api_key": "some-key-value"})
+assert st2_ok is True
+assert st2_msg == ""
+
+# State 3: harness, harness_available False
+st3_ok, st3_msg = ez.agent_status({"backend": "harness", "harness_path": os.path.join(fake_harness_root, "bogus_dir_xyz")})
+assert st3_ok is False
+assert st3_msg.startswith("Organism Harness not available:")
+assert "Set the harness folder via 'Endpoint…' above." in st3_msg
+
+# State 4: harness, available, no grant
+st4_ok, st4_msg = ez.agent_status({"backend": "harness", "harness_path": fake_harness_root, "grant_dir": ""})
+assert st4_ok is False
+assert st4_msg == "Set a grant folder via 'Endpoint…' above — it becomes the harness workspace."
+
+# State 5: harness, available + grant
+st5_ok, st5_msg = ez.agent_status({"backend": "harness", "harness_path": fake_harness_root, "grant_dir": grant_temp})
+assert st5_ok is True
+assert st5_msg == f"Organism Harness ready · workspace: {grant_temp}"
+
+# 2c. Panel-level status and regression pinning
+# Harness configured + fake harness + grant -> ready line visible, NOT "No API key configured"
+spot.agent_client.config = {"backend": "harness", "harness_path": fake_harness_root, "grant_dir": grant_temp}
+spot.agent_messages.clear()
+spot.set_mode("agent")
+panel_harness_txt = spot.transcript.toPlainText()
+assert f"Organism Harness ready · workspace: {grant_temp}" in panel_harness_txt
+assert "No API key configured" not in panel_harness_txt
+
+# Endpoint + no key -> original setup text verbatim
+spot.agent_client.config = {"backend": "endpoint", "api_key": ""}
+spot.agent_messages.clear()
+spot.set_mode("agent")
+panel_ep_txt = spot.transcript.toPlainText()
+assert "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key." in panel_ep_txt
+
+# 2d. Send while not-ready -> no worker constructed, fake harness records nothing
+Harness = None
+if os.path.abspath(fake_harness_root) not in [os.path.abspath(p) for p in sys.path]:
+    sys.path.insert(0, fake_harness_root)
+sys.modules.pop("harness", None)
+from harness import Harness
+
+Harness.run_calls.clear()
+spot.agent_client.config = {"backend": "endpoint", "api_key": ""}
+spot.transcript.clear()
+spot.edit.setText("Attempt send while not ready")
+spot.send_agent_message()
+assert len(Harness.run_calls) == 0, "No worker or run call should be initiated when not ready"
+assert spot._harness_worker is None or not spot._harness_worker.isRunning()
+assert "Setup required: No API key configured" in spot.transcript.toPlainText()
+
+# 3. Case A: Run wiring, public tool injection, schema equality, and Case A banner
 harness_cfg = {
     "backend": "harness",
     "harness_path": fake_harness_root,
