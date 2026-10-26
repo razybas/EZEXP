@@ -5251,12 +5251,19 @@ class HotkeyFilter(QAbstractNativeEventFilter):
 
     def nativeEventFilter(self, event_type, message):
         try:
-            if str(event_type) == "windows_generic_MSG":
+            if event_type == b"windows_generic_MSG":
                 msg = wintypes.MSG.from_address(int(message))
                 if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
                     self.callback()
         except Exception:
-            pass
+            try:
+                with open(os.path.join(APP_DIR, "error.log"), "a",
+                          encoding="utf-8") as fh:
+                    fh.write("\n=== %s ===\n" % time.strftime(
+                        "%Y-%m-%d %H:%M:%S"))
+                    fh.write(traceback.format_exc())
+            except Exception:
+                pass
         return False, 0
 
 
