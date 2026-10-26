@@ -1208,19 +1208,27 @@ finally:
 # ---------------------------------------------------------------------------
 fake_harness_root = tempfile.mkdtemp(prefix="fake_harness_")
 fake_harness_pkg = os.path.join(fake_harness_root, "harness")
-os.makedirs(fake_harness_pkg, exist_ok=True)
+fake_runtime_pkg = os.path.join(fake_harness_pkg, "runtime")
+os.makedirs(fake_runtime_pkg, exist_ok=True)
+
+with open(os.path.join(fake_runtime_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+    fh.write("")
+
+with open(os.path.join(fake_runtime_pkg, "tools.py"), "w", encoding="utf-8") as fh:
+    fh.write('''
+class ToolResult:
+    def __init__(self, ok=True, output="", error=None):
+        self.ok = ok
+        self.output = output
+        self.error = error
+
+    def __repr__(self):
+        return f"ToolResult(ok={self.ok}, output={self.output!r}, error={self.error!r})"
+''')
 
 with open(os.path.join(fake_harness_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
     fh.write('''
-class FakeTools:
-    def __init__(self):
-        self._tools = {
-            "shell": "native_shell",
-            "read_file": "native_read",
-            "write_file": "native_write",
-            "edit_file": "native_edit",
-            "list_dir": "native_list",
-        }
+from harness.runtime.tools import ToolResult
 
 class FakeTaskResult:
     def __init__(self, output_markdown="canned response from fake harness", atp_burned=42.0, total_cycle_latency_ms=123.45):
@@ -1233,12 +1241,52 @@ class Harness:
     instances = []
     run_calls = []
     should_raise = False
+    sabotage_disable = False
+    tool_to_call_during_run = None
+    last_tool_result = None
 
-    def __init__(self, workspace=None, providers=None):
+    def __init__(self, workspace=None, providers=None, tools=None, disable_tools=None):
         self.workspace = workspace
         self.providers = providers
-        self.tools = FakeTools()
+        self.constructor_disable_tools = disable_tools
+        self._active_tools = {
+            "shell": {"name": "shell", "description": "native shell", "parameters": {}, "func": None},
+            "read_file": {"name": "read_file", "description": "native read", "parameters": {}, "func": None},
+            "write_file": {"name": "write_file", "description": "native write", "parameters": {}, "func": None},
+            "edit_file": {"name": "edit_file", "description": "native edit", "parameters": {}, "func": None},
+            "list_dir": {"name": "list_dir", "description": "native list", "parameters": {}, "func": None},
+        }
+        if disable_tools and not Harness.sabotage_disable:
+            self.disable_tools(disable_tools)
+        if tools:
+            for t in tools:
+                self.register_tool(t["name"], t["description"], t["parameters"], t["func"])
         Harness.instances.append(self)
+
+    def register_tool(self, name, description, parameters, func, replace=False):
+        self._active_tools[name] = {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+            "func": func,
+        }
+
+    def disable_tools(self, names):
+        for n in names:
+            self._active_tools.pop(n, None)
+
+    def tool_names(self):
+        return list(self._active_tools.keys())
+
+    def tool_schemas(self):
+        return [
+            {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["parameters"],
+            }
+            for t in self._active_tools.values()
+        ]
 
     def run(self, task, mode="pipeline", **kwargs):
         Harness.run_calls.append({
@@ -1250,6 +1298,11 @@ class Harness:
         })
         if Harness.should_raise:
             raise RuntimeError("simulated harness explosion")
+        if Harness.tool_to_call_during_run:
+            name, call_kwargs = Harness.tool_to_call_during_run
+            fn = self._active_tools[name]["func"]
+            res = fn(**call_kwargs)
+            Harness.last_tool_result = res
         return FakeTaskResult()
 ''')
 
@@ -1306,7 +1359,7 @@ try:
 finally:
     ez.APP_DIR = _orig_ez_app_dir
 
-# 3. Run wiring & Case B tool assertions
+# 3. Case A: Run wiring, public tool injection, schema equality, and Case A banner
 grant_temp = tempfile.mkdtemp(prefix="ez_grant_test_")
 harness_cfg = {
     "backend": "harness",
@@ -1322,6 +1375,9 @@ from harness import Harness
 Harness.instances.clear()
 Harness.run_calls.clear()
 Harness.should_raise = False
+Harness.sabotage_disable = False
+Harness.tool_to_call_during_run = None
+Harness.last_tool_result = None
 
 spot.agent_client.config = harness_cfg
 spot.set_mode("agent")
@@ -1345,16 +1401,89 @@ transcript_txt = spot.transcript.toPlainText()
 assert "canned response from fake harness" in transcript_txt, f"Canned text missing from transcript: {transcript_txt}"
 assert "Tokens: 42.0" in transcript_txt, f"Token budget missing: {transcript_txt}"
 assert "Time: 123.45ms" in transcript_txt, f"Latency missing: {transcript_txt}"
-assert "Tools: harness file tools (jailed to the grant folder)" in transcript_txt, f"Case B banner missing: {transcript_txt}"
+assert "Tools: EzExp catalog + grant tools via the harness (native harness tools disabled)." in transcript_txt, f"Case A banner missing: {transcript_txt}"
 
-# Case B only: assert shell tool was disabled on the harness instance through the verified surface
+# Assert all 5 native tools were disabled at construction
 assert len(Harness.instances) >= 1
 inst = Harness.instances[-1]
-assert "shell" not in inst.tools._tools, f"Shell tool was not disabled! Tools: {inst.tools._tools}"
-assert "read_file" in inst.tools._tools
-assert "write_file" in inst.tools._tools
+assert inst.constructor_disable_tools == ["shell", "read_file", "write_file", "edit_file", "list_dir"], f"Expected all 5 native tools disabled at construction, got: {inst.constructor_disable_tools}"
 
-# 4. Failure honesty
+# Assert exactly the 5 EzExp tools are registered
+expected_five = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
+assert sorted(inst.tool_names()) == expected_five, f"Expected active tools {expected_five}, got {inst.tool_names()}"
+
+# Assert registered tool schemas equal endpoint tool dicts
+endpoint_tool_map = {t["function"]["name"]: t["function"] for t in ez.AGENT_TOOLS}
+for t_schema in inst.tool_schemas():
+    t_name = t_schema["name"]
+    assert t_name in endpoint_tool_map, f"Unexpected tool {t_name}"
+    expected_spec = endpoint_tool_map[t_name]
+    assert t_schema["description"] == expected_spec["description"], f"Description mismatch for {t_name}"
+    assert t_schema["parameters"] == expected_spec["parameters"], f"Parameters mismatch for {t_name}"
+
+# 4. Fail-closed tool set assertion (sabotaged harness ignoring disable_tools)
+Harness.sabotage_disable = True
+spot.transcript.clear()
+spot.edit.setText("test sabotage")
+spot.send_agent_message()
+assert spot._harness_worker is not None
+spot._harness_worker.wait(5000)
+qapp.processEvents()
+
+# Run should have been refused BEFORE h.run
+assert len(Harness.run_calls) == 1, "h.run should NOT have been called when tool set mismatched"
+refusal_transcript = spot.transcript.toPlainText()
+assert "Refused to run: harness tool set mismatch — expected EzExp tools only, got:" in refusal_transcript, f"Refusal line missing: {refusal_transcript}"
+assert "shell" in refusal_transcript, f"Sabotaged tool 'shell' should be mentioned in refusal message: {refusal_transcript}"
+Harness.sabotage_disable = False
+
+# 5. Real tool dispatch through fake harness loop
+Harness.tool_to_call_during_run = ("search_files", {"query": "test"})
+spot.transcript.clear()
+spot.edit.setText("run real search")
+spot.send_agent_message()
+assert spot._harness_worker is not None
+spot._harness_worker.wait(5000)
+qapp.processEvents()
+assert Harness.last_tool_result is not None, "Tool should have executed"
+assert Harness.last_tool_result.ok is True, f"search_files failed: {Harness.last_tool_result}"
+assert isinstance(Harness.last_tool_result.output, str)
+Harness.tool_to_call_during_run = None
+
+# 6. Confirmer gates create_file: Deny vs Allow
+# 6a. Deny
+spot.agent_client.confirmer = lambda text: False
+deny_rel_path = "denied_file.txt"
+Harness.tool_to_call_during_run = ("create_file", {"rel_path": deny_rel_path, "content": "should be blocked"})
+spot.transcript.clear()
+spot.edit.setText("create denied file")
+spot.send_agent_message()
+assert spot._harness_worker is not None
+spot._harness_worker.wait(5000)
+qapp.processEvents()
+assert not os.path.exists(os.path.join(grant_temp, deny_rel_path)), "Denied file should NOT exist on disk"
+assert Harness.last_tool_result.ok is False, "Declined tool call should return ok=False"
+assert Harness.last_tool_result.error == "user declined", f"Expected 'user declined', got: {Harness.last_tool_result}"
+
+# 6b. Allow
+spot.agent_client.confirmer = lambda text: True
+allow_rel_path = "allowed_file.txt"
+Harness.tool_to_call_during_run = ("create_file", {"rel_path": allow_rel_path, "content": "approved content 123"})
+spot.transcript.clear()
+spot.edit.setText("create allowed file")
+spot.send_agent_message()
+assert spot._harness_worker is not None
+spot._harness_worker.wait(5000)
+qapp.processEvents()
+allowed_full_path = os.path.join(grant_temp, allow_rel_path)
+assert os.path.exists(allowed_full_path), "Allowed file should exist on disk"
+with open(allowed_full_path, "r", encoding="utf-8") as f:
+    created_content = f.read()
+assert created_content == "approved content 123", f"Created content mismatch: {created_content}"
+assert Harness.last_tool_result.ok is True, f"Expected ok=True, got: {Harness.last_tool_result}"
+Harness.tool_to_call_during_run = None
+
+# 7. Failure honesty
 Harness.should_raise = True
 spot.transcript.clear()
 spot.edit.setText("test failure")

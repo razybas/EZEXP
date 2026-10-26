@@ -5027,11 +5027,12 @@ class HarnessWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, task, grant_dir, harness_path="", parent=None):
+    def __init__(self, task, grant_dir, harness_path="", client=None, parent=None):
         super().__init__(parent)
         self.task = task
         self.grant_dir = grant_dir
         self.harness_path = harness_path
+        self.client = client
 
     def run(self):
         try:
@@ -5040,12 +5041,50 @@ class HarnessWorker(QThread):
                 if hp not in sys.path:
                     sys.path.insert(0, hp)
             from harness import Harness
-            h = Harness(workspace=self.grant_dir, providers=["groq", "openrouter"])
-            # Case B: disable shell tool through verified surface
-            if hasattr(h, "tools") and hasattr(h.tools, "_tools"):
-                h.tools._tools.pop("shell", None)
-            elif hasattr(h, "tools") and hasattr(h.tools, "unregister"):
-                h.tools.unregister("shell")
+            try:
+                from harness.runtime.tools import ToolResult
+            except ImportError:
+                ToolResult = None
+
+            # Case A: disable ALL native harness tools at construction
+            h = Harness(
+                self.grant_dir,
+                ["groq", "openrouter"],
+                None,
+                ["shell", "read_file", "write_file", "edit_file", "list_dir"],
+            )
+
+            client = self.client if self.client is not None else AgentClient(config=load_agent_config())
+
+            def make_tool_fn(tool_name):
+                def tool_fn(**kwargs):
+                    res = client.dispatch_tool(tool_name, kwargs)
+                    if ToolResult is not None:
+                        if isinstance(res, str) and (res.startswith("Error:") or res == "user declined"):
+                            return ToolResult(ok=False, error=res)
+                        return ToolResult(ok=True, output=str(res))
+                    return res
+                return tool_fn
+
+            for t in AGENT_TOOLS:
+                fn_spec = t["function"]
+                t_name = fn_spec["name"]
+                t_desc = fn_spec["description"]
+                t_params = fn_spec["parameters"]
+                h.register_tool(
+                    name=t_name,
+                    description=t_desc,
+                    parameters=t_params,
+                    func=make_tool_fn(t_name),
+                )
+
+            expected_names = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
+            actual_names = sorted(h.tool_names())
+            if actual_names != expected_names:
+                msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {actual_names}."
+                self.failed.emit(msg)
+                return
+
             res = h.run(self.task, mode="pipeline")
 
             if isinstance(res, str):
@@ -5261,7 +5300,7 @@ class Spotlight(FramelessWindow):
             self.edit.clear()
             if not self._harness_banner_shown:
                 self.transcript.appendPlainText(
-                    "Tools: harness file tools (jailed to the grant folder); EzExp catalog tools not injected in this configuration.\n"
+                    "Tools: EzExp catalog + grant tools via the harness (native harness tools disabled).\n"
                 )
                 self._harness_banner_shown = True
             self.transcript.appendPlainText(f"You: {text}\n")
@@ -5277,7 +5316,7 @@ class Spotlight(FramelessWindow):
     def _start_harness_task(self, text, grant_dir, harness_path=""):
         self.edit.setEnabled(False)
         self.foot.setText("  Agent working…      Esc  Close  ")
-        self._harness_worker = HarnessWorker(text, grant_dir, harness_path, self)
+        self._harness_worker = HarnessWorker(text, grant_dir, harness_path, client=self.agent_client, parent=self)
         self._harness_worker.done.connect(self._on_harness_done)
         self._harness_worker.failed.connect(self._on_harness_failed)
         self._harness_worker.start()
