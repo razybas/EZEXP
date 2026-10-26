@@ -1496,6 +1496,93 @@ fail_transcript = spot.transcript.toPlainText()
 assert "simulated harness explosion" in fail_transcript, f"Exception text missing from transcript: {fail_transcript}"
 assert "Error:" in fail_transcript
 
+# 8. ConfirmBridge tests (cross-thread confirm, UI-thread guard, and production confirmer resolution)
+bridge_test_spot = ez.Spotlight(worker)
+assert hasattr(bridge_test_spot, "confirm_bridge"), "Spotlight must own a ConfirmBridge"
+bridge = bridge_test_spot.confirm_bridge
+
+recorded_threads = []
+_orig_qmessagebox_question = ez.QMessageBox.question
+
+try:
+    # 8a. Cross-thread confirm returning Yes:
+    # Monkeypatch QMessageBox.question with a stub that records QThread.currentThread() and returns Yes
+    def stub_question_yes(parent, title, text, *args, **kwargs):
+        recorded_threads.append(ez.QThread.currentThread())
+        return ez.QMessageBox.StandardButton.Yes
+
+    ez.QMessageBox.question = stub_question_yes
+
+    # Production confirmer path: bridge attached, no injected confirmer (confirmer is None)
+    client_prod = ez.AgentClient(config={"grant_dir": grant_temp}, confirm_bridge=bridge)
+    assert client_prod.confirmer is None
+
+    class WorkerCrossThreadConfirm(ez.QThread):
+        def __init__(self, action_fn):
+            super().__init__()
+            self.action_fn = action_fn
+            self.res = None
+
+        def run(self):
+            self.res = self.action_fn()
+
+    recorded_threads.clear()
+    w_yes = WorkerCrossThreadConfirm(lambda: client_prod._confirm_action("Allow write to plan.txt?"))
+    w_yes.start()
+    while w_yes.isRunning():
+        qapp.processEvents()
+    w_yes.wait(5000)
+
+    assert w_yes.res is True, f"Expected True from bridge, got: {w_yes.res}"
+    assert len(recorded_threads) == 1, f"Expected exactly 1 QMessageBox call, got {len(recorded_threads)}"
+    assert recorded_threads[0] == qapp.thread(), f"QMessageBox did not run on main UI thread! Thread: {recorded_threads[0]}"
+
+    # 8b. Repeat with stub returning No -> returns False
+    recorded_threads.clear()
+    def stub_question_no(parent, title, text, *args, **kwargs):
+        recorded_threads.append(ez.QThread.currentThread())
+        return ez.QMessageBox.StandardButton.No
+
+    ez.QMessageBox.question = stub_question_no
+
+    w_no = WorkerCrossThreadConfirm(lambda: client_prod._confirm_action("Allow write to plan.txt?"))
+    w_no.start()
+    while w_no.isRunning():
+        qapp.processEvents()
+    w_no.wait(5000)
+
+    assert w_no.res is False, f"Expected False from bridge, got: {w_no.res}"
+    assert len(recorded_threads) == 1, f"Expected exactly 1 QMessageBox call, got {len(recorded_threads)}"
+    assert recorded_threads[0] == qapp.thread(), f"QMessageBox did not run on main UI thread! Thread: {recorded_threads[0]}"
+
+    # 8c. UI-thread guard: calling ask_from_worker on the UI thread returns the stubbed answer without hanging
+    guard_res_no = bridge.ask_from_worker("Direct UI call with stub No")
+    assert guard_res_no is False, f"Expected False from UI guard, got {guard_res_no}"
+
+    ez.QMessageBox.question = stub_question_yes
+    guard_res_yes = bridge.ask_from_worker("Direct UI call with stub Yes")
+    assert guard_res_yes is True, f"Expected True from UI guard, got {guard_res_yes}"
+
+    # 8d. Real HarnessWorker with production bridge (no injected confirmer)
+    Harness.should_raise = False
+    spot.agent_client.confirmer = None
+    Harness.tool_to_call_during_run = ("create_file", {"rel_path": "bridge_approved.txt", "content": "bridge content"})
+    spot.transcript.clear()
+    spot.edit.setText("test bridge worker")
+    spot.send_agent_message()
+    assert spot._harness_worker is not None
+    while spot._harness_worker.isRunning():
+        qapp.processEvents()
+    spot._harness_worker.wait(5000)
+    qapp.processEvents()
+
+    assert os.path.exists(os.path.join(grant_temp, "bridge_approved.txt")), "File should exist when bridge approved"
+    assert Harness.last_tool_result.ok is True
+    Harness.tool_to_call_during_run = None
+
+finally:
+    ez.QMessageBox.question = _orig_qmessagebox_question
+
 # ====================================================================
 worker.stop()
 worker.wait(3000)

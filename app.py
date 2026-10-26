@@ -4783,20 +4783,80 @@ AGENT_TOOLS = [
 ]
 
 
+class ConfirmBridge(QObject):
+    _requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pending_text = ""
+        self._result = False
+        self._done = threading.Event()
+        self._requested.connect(self._on_requested)
+
+    def _get_parent_widget(self):
+        p = self.parent()
+        if isinstance(p, QWidget):
+            return getattr(p, "main", None) or p
+        return None
+
+    def ask_from_worker(self, text: str) -> bool:
+        app = QApplication.instance()
+        ui_thread = app.thread() if app is not None else self.thread()
+        if QThread.currentThread() == ui_thread:
+            ret = QMessageBox.question(
+                self._get_parent_widget(),
+                "EzExp Agent",
+                text,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return ret == QMessageBox.StandardButton.Yes
+
+        self._pending_text = text
+        self._result = False
+        self._done.clear()
+        self._requested.emit()
+        self._done.wait()
+        return self._result
+
+    def _on_requested(self):
+        try:
+            ret = QMessageBox.question(
+                self._get_parent_widget(),
+                "EzExp Agent",
+                self._pending_text,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            self._result = (ret == QMessageBox.StandardButton.Yes)
+        finally:
+            self._done.set()
+
+
 class AgentClient(QObject):
     agent_text = Signal(str)
     agent_error = Signal(str)
 
-    def __init__(self, parent=None, config=None, confirmer=None):
+    def __init__(self, parent=None, config=None, confirmer=None, confirm_bridge=None):
         super().__init__(parent)
         self.nam = QNetworkAccessManager(self)
         self.config = config
         self.confirmer = confirmer
+        self.confirm_bridge = confirm_bridge
         self._current_reply = None
 
     def _confirm_action(self, text: str) -> bool:
         if self.confirmer is not None:
             return bool(self.confirmer(text))
+
+        if self.confirm_bridge is not None:
+            return bool(self.confirm_bridge.ask_from_worker(text))
+
+        app = QApplication.instance()
+        ui_thread = app.thread() if app is not None else None
+        if ui_thread is not None and QThread.currentThread() != ui_thread:
+            return False
+
         ret = QMessageBox.question(
             None,
             "Agent Permission Request",
@@ -5027,12 +5087,13 @@ class HarnessWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, task, grant_dir, harness_path="", client=None, parent=None):
+    def __init__(self, task, grant_dir, harness_path="", client=None, bridge=None, parent=None):
         super().__init__(parent)
         self.task = task
         self.grant_dir = grant_dir
         self.harness_path = harness_path
         self.client = client
+        self.bridge = bridge
 
     def run(self):
         try:
@@ -5055,37 +5116,43 @@ class HarnessWorker(QThread):
             )
 
             client = self.client if self.client is not None else AgentClient(config=load_agent_config())
+            orig_bridge = getattr(client, "confirm_bridge", None)
+            if self.bridge is not None:
+                client.confirm_bridge = self.bridge
 
-            def make_tool_fn(tool_name):
-                def tool_fn(**kwargs):
-                    res = client.dispatch_tool(tool_name, kwargs)
-                    if ToolResult is not None:
-                        if isinstance(res, str) and (res.startswith("Error:") or res == "user declined"):
-                            return ToolResult(ok=False, error=res)
-                        return ToolResult(ok=True, output=str(res))
-                    return res
-                return tool_fn
+            try:
+                def make_tool_fn(tool_name):
+                    def tool_fn(**kwargs):
+                        res = client.dispatch_tool(tool_name, kwargs)
+                        if ToolResult is not None:
+                            if isinstance(res, str) and (res.startswith("Error:") or res == "user declined"):
+                                return ToolResult(ok=False, error=res)
+                            return ToolResult(ok=True, output=str(res))
+                        return res
+                    return tool_fn
 
-            for t in AGENT_TOOLS:
-                fn_spec = t["function"]
-                t_name = fn_spec["name"]
-                t_desc = fn_spec["description"]
-                t_params = fn_spec["parameters"]
-                h.register_tool(
-                    name=t_name,
-                    description=t_desc,
-                    parameters=t_params,
-                    func=make_tool_fn(t_name),
-                )
+                for t in AGENT_TOOLS:
+                    fn_spec = t["function"]
+                    t_name = fn_spec["name"]
+                    t_desc = fn_spec["description"]
+                    t_params = fn_spec["parameters"]
+                    h.register_tool(
+                        name=t_name,
+                        description=t_desc,
+                        parameters=t_params,
+                        func=make_tool_fn(t_name),
+                    )
 
-            expected_names = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
-            actual_names = sorted(h.tool_names())
-            if actual_names != expected_names:
-                msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {actual_names}."
-                self.failed.emit(msg)
-                return
+                expected_names = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
+                actual_names = sorted(h.tool_names())
+                if actual_names != expected_names:
+                    msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {actual_names}."
+                    self.failed.emit(msg)
+                    return
 
-            res = h.run(self.task, mode="pipeline")
+                res = h.run(self.task, mode="pipeline")
+            finally:
+                client.confirm_bridge = orig_bridge
 
             if isinstance(res, str):
                 final_text = res
@@ -5211,6 +5278,7 @@ class Spotlight(FramelessWindow):
         self.resize(self.W, self.H)
 
         self.mode = "search"
+        self.confirm_bridge = ConfirmBridge(self)
         self.agent_client = AgentClient(self)
         self.agent_client.agent_text.connect(self.on_agent_text)
         self.agent_client.agent_error.connect(self.on_agent_error)
@@ -5316,7 +5384,9 @@ class Spotlight(FramelessWindow):
     def _start_harness_task(self, text, grant_dir, harness_path=""):
         self.edit.setEnabled(False)
         self.foot.setText("  Agent working…      Esc  Close  ")
-        self._harness_worker = HarnessWorker(text, grant_dir, harness_path, client=self.agent_client, parent=self)
+        self._harness_worker = HarnessWorker(
+            text, grant_dir, harness_path, client=self.agent_client, bridge=self.confirm_bridge, parent=self
+        )
         self._harness_worker.done.connect(self._on_harness_done)
         self._harness_worker.failed.connect(self._on_harness_failed)
         self._harness_worker.start()
