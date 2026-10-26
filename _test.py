@@ -1690,6 +1690,144 @@ finally:
     ez.QMessageBox.question = _orig_qmessagebox_question
 
 # ====================================================================
+# ====================================================================
+# 9. Construction smoke test for all dialog and widget classes
+# ====================================================================
+# Complete enumeration of all dialog and top-level widget classes defined in app.py:
+# - AgentSettingsDialog: QDialog subclass (only QDialog subclass in app.py)
+# - MainWindow: FramelessWindow / QWidget top-level window
+# - Spotlight: FramelessWindow / QWidget top-level window
+# - FramelessWindow: QWidget top-level base window
+#
+# Component and UI widget classes:
+# - TitleBar: QFrame subclass
+# - SearchField: QFrame subclass
+# - ResultsTree: QTreeWidget subclass
+# - DetailsPane: QFrame subclass
+# - GraphView: QGraphicsView subclass
+# - GraphNode: QGraphicsObject subclass
+# - ClickableLabel: QLabel subclass
+# - QLaunchButton: QPushButton subclass
+#
+# Supporting Qt classes:
+# - ConfirmBridge: QObject
+# - AgentClient: QObject
+# - HotkeyFilter: QAbstractNativeEventFilter
+# - HarnessWorker: QThread
+# - IndexerThread: QThread
+# - NameDelegate: QStyledItemDelegate
+# - SpotDelegate: QStyledItemDelegate
+#
+# (No classes excluded; all 19 can be constructed offscreen without live user state.)
+
+from PySide6.QtGui import QMouseEvent  # noqa: E402
+
+# 1. AgentSettingsDialog
+smoke_dlg = ez.AgentSettingsDialog()
+assert isinstance(smoke_dlg, ez.QDialog)
+assert hasattr(smoke_dlg, "combo_backend")
+assert smoke_dlg.combo_backend.count() == 2
+
+# 2. FramelessWindow (and exercise QRect resize in mouseMoveEvent)
+smoke_fw = ez.FramelessWindow()
+assert isinstance(smoke_fw, ez.QWidget)
+smoke_fw.setGeometry(100, 100, 400, 300)
+smoke_fw._resize_dir = 1
+smoke_fw._resize_geo = smoke_fw.geometry()
+smoke_fw._resize_gpos = ez.QPointF(100, 100).toPoint()
+move_ev = QMouseEvent(
+    ez.QEvent.Type.MouseMove,
+    ez.QPointF(105, 105),
+    ez.QPointF(105, 105),
+    ez.Qt.MouseButton.NoButton,
+    ez.Qt.MouseButton.NoButton,
+    ez.Qt.KeyboardModifier.NoModifier,
+)
+smoke_fw.mouseMoveEvent(move_ev)
+smoke_fw._resize_dir = 0
+
+# 3. MainWindow
+smoke_mw = ez.MainWindow(worker)
+assert isinstance(smoke_mw, ez.FramelessWindow)
+assert smoke_mw.tree is not None
+assert smoke_mw.titlebar is not None
+
+# 4. Spotlight
+smoke_sp = ez.Spotlight(worker)
+assert isinstance(smoke_sp, ez.FramelessWindow)
+assert smoke_sp.edit is not None
+assert smoke_sp.btn_agent is not None
+assert smoke_sp.btn_search is not None
+assert smoke_sp.btn_endpoint is not None
+
+# 5. TitleBar
+smoke_tb = ez.TitleBar(smoke_fw, with_search=True)
+assert isinstance(smoke_tb, ez.QFrame)
+assert smoke_tb.win == smoke_fw
+
+# 6. SearchField
+smoke_sf = ez.SearchField(None, "Search smoke placeholder")
+assert isinstance(smoke_sf, ez.QFrame)
+assert smoke_sf.edit.placeholderText() == "Search smoke placeholder"
+
+# 7. ResultsTree
+smoke_rt = ez.ResultsTree()
+assert isinstance(smoke_rt, ez.QTreeWidget)
+assert smoke_rt.columnCount() == 4
+
+# 8. DetailsPane (requires parent widget)
+smoke_dp = ez.DetailsPane(smoke_fw)
+assert isinstance(smoke_dp, ez.QFrame)
+assert smoke_dp.objectName() == "details"
+
+# 9. GraphView
+smoke_gv = ez.GraphView()
+assert isinstance(smoke_gv, ez.QGraphicsView)
+assert smoke_gv.scene() is not None
+
+# 10. GraphNode
+smoke_gn = ez.GraphNode(smoke_gv, 0, "Smoke Node", 20.0, "C:\\", "smoke.txt", "C:\\smoke.txt", "doc", False)
+assert isinstance(smoke_gn, ez.QGraphicsObject)
+assert smoke_gn.label == "Smoke Node"
+
+# 11. ClickableLabel
+smoke_cl = ez.ClickableLabel("Smoke Clickable")
+assert isinstance(smoke_cl, ez.QLabel)
+assert smoke_cl.text() == "Smoke Clickable"
+
+# 12. QLaunchButton (requires path and parent widget)
+smoke_qlb = ez.QLaunchButton("C:\\Windows\\notepad.exe", smoke_fw)
+assert isinstance(smoke_qlb, ez.QPushButton)
+assert smoke_qlb._path == "C:\\Windows\\notepad.exe"
+
+# 13. ConfirmBridge
+smoke_cb = ez.ConfirmBridge()
+assert isinstance(smoke_cb, ez.QObject)
+
+# 14. AgentClient
+smoke_ac = ez.AgentClient()
+assert isinstance(smoke_ac, ez.QObject)
+
+# 15. HotkeyFilter
+smoke_hf = ez.HotkeyFilter(lambda: None)
+assert isinstance(smoke_hf, ez.QAbstractNativeEventFilter)
+
+# 16. HarnessWorker
+smoke_hw = ez.HarnessWorker("smoke_task", grant_temp)
+assert isinstance(smoke_hw, ez.QThread)
+
+# 17. IndexerThread
+smoke_idx = ez.IndexerThread(rebuild=False)
+assert isinstance(smoke_idx, ez.QThread)
+
+# 18. NameDelegate
+smoke_nd = ez.NameDelegate()
+assert isinstance(smoke_nd, ez.QStyledItemDelegate)
+
+# 19. SpotDelegate
+smoke_sd = ez.SpotDelegate(smoke_sp)
+assert isinstance(smoke_sd, ez.QStyledItemDelegate)
+
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")

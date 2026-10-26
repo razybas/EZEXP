@@ -29,7 +29,7 @@ from collections import deque
 from ctypes import wintypes
 
 from PySide6.QtCore import (
-    Qt, QFileInfo, QTimer, QThread, QUrl, QSize, QPointF, QRectF, QLineF,
+    Qt, QFileInfo, QTimer, QThread, QUrl, QSize, QPointF, QRect, QRectF, QLineF,
     QMimeData,
     QEvent, QSettings, Signal, QAbstractNativeEventFilter, QLockFile,
     QByteArray, QObject,
@@ -5752,6 +5752,8 @@ def register_hotkey():
         return "Alt+Space"
     if user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x20):
         return "Ctrl+Alt+Space"
+    if user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_NOREPEAT, 0x20):
+        return "Ctrl+Space"
     return None
 
 
@@ -5942,13 +5944,19 @@ def main():
         else:
             spot.open_spotlight()
 
+    filt = HotkeyFilter(toggle_spotlight)
+    app.installNativeEventFilter(filt)
     hotkey_name = register_hotkey()
-    if hotkey_name:
-        filt = HotkeyFilter(toggle_spotlight)
-        app.installNativeEventFilter(filt)
-    else:
-        filt = None
+    if not hotkey_name:
         win.status_right.setText("Quick search hotkey unavailable (Alt+Space busy)")
+    QShortcut(QKeySequence("Ctrl+Space"), win, toggle_spotlight)
+    QShortcut(QKeySequence("Alt+Space"), win, toggle_spotlight)
+
+    if "--agent" in sys.argv:
+        spot.open_spotlight()
+        spot.set_mode("agent")
+    elif "--spotlight" in sys.argv:
+        spot.open_spotlight()
 
     # quietly refresh the index every 10 minutes
     auto = QTimer()
