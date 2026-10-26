@@ -972,44 +972,231 @@ assert "render_final.mp4" in ql_names
 assert "Recent" in ql_names
 assert "Q3 Financial Report.pdf" in ql_names
 
-# Part C: Enter opens folders; Alt+Enter drills into EzExp; footer text
+# ====================================================================
+# Spotlight: real app icons, complete Quick Launch + web row, Enter drills folders
+# ====================================================================
+
+# 1. Icon routing (FIX 1)
+_calls = {"app": 0, "img": 0, "cat": 0}
+sentinel_app = object()
+sentinel_img = object()
+sentinel_cat = object()
+
+_orig_app_icon = getattr(ez, "app_icon_for", None)
+_orig_real_icon = getattr(ez, "real_file_icon", None)
+_orig_cat_icon = getattr(ez, "category_icon", None)
+
+def _stub_app(path):
+    _calls["app"] += 1
+    if "boom" in path:
+        raise RuntimeError("boom")
+    return sentinel_app
+
+def _stub_img(path):
+    _calls["img"] += 1
+    return sentinel_img
+
+def _stub_cat(cat):
+    _calls["cat"] += 1
+    return sentinel_cat
+
+ez.app_icon_for = _stub_app
+ez.real_file_icon = _stub_img
+ez.category_icon = _stub_cat
+if hasattr(ez, "_spot_icon_cache"):
+    ez._spot_icon_cache.clear()
+
+try:
+    # a Chrome.lnk row whose stored category is "other" routes to app_icon_for (the staleness case)
+    r_lnk = {"parent": r"C:\Programs", "name": "Chrome.lnk", "category": "other"}
+    ic1 = ez.spot_row_icon(r_lnk)
+    assert _calls["app"] == 1, f"Expected app_icon_for call, got {_calls}"
+    assert ic1 == sentinel_app
+
+    # an "img" row routes to real_file_icon
+    r_img = {"parent": r"C:\Pics", "name": "photo.png", "category": "img"}
+    ic2 = ez.spot_row_icon(r_img)
+    assert _calls["img"] == 1, f"Expected real_file_icon call, got {_calls}"
+    assert ic2 == sentinel_img
+
+    # a "doc" row routes to category_icon
+    r_doc = {"parent": r"C:\Docs", "name": "notes.txt", "category": "doc"}
+    ic3 = ez.spot_row_icon(r_doc)
+    assert _calls["cat"] >= 1, f"Expected category_icon call, got {_calls}"
+    assert ic3 == sentinel_cat
+
+    # a second call for the same path hits the cache (stub call count unchanged)
+    app_calls_before = _calls["app"]
+    ic1_again = ez.spot_row_icon(r_lnk)
+    assert _calls["app"] == app_calls_before, "Cache was bypassed on second call"
+    assert ic1_again == sentinel_app
+
+    # a stub raising an exception yields the category glyph, not a raise
+    r_boom = {"parent": r"C:\Programs", "name": "boom.exe", "category": "other"}
+    cat_calls_before = _calls["cat"]
+    ic_boom = ez.spot_row_icon(r_boom)
+    assert _calls["cat"] > cat_calls_before, "Expected category_icon fallback on error"
+    assert ic_boom == sentinel_cat
+finally:
+    if _orig_app_icon is not None:
+        ez.app_icon_for = _orig_app_icon
+    if _orig_real_icon is not None:
+        ez.real_file_icon = _orig_real_icon
+    if _orig_cat_icon is not None:
+        ez.category_icon = _orig_cat_icon
+    if hasattr(ez, "_spot_icon_cache"):
+        ez._spot_icon_cache.clear()
+
+# 2. QL completeness (FIX 2.1)
+uncat_dir = os.path.join(tmp, "uncat_pins")
+os.makedirs(uncat_dir, exist_ok=True)
+uncat_files = []
+for i in range(5):
+    p = os.path.join(uncat_dir, f"uncat_{i}.exe")
+    with open(p, "wb") as f:
+        f.write(b"MZ")
+    uncat_files.append(os.path.normpath(p))
+
+cat_files = [
+    os.path.normpath(os.path.join(docs, "meeting-notes.txt")),
+    os.path.normpath(os.path.join(docs, "Q3 Financial Report.pdf")),
+    os.path.normpath(os.path.join(code, "main.py")),
+    os.path.normpath(os.path.join(data, "render_final.mp4")),
+]
+nonexistent_pin = os.path.normpath(os.path.join(tmp, "nonexistent_file.exe"))
+ten_pins = cat_files + uncat_files + [nonexistent_pin]
+assert len(ten_pins) == 10
+
+_orig_counts = ez.get_launch_counts()
+_settings = ez.QSettings("ezexp", "EzExp")
+_settings.setValue("launch_counts", "{}")
+_settings.sync()
+try:
+    ez.set_quicklaunch(ten_pins)
+    spot.spot_seq = 2000
+    spot.on_results(2000, "", [], "")
+
+    ql_items = []
+    is_ql = False
+    for i in range(spot.tree.topLevelItemCount()):
+        it = spot.tree.topLevelItem(i)
+        d = it.data(0, Qt.UserRole)
+        if d and d.get("__header__"):
+            is_ql = (d.get("text") == "Quick Launch")
+        elif is_ql:
+            ql_items.append(d)
+
+    assert len(ql_items) == 9, f"Expected 9 resolvable QL items, got {len(ql_items)}"
+    assert all(os.path.basename(nonexistent_pin) != r["name"] for r in ql_items), "Nonexistent pin should be skipped"
+    assert spot.tree.currentItem() is not None, "A non-header item should be selected"
+    assert not spot.tree.currentItem().data(0, Qt.UserRole).get("__header__"), "Selected item must not be a header"
+    assert spot.tree.currentItem() == spot.tree.topLevelItem(1), "First non-header item must be selected"
+finally:
+    _settings.setValue("launch_counts", json.dumps(_orig_counts))
+    _settings.sync()
+
+# 3. Web row (FIX 2.2, 2.3)
+spot.spot_seq = 2001
+spot.on_results(2001, "gibberishqueryxyz", [], "")
+assert spot.tree.topLevelItemCount() == 1, f"Expected exactly 1 item, got {spot.tree.topLevelItemCount()}"
+only_item = spot.tree.topLevelItem(0)
+d_web = only_item.data(0, Qt.UserRole)
+assert d_web and d_web.get("__web__") is True, f"Expected web sentinel, got {d_web}"
+assert d_web.get("name") == "gibberishqueryxyz"
+assert spot.tree.currentItem() == only_item, "Web row must be current selection on no results"
+
+spot.spot_seq = 2002
+spot.on_results(2002, "notes", [{"parent": docs, "name": "meeting-notes.txt", "is_dir": 0, "size": 5, "mtime": 1.0, "category": "doc", "kind": "Text"}], "")
+assert spot.tree.topLevelItemCount() >= 2
+last_item = spot.tree.topLevelItem(spot.tree.topLevelItemCount() - 1)
+d_last = last_item.data(0, Qt.UserRole)
+assert d_last and d_last.get("__web__") is True, f"Expected last item to be web sentinel, got {d_last}"
+assert spot.tree.currentItem() == spot.tree.topLevelItem(1), "Matches query must select first result"
+
+from PySide6.QtGui import QDesktopServices  # noqa: E402
+recorded_urls = []
+recorded_startfile = []
+_orig_openUrl = getattr(QDesktopServices, "openUrl", None)
+_orig_startfile = os.startfile
+QDesktopServices.openUrl = staticmethod(lambda url: recorded_urls.append(url.toString()))
+os.startfile = lambda p: recorded_startfile.append(p)
+try:
+    spot.spot_seq = 2003
+    spot.on_results(2003, "test search", [], "")
+    spot.show()
+    ev_enter = QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier)
+    spot.keyPressEvent(ev_enter)
+    assert spot.isHidden(), "Spotlight should hide after Enter on web row"
+    assert len(recorded_urls) == 1, f"Expected 1 openUrl call, got {recorded_urls}"
+    assert recorded_urls[0].startswith("https://duckduckgo.com/?q=test+search") or "test" in recorded_urls[0]
+    assert len(recorded_startfile) == 0, f"os.startfile should not be called: {recorded_startfile}"
+finally:
+    if _orig_openUrl is not None:
+        QDesktopServices.openUrl = _orig_openUrl
+    os.startfile = _orig_startfile
+
+# 4. Enter semantics (FIX 3)
 foot_lbl = spot.findChild(ez.QLabel, "spotFooter")
 assert foot_lbl is not None
-assert foot_lbl.text() == "  \u23ce  Open      Ctrl \u23ce  Show in Folder      Alt \u23ce  In EzExp      Esc  Close  ", f"Got {foot_lbl.text()}"
+assert foot_lbl.text() == "  \u23ce  Open (folders in EzExp)      Ctrl \u23ce  Show in Folder      Alt \u23ce  In EzExp      Esc  Close  ", f"Got {foot_lbl.text()}"
 
 folder_row = {"parent": data, "name": "Documents", "is_dir": 1, "size": 0, "mtime": 1.0, "category": "folder", "kind": "Folder"}
-spot.spot_seq = 1001
-spot.on_results(1001, "Documents", [folder_row], "")
-spot.tree.setCurrentItem(spot.tree.topLevelItem(1))
-assert spot.current_row() and spot.current_row()["name"] == "Documents"
+file_row = {"parent": docs, "name": "meeting-notes.txt", "is_dir": 0, "size": 5, "mtime": 1.0, "category": "doc", "kind": "Text"}
 
+# Enter on folder row with spot.main -> win.current_place becomes folder path and startfile NOT called
 startfile_calls = []
 _orig_startfile = os.startfile
 os.startfile = lambda p: startfile_calls.append(p)
 win.current_place = None
+spot.main = win
 spot.show()
+spot.spot_seq = 2004
+spot.on_results(2004, "Documents", [folder_row], "")
+spot.tree.setCurrentItem(spot.tree.topLevelItem(1))
 try:
     ev_enter = QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier)
     spot.keyPressEvent(ev_enter)
-    assert spot.isHidden(), "Spotlight should hide after Enter"
+    assert spot.isHidden(), "Spotlight should hide after Enter on folder"
     expected_folder_path = os.path.normpath(os.path.join(data, "Documents"))
-    assert len(startfile_calls) == 1 and os.path.normpath(startfile_calls[0]) == expected_folder_path, f"os.startfile not called with folder: {startfile_calls}"
-    assert win.current_place is None, f"win.current_place should not change on Enter: {win.current_place}"
+    assert win.current_place == expected_folder_path, f"win.current_place should be drilled: {win.current_place}"
+    assert len(startfile_calls) == 0, f"os.startfile should NOT be called on folder Enter: {startfile_calls}"
 finally:
     os.startfile = _orig_startfile
 
+# Enter on a file row -> startfile called once
 startfile_calls = []
 os.startfile = lambda p: startfile_calls.append(p)
+win.current_place = None
 spot.show()
+spot.spot_seq = 2005
+spot.on_results(2005, "meeting-notes.txt", [file_row], "")
 spot.tree.setCurrentItem(spot.tree.topLevelItem(1))
 try:
-    ev_alt_enter = QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.AltModifier)
-    spot.keyPressEvent(ev_alt_enter)
-    assert spot.isHidden(), "Spotlight should hide after Alt+Enter"
-    assert len(startfile_calls) == 0, f"os.startfile should NOT be called on Alt+Enter: {startfile_calls}"
-    assert win.current_place == expected_folder_path, f"win.current_place should be drilled to folder: {win.current_place}"
+    ev_enter = QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier)
+    spot.keyPressEvent(ev_enter)
+    assert spot.isHidden(), "Spotlight should hide after Enter on file"
+    expected_file_path = os.path.normpath(os.path.join(docs, "meeting-notes.txt"))
+    assert len(startfile_calls) == 1 and os.path.normpath(startfile_calls[0]) == expected_file_path, f"startfile should be called once on file: {startfile_calls}"
+    assert win.current_place is None, "win.current_place should not change on file Enter"
 finally:
     os.startfile = _orig_startfile
+
+# with spot.main = None, Enter on a folder -> startfile called (fallback)
+startfile_calls = []
+os.startfile = lambda p: startfile_calls.append(p)
+spot.main = None
+spot.show()
+spot.spot_seq = 2006
+spot.on_results(2006, "Documents", [folder_row], "")
+spot.tree.setCurrentItem(spot.tree.topLevelItem(1))
+try:
+    ev_enter = QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier)
+    spot.keyPressEvent(ev_enter)
+    assert spot.isHidden(), "Spotlight should hide after Enter on folder fallback"
+    assert len(startfile_calls) == 1 and os.path.normpath(startfile_calls[0]) == expected_folder_path, f"startfile fallback expected: {startfile_calls}"
+finally:
+    os.startfile = _orig_startfile
+    spot.main = win
 
 
 # ====================================================================

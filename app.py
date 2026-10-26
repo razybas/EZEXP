@@ -34,10 +34,12 @@ from PySide6.QtCore import (
     QEvent, QSettings, Signal, QAbstractNativeEventFilter, QLockFile,
     QByteArray, QObject,
 )
+import urllib.parse
+
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient,
     QPainter, QPainterPath, QPolygonF, QPixmap, QPen, QShortcut, QGuiApplication,
-    QDrag,
+    QDrag, QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFileIconProvider, QFrame, QGraphicsItem,
@@ -261,6 +263,7 @@ SUBTLE = "#86868b"
 # ---------------------------------------------------------------------------
 
 CAT_EXTS = {
+    "app": APP_EXTS,
     "doc": {
         "pdf", "doc", "docx", "docm", "dot", "dotx", "xls", "xlsx", "xlsm",
         "xlsb", "ppt", "pptx", "pptm", "odt", "ods", "odp", "txt", "text",
@@ -1522,6 +1525,7 @@ def build_structure_graph(conn, place=None, roots=None, max_nodes=2500):
 CAT_COLORS = {
     "folder": "#0a84ff", "img": "#34c759", "vid": "#bf5af2", "aud": "#ff9f0a",
     "zip": "#64d2ff", "code": "#30d158", "doc": "#98989d", "other": "#98989d",
+    "app": "#0a84ff",
 }
 
 _icon_cache = {}
@@ -1793,6 +1797,49 @@ def app_icon_for(path):
         if target:
             return real_file_icon(target)
     return real_file_icon(path)
+
+
+_spot_icon_cache = {}
+
+
+def spot_row_icon(row):
+    cat = row.get("category", "other")
+    try:
+        path = join_path(row.get("parent", ""), row.get("name", ""))
+        if len(path) == 2 and path[1] == ":":
+            path += "\\"
+        elif len(path) == 2:
+            path += "\\"
+        key = path.lower()
+        if key in _spot_icon_cache:
+            return _spot_icon_cache[key]
+
+        name = row.get("name", "")
+        if ext_of(name) in APP_EXTS:
+            try:
+                icon = app_icon_for(path)
+            except Exception:
+                icon = category_icon(cat)
+        elif cat == "img":
+            try:
+                icon = real_file_icon(path)
+            except Exception:
+                icon = category_icon(cat)
+        else:
+            icon = category_icon(cat)
+
+        if icon is None:
+            icon = category_icon(cat)
+
+        if len(_spot_icon_cache) > 300:
+            _spot_icon_cache.clear()
+        _spot_icon_cache[key] = icon
+        return icon
+    except Exception:
+        try:
+            return category_icon(cat)
+        except Exception:
+            return QIcon()
 
 
 def app_logo_pixmap(size=256):
@@ -4994,7 +5041,7 @@ class Spotlight(FramelessWindow):
         self.transcript.hide()
         lay.addWidget(self.transcript, 1)
 
-        self.foot = QLabel("  ⏎  Open      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ", panel)
+        self.foot = QLabel("  ⏎  Open (folders in EzExp)      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ", panel)
         self.foot.setObjectName("spotFooter")
         self.foot.setFixedHeight(34)
         lay.addWidget(self.foot)
@@ -5036,7 +5083,7 @@ class Spotlight(FramelessWindow):
             self.transcript.hide()
             self.tree.show()
             self.btn_endpoint.hide()
-            self.foot.setText("  ⏎  Open      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ")
+            self.foot.setText("  ⏎  Open (folders in EzExp)      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ")
             self.edit.setPlaceholderText("Search your entire PC")
 
     def on_text(self, text):
@@ -5099,8 +5146,21 @@ class Spotlight(FramelessWindow):
                 r = cur.fetchone()
                 if r:
                     ql_rows.append(_row_dict(r))
-                    if len(ql_rows) == 8:
-                        break
+                else:
+                    try:
+                        st = os.stat(p)
+                        is_dir = 1 if os.path.isdir(p) else 0
+                        ql_rows.append({
+                            "parent": parent,
+                            "name": name,
+                            "is_dir": is_dir,
+                            "size": st.st_size if not is_dir else 0,
+                            "mtime": st.st_mtime,
+                            "category": category_for(name, bool(is_dir)),
+                            "kind": kind_for(name, bool(is_dir)),
+                        })
+                    except OSError:
+                        pass
 
             if ql_rows:
                 self.tree.addTopLevelItem(self._header("Quick Launch"))
@@ -5112,11 +5172,19 @@ class Spotlight(FramelessWindow):
                 self.tree.addTopLevelItem(self._header("Recent"))
                 for r in recent_rows:
                     self.tree.addTopLevelItem(self._item(r))
+
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                data = item.data(0, Qt.UserRole)
+                if data and not data.get("__header__"):
+                    self.tree.setCurrentItem(item)
+                    break
             return
         if not rows:
-            item = QTreeWidgetItem(["No results"])
-            item.setFlags(Qt.NoItemFlags)
-            self.tree.addTopLevelItem(item)
+            web_item = QTreeWidgetItem([f"Search the web for '{q}'"])
+            web_item.setData(0, Qt.UserRole, {"__web__": True, "name": q})
+            self.tree.addTopLevelItem(web_item)
+            self.tree.setCurrentItem(web_item)
             return
 
         def row_path_norm(r):
@@ -5163,6 +5231,10 @@ class Spotlight(FramelessWindow):
                     self.tree.addTopLevelItem(self._header(label))
                     for r in hits:
                         self.tree.addTopLevelItem(self._item(r))
+
+        web_item = QTreeWidgetItem([f"Search the web for '{q}'"])
+        web_item.setData(0, Qt.UserRole, {"__web__": True, "name": q})
+        self.tree.addTopLevelItem(web_item)
         self.tree.setCurrentItem(self.tree.topLevelItem(1))
 
     def _header(self, text):
@@ -5195,18 +5267,35 @@ class Spotlight(FramelessWindow):
                 return
             row = self.current_row()
             if row:
+                if row.get("__web__"):
+                    url_str = "https://duckduckgo.com/?q=" + urllib.parse.quote_plus(row.get("name", ""))
+                    QDesktopServices.openUrl(QUrl(url_str))
+                    self.hide()
+                    return
                 path = join_path(row["parent"], row["name"])
                 if len(path) == 2:
                     path += "\\"
                 if e.modifiers() & Qt.ControlModifier:
                     reveal_in_explorer(path)
                     self.hide()
-                elif e.modifiers() & Qt.AltModifier:
+                elif e.modifiers() & Qt.AltModifier and row["is_dir"]:
                     if self.main is not None:
                         self.main.show()
                         self.main.raise_()
                         self.main.activateWindow()
                         self.main.drill_to_path(path, row["name"])
+                    self.hide()
+                elif row["is_dir"]:
+                    if self.main is not None:
+                        self.main.show()
+                        self.main.raise_()
+                        self.main.activateWindow()
+                        self.main.drill_to_path(path, row["name"])
+                    else:
+                        try:
+                            os.startfile(path)
+                        except OSError:
+                            pass
                     self.hide()
                 else:
                     try:
@@ -5288,7 +5377,22 @@ class SpotDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
         if selected:
             p.fillRect(r.adjusted(8, 1, -8, -1), QColor(ACCENT))
-        icon = category_icon(row["category"])
+        if row.get("__web__"):
+            icon = search_glyph()
+            p.drawPixmap(r.left() + 16, r.top() + (r.height() - 22) // 2, icon.pixmap(22, 22))
+            f = QFont(option.font)
+            f.setPointSizeF(10.0)
+            p.setFont(f)
+            p.setPen(QColor("#ffffff") if selected else QColor(TEXT))
+            fm = QFontMetrics(f)
+            label = f"Search the web for '{row.get('name', '')}'"
+            name = fm.elidedText(label, Qt.ElideRight, r.width() - 80)
+            p.drawText(r.left() + 54, r.top(), r.width() - 80, r.height(),
+                       Qt.AlignLeft | Qt.AlignVCenter, name)
+            p.restore()
+            return
+
+        icon = spot_row_icon(row)
         p.drawPixmap(r.left() + 16, r.top() + (r.height() - 26) // 2, icon.pixmap(26, 26))
         f = QFont(option.font)
         f.setPointSizeF(row["category"] == "folder" and 10.5 or 10.0)
