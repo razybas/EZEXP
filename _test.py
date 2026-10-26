@@ -742,6 +742,8 @@ try:
     # Defaults load when no file exists
     defaults = ez.load_agent_config()
     expected_defaults = {
+        "backend": "endpoint",
+        "harness_path": "",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "model": "meta/llama-3.3-70b-instruct",
         "api_key": "",
@@ -751,6 +753,8 @@ try:
 
     # Save a config, load it back, assert equality
     test_cfg = {
+        "backend": "endpoint",
+        "harness_path": "",
         "base_url": "http://127.0.0.1:5555/v1",
         "model": "meta/llama-test",
         "api_key": "local-test-key",
@@ -1198,6 +1202,170 @@ finally:
     os.startfile = _orig_startfile
     spot.main = win
 
+
+# ====================================================================
+# Organism Harness integration tests (stub harness only; no real checkout, no network, no keys)
+# ---------------------------------------------------------------------------
+fake_harness_root = tempfile.mkdtemp(prefix="fake_harness_")
+fake_harness_pkg = os.path.join(fake_harness_root, "harness")
+os.makedirs(fake_harness_pkg, exist_ok=True)
+
+with open(os.path.join(fake_harness_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+    fh.write('''
+class FakeTools:
+    def __init__(self):
+        self._tools = {
+            "shell": "native_shell",
+            "read_file": "native_read",
+            "write_file": "native_write",
+            "edit_file": "native_edit",
+            "list_dir": "native_list",
+        }
+
+class FakeTaskResult:
+    def __init__(self, output_markdown="canned response from fake harness", atp_burned=42.0, total_cycle_latency_ms=123.45):
+        self.output_markdown = output_markdown
+        self.output = output_markdown
+        self.atp_burned = atp_burned
+        self.total_cycle_latency_ms = total_cycle_latency_ms
+
+class Harness:
+    instances = []
+    run_calls = []
+    should_raise = False
+
+    def __init__(self, workspace=None, providers=None):
+        self.workspace = workspace
+        self.providers = providers
+        self.tools = FakeTools()
+        Harness.instances.append(self)
+
+    def run(self, task, mode="pipeline", **kwargs):
+        Harness.run_calls.append({
+            "task": task,
+            "mode": mode,
+            "workspace": self.workspace,
+            "providers": self.providers,
+            "kwargs": kwargs,
+        })
+        if Harness.should_raise:
+            raise RuntimeError("simulated harness explosion")
+        return FakeTaskResult()
+''')
+
+# 1. Detection
+_orig_sys_path = list(sys.path)
+_orig_harness_mod = sys.modules.pop("harness", None)
+try:
+    # with harness_path pointing at fake package, harness_available returns True
+    ok, err = ez.harness_available({"harness_path": fake_harness_root})
+    assert ok is True, f"Expected True with fake harness, got: {err}"
+    assert err == ""
+
+    # with a bogus path, False + non-empty error string
+    sys.modules.pop("harness", None)
+    sys.path = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(fake_harness_root)]
+    ok, err = ez.harness_available({"harness_path": os.path.join(fake_harness_root, "nonexistent_dir_xyz")})
+    assert ok is False, "Expected False with bogus harness path"
+    assert len(err) > 0, "Expected non-empty error string"
+
+    # with no fake package importable, False
+    sys.modules.pop("harness", None)
+    sys.path = [p for p in sys.path if "harness" not in p.lower() and "organism" not in p.lower()]
+    ok, err = ez.harness_available({"harness_path": ""})
+    assert ok is False, "Expected False with no package importable"
+finally:
+    sys.path = _orig_sys_path
+    if _orig_harness_mod is not None:
+        sys.modules["harness"] = _orig_harness_mod
+
+# 2. Config round-trip
+test_cfg_dir = tempfile.mkdtemp(prefix="ez_cfg_test_")
+_orig_ez_app_dir = ez.APP_DIR
+ez.APP_DIR = test_cfg_dir
+try:
+    # Legacy config (only phase-1 fields)
+    legacy_json = os.path.join(test_cfg_dir, "agent.json")
+    with open(legacy_json, "w", encoding="utf-8") as fh:
+        json.dump({"base_url": "http://legacy.test", "model": "legacy-model", "api_key": "k", "grant_dir": "g"}, fh)
+    loaded_legacy = ez.load_agent_config()
+    assert loaded_legacy["backend"] == "endpoint", f"Expected default backend 'endpoint', got {loaded_legacy.get('backend')}"
+    assert loaded_legacy["harness_path"] == "", f"Expected default harness_path '', got {loaded_legacy.get('harness_path')}"
+    assert loaded_legacy["base_url"] == "http://legacy.test"
+
+    # Save new config with backend=harness and harness_path
+    ez.save_agent_config({
+        "backend": "harness",
+        "harness_path": fake_harness_root,
+        "grant_dir": test_cfg_dir,
+    })
+    loaded_new = ez.load_agent_config()
+    assert loaded_new["backend"] == "harness"
+    assert loaded_new["harness_path"] == fake_harness_root
+    assert loaded_new["grant_dir"] == test_cfg_dir
+finally:
+    ez.APP_DIR = _orig_ez_app_dir
+
+# 3. Run wiring & Case B tool assertions
+grant_temp = tempfile.mkdtemp(prefix="ez_grant_test_")
+harness_cfg = {
+    "backend": "harness",
+    "harness_path": fake_harness_root,
+    "grant_dir": grant_temp,
+}
+
+if os.path.abspath(fake_harness_root) not in [os.path.abspath(p) for p in sys.path]:
+    sys.path.insert(0, fake_harness_root)
+sys.modules.pop("harness", None)
+from harness import Harness
+
+Harness.instances.clear()
+Harness.run_calls.clear()
+Harness.should_raise = False
+
+spot.agent_client.config = harness_cfg
+spot.set_mode("agent")
+spot.transcript.clear()
+spot._harness_banner_shown = False
+spot.edit.setText("hello harness")
+spot.send_agent_message()
+
+assert spot._harness_worker is not None, "Worker should be created"
+spot._harness_worker.wait(5000)
+qapp.processEvents()
+
+assert len(Harness.run_calls) == 1, f"Expected 1 run call, got {len(Harness.run_calls)}"
+call = Harness.run_calls[0]
+assert call["workspace"] == grant_temp, f"Expected workspace {grant_temp}, got {call['workspace']}"
+assert call["providers"] == ["groq", "openrouter"], f"Expected providers ['groq', 'openrouter'], got {call['providers']}"
+assert call["mode"] == "pipeline", f"Expected mode 'pipeline', got {call['mode']}"
+assert call["task"] == "hello harness", f"Expected task 'hello harness', got {call['task']}"
+
+transcript_txt = spot.transcript.toPlainText()
+assert "canned response from fake harness" in transcript_txt, f"Canned text missing from transcript: {transcript_txt}"
+assert "Tokens: 42.0" in transcript_txt, f"Token budget missing: {transcript_txt}"
+assert "Time: 123.45ms" in transcript_txt, f"Latency missing: {transcript_txt}"
+assert "Tools: harness file tools (jailed to the grant folder)" in transcript_txt, f"Case B banner missing: {transcript_txt}"
+
+# Case B only: assert shell tool was disabled on the harness instance through the verified surface
+assert len(Harness.instances) >= 1
+inst = Harness.instances[-1]
+assert "shell" not in inst.tools._tools, f"Shell tool was not disabled! Tools: {inst.tools._tools}"
+assert "read_file" in inst.tools._tools
+assert "write_file" in inst.tools._tools
+
+# 4. Failure honesty
+Harness.should_raise = True
+spot.transcript.clear()
+spot.edit.setText("test failure")
+spot.send_agent_message()
+assert spot._harness_worker is not None
+spot._harness_worker.wait(5000)
+qapp.processEvents()
+
+fail_transcript = spot.transcript.toPlainText()
+assert "simulated harness explosion" in fail_transcript, f"Exception text missing from transcript: {fail_transcript}"
+assert "Error:" in fail_transcript
 
 # ====================================================================
 worker.stop()

@@ -141,11 +141,28 @@ def remove_launch_count(path):
 # ---------------------------------------------------------------------------
 
 DEFAULT_AGENT_CONFIG = {
+    "backend": "endpoint",
+    "harness_path": "",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "model": "meta/llama-3.3-70b-instruct",
     "api_key": "",
     "grant_dir": "",
 }
+
+
+def harness_available(cfg=None):
+    try:
+        if cfg is None:
+            cfg = load_agent_config()
+        hp = (cfg.get("harness_path") or "").strip()
+        if hp:
+            hp_abs = os.path.abspath(hp)
+            if hp_abs not in sys.path:
+                sys.path.insert(0, hp_abs)
+        from harness import Harness
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def agent_config_path():
@@ -189,6 +206,30 @@ class AgentSettingsDialog(QDialog):
         lay.setSpacing(10)
         lay.setContentsMargins(18, 18, 18, 18)
 
+        lbl_backend = QLabel("Backend:", self)
+        self.combo_backend = QComboBox(self)
+        self.combo_backend.addItem("Endpoint")
+        self.combo_backend.addItem("Organism Harness")
+        backend = (self.cfg.get("backend") or "endpoint").lower()
+        if backend == "harness":
+            self.combo_backend.setCurrentIndex(1)
+        else:
+            self.combo_backend.setCurrentIndex(0)
+        lay.addWidget(lbl_backend)
+        lay.addWidget(self.combo_backend)
+
+        self.lbl_harness = QLabel("Harness folder (Organism repo path):", self)
+        lay.addWidget(self.lbl_harness)
+        harness_row = QHBoxLayout()
+        self.edit_harness = QLineEdit(self)
+        self.edit_harness.setText(self.cfg.get("harness_path", ""))
+        self.edit_harness.setPlaceholderText("Path to organism_ai checkout")
+        self.btn_choose_harness = QPushButton("Choose…", self)
+        self.btn_choose_harness.clicked.connect(self._choose_harness)
+        harness_row.addWidget(self.edit_harness, 1)
+        harness_row.addWidget(self.btn_choose_harness)
+        lay.addLayout(harness_row)
+
         lbl_url = QLabel("Base URL:", self)
         self.edit_url = QLineEdit(self)
         self.edit_url.setText(self.cfg.get("base_url", ""))
@@ -223,6 +264,9 @@ class AgentSettingsDialog(QDialog):
         grant_row.addWidget(btn_choose)
         lay.addLayout(grant_row)
 
+        self.combo_backend.currentIndexChanged.connect(self._sync_backend_ui)
+        self._sync_backend_ui()
+
         lay.addSpacing(6)
 
         btn_row = QHBoxLayout()
@@ -236,6 +280,18 @@ class AgentSettingsDialog(QDialog):
         btn_row.addWidget(btn_save)
         lay.addLayout(btn_row)
 
+    def _sync_backend_ui(self):
+        is_harness = (self.combo_backend.currentIndex() == 1)
+        self.lbl_harness.setEnabled(is_harness)
+        self.edit_harness.setEnabled(is_harness)
+        self.btn_choose_harness.setEnabled(is_harness)
+
+    def _choose_harness(self):
+        curr = self.edit_harness.text().strip() or os.path.expanduser("~")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose Organism Harness Folder", curr)
+        if chosen:
+            self.edit_harness.setText(os.path.normpath(chosen))
+
     def _choose_grant(self):
         curr = self.edit_grant.text().strip() or os.path.expanduser("~")
         chosen = QFileDialog.getExistingDirectory(self, "Choose Grant Folder", curr)
@@ -244,6 +300,8 @@ class AgentSettingsDialog(QDialog):
 
     def _on_save(self):
         cfg = {
+            "backend": "harness" if self.combo_backend.currentIndex() == 1 else "endpoint",
+            "harness_path": self.edit_harness.text().strip(),
             "base_url": self.edit_url.text().strip(),
             "model": self.edit_model.text().strip(),
             "api_key": self.edit_key.text().strip(),
@@ -4965,6 +5023,68 @@ class AgentClient(QObject):
 # Spotlight-style quick search
 # ---------------------------------------------------------------------------
 
+class HarnessWorker(QThread):
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, task, grant_dir, harness_path="", parent=None):
+        super().__init__(parent)
+        self.task = task
+        self.grant_dir = grant_dir
+        self.harness_path = harness_path
+
+    def run(self):
+        try:
+            if self.harness_path:
+                hp = os.path.abspath(self.harness_path)
+                if hp not in sys.path:
+                    sys.path.insert(0, hp)
+            from harness import Harness
+            h = Harness(workspace=self.grant_dir, providers=["groq", "openrouter"])
+            # Case B: disable shell tool through verified surface
+            if hasattr(h, "tools") and hasattr(h.tools, "_tools"):
+                h.tools._tools.pop("shell", None)
+            elif hasattr(h, "tools") and hasattr(h.tools, "unregister"):
+                h.tools.unregister("shell")
+            res = h.run(self.task, mode="pipeline")
+
+            if isinstance(res, str):
+                final_text = res
+            elif hasattr(res, "output_markdown") and res.output_markdown:
+                final_text = res.output_markdown
+            elif hasattr(res, "output") and res.output:
+                final_text = res.output
+            elif hasattr(res, "final_text") and res.final_text:
+                final_text = res.final_text
+            elif hasattr(res, "text") and res.text:
+                final_text = res.text
+            else:
+                final_text = str(res)
+
+            # Budget / usage data
+            parts = []
+            tokens = getattr(res, "atp_burned", None)
+            if tokens is None:
+                tokens = getattr(res, "tokens", None)
+            if tokens is not None:
+                parts.append(f"Tokens: {tokens}")
+
+            latency = getattr(res, "total_cycle_latency_ms", None)
+            if latency is None:
+                latency = getattr(res, "duration_sec", None)
+                if latency is not None:
+                    parts.append(f"Time: {latency}s")
+            else:
+                parts.append(f"Time: {latency}ms")
+
+            if parts:
+                final_text = f"{final_text}\n[{', '.join(parts)}]"
+
+            self.done.emit(final_text)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class Spotlight(FramelessWindow):
     W, H = 660, 470
 
@@ -5056,10 +5176,14 @@ class Spotlight(FramelessWindow):
         self.agent_client.agent_text.connect(self.on_agent_text)
         self.agent_client.agent_error.connect(self.on_agent_error)
         self.agent_messages = []
+        self._harness_worker = None
+        self._harness_banner_shown = False
 
     def _open_endpoint(self):
         dlg = AgentSettingsDialog(self)
-        dlg.exec()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self.mode == "agent":
+                self.set_mode("agent")
 
     def set_mode(self, mode):
         self.mode = mode
@@ -5072,11 +5196,25 @@ class Spotlight(FramelessWindow):
             self.foot.setText("  ⏎  Send      Esc  Close  ")
             self.edit.setPlaceholderText("Ask the agent...")
             cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
-            if not (cfg.get("api_key") or "").strip():
-                if not self.transcript.toPlainText().strip():
-                    self.transcript.appendPlainText(
-                        "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key."
-                    )
+            backend = (cfg.get("backend") or "endpoint").lower()
+            if backend == "harness":
+                avail, err = harness_available(cfg)
+                if not avail:
+                    if not self.transcript.toPlainText().strip():
+                        self.transcript.appendPlainText(
+                            f"Setup required: Organism Harness not available ({err}). Click 'Endpoint…' above to configure the Harness folder."
+                        )
+                elif not (cfg.get("grant_dir") or "").strip():
+                    if not self.transcript.toPlainText().strip():
+                        self.transcript.appendPlainText(
+                            "Setup required: No grant folder configured. The grant folder IS the harness workspace; set one first in 'Endpoint…'."
+                        )
+            else:
+                if not (cfg.get("api_key") or "").strip():
+                    if not self.transcript.toPlainText().strip():
+                        self.transcript.appendPlainText(
+                            "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key."
+                        )
         else:
             self.btn_search.setChecked(True)
             self.btn_agent.setChecked(False)
@@ -5100,13 +5238,63 @@ class Spotlight(FramelessWindow):
             self.transcript.appendPlainText(f"Error: {err}")
 
     def send_agent_message(self):
+        if self._harness_worker is not None and self._harness_worker.isRunning():
+            return
         text = self.edit.text().strip()
         if not text:
             return
-        self.edit.clear()
-        self.transcript.appendPlainText(f"You: {text}\n")
-        self.agent_messages.append({"role": "user", "content": text})
-        self.agent_client.send(self.agent_messages)
+        cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+        backend = (cfg.get("backend") or "endpoint").lower()
+        if backend == "harness":
+            avail, err = harness_available(cfg)
+            if not avail:
+                self.transcript.appendPlainText(
+                    f"Error: Organism Harness not available ({err}). Please configure the Harness folder in Endpoint settings.\n"
+                )
+                return
+            grant_dir = (cfg.get("grant_dir") or "").strip()
+            if not grant_dir:
+                self.transcript.appendPlainText(
+                    "Error: No grant folder configured. The grant folder IS the harness workspace; set one first in Endpoint settings.\n"
+                )
+                return
+            self.edit.clear()
+            if not self._harness_banner_shown:
+                self.transcript.appendPlainText(
+                    "Tools: harness file tools (jailed to the grant folder); EzExp catalog tools not injected in this configuration.\n"
+                )
+                self._harness_banner_shown = True
+            self.transcript.appendPlainText(f"You: {text}\n")
+            self.agent_messages.append({"role": "user", "content": text})
+            hp = (cfg.get("harness_path") or "").strip()
+            self._start_harness_task(text, grant_dir, hp)
+        else:
+            self.edit.clear()
+            self.transcript.appendPlainText(f"You: {text}\n")
+            self.agent_messages.append({"role": "user", "content": text})
+            self.agent_client.send(self.agent_messages)
+
+    def _start_harness_task(self, text, grant_dir, harness_path=""):
+        self.edit.setEnabled(False)
+        self.foot.setText("  Agent working…      Esc  Close  ")
+        self._harness_worker = HarnessWorker(text, grant_dir, harness_path, self)
+        self._harness_worker.done.connect(self._on_harness_done)
+        self._harness_worker.failed.connect(self._on_harness_failed)
+        self._harness_worker.start()
+
+    def _on_harness_done(self, final_text):
+        self.edit.setEnabled(True)
+        self.foot.setText("  ⏎  Send      Esc  Close  ")
+        self.edit.setFocus()
+        if final_text:
+            self.transcript.appendPlainText(final_text + "\n")
+            self.agent_messages.append({"role": "assistant", "content": final_text})
+
+    def _on_harness_failed(self, err_text):
+        self.edit.setEnabled(True)
+        self.foot.setText("  ⏎  Send      Esc  Close  ")
+        self.edit.setFocus()
+        self.transcript.appendPlainText(f"Error: {err_text}\n")
 
     def on_results(self, seq, q, rows, note):
         if seq != self.spot_seq:
