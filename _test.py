@@ -1350,12 +1350,12 @@ ok, err = ez.harness_available({"harness_path": os.path.join(fake_harness_root, 
 assert ok is False, "Expected False with bogus harness path"
 assert len(err) > 0, "Expected non-empty error string"
 
-# with an existing empty dir without harness, probe spawns, fails, and caches
+# with an existing empty dir without harness, probe spawns, fails, and is NOT cached
 empty_probe_dir = tempfile.mkdtemp(prefix="empty_probe_")
 ok, err = ez.harness_available({"harness_path": empty_probe_dir, "harness_python": "py"})
 assert ok is False
 assert len(err) > 0
-assert len(ez._harness_probe_cache) == 2
+assert len(ez._harness_probe_cache) == 1, "Failures must not be cached"
 
 # with empty harness_path, False
 ok, err = ez.harness_available({"harness_path": ""})
@@ -1898,6 +1898,126 @@ assert isinstance(smoke_nd, ez.QStyledItemDelegate)
 smoke_sd = ez.SpotDelegate(smoke_sp)
 assert isinstance(smoke_sd, ez.QStyledItemDelegate)
 
+# 20. ProbeWorker
+smoke_pw = ez.ProbeWorker()
+assert isinstance(smoke_pw, ez.QThread)
+
+# ---------------------------------------------------------------------------
+# Part 0 Tests: Probe 30s timeout, async entry, cache, failure-not-cached, dedup
+# ---------------------------------------------------------------------------
+
+# 1. slow-probe pass (stub interpreter sleeps ~6s, succeeds under 30s limit)
+stub_probe_bat = os.path.join(tempfile.mkdtemp(prefix="ez_probe_"), "stub_py.bat")
+with open(stub_probe_bat, "w", encoding="utf-8") as f:
+    f.write(f'@echo off\n"{sys.executable}" -c "import time; time.sleep(6)"\nexit /b 0\n')
+temp_probe_harness_dir = tempfile.mkdtemp(prefix="ez_probe_dir_")
+
+ez.clear_harness_probe_cache()
+t0 = time.time()
+ok_slow, err_slow = ez.harness_available({"backend": "harness", "harness_path": temp_probe_harness_dir, "harness_python": stub_probe_bat})
+probe_elapsed = time.time() - t0
+assert ok_slow is True, f"Expected slow probe to succeed within 30s, got err: {err_slow}"
+assert probe_elapsed >= 5.5, f"Expected sleep ~6s, got {probe_elapsed:.2f}s"
+
+# 2. async entry (< 2s return, ready after landing)
+ez.clear_harness_probe_cache()
+async_cfg = {
+    "backend": "harness",
+    "harness_path": temp_probe_harness_dir,
+    "harness_python": stub_probe_bat,
+    "grant_dir": temp_probe_harness_dir,
+}
+test_spot_async = ez.Spotlight(worker)
+test_spot_async.agent_client.config = async_cfg
+t_entry = time.time()
+test_spot_async.set_mode("agent")
+entry_duration = time.time() - t_entry
+assert entry_duration < 2.0, f"set_mode('agent') took {entry_duration:.2f}s, must be < 2.0s"
+assert test_spot_async._probe_in_progress is True
+assert "checking" in test_spot_async.transcript.toPlainText().lower()
+
+# Wait for probe worker to finish and verify ready
+if test_spot_async._probe_worker is not None:
+    test_spot_async._probe_worker.wait(15000)
+    QApplication.processEvents()
+assert test_spot_async._probe_in_progress is False
+assert "ready" in test_spot_async.transcript.toPlainText().lower()
+
+# 3. cache (two entries = one stub invocation)
+counter_file = os.path.join(tempfile.mkdtemp(prefix="ez_counter_"), "count.txt")
+stub_counter_bat = os.path.join(tempfile.mkdtemp(prefix="ez_counter_bat_"), "stub_counter.bat")
+with open(stub_counter_bat, "w", encoding="utf-8") as f:
+    f.write(f'@echo off\necho 1>>"{counter_file}"\nexit /b 0\n')
+
+ez.clear_harness_probe_cache()
+cache_cfg = {
+    "backend": "harness",
+    "harness_path": temp_probe_harness_dir,
+    "harness_python": stub_counter_bat,
+    "grant_dir": temp_probe_harness_dir,
+}
+test_spot_cache = ez.Spotlight(worker)
+test_spot_cache.agent_client.config = cache_cfg
+test_spot_cache.set_mode("agent")
+if test_spot_cache._probe_worker is not None:
+    test_spot_cache._probe_worker.wait(10000)
+    QApplication.processEvents()
+
+with open(counter_file, "r", encoding="utf-8") as cf:
+    invocations = len(cf.readlines())
+assert invocations == 1, f"Expected 1 stub invocation, got {invocations}"
+
+# Second entry: switch to search and back to agent
+test_spot_cache.set_mode("search")
+test_spot_cache.set_mode("agent")
+QApplication.processEvents()
+with open(counter_file, "r", encoding="utf-8") as cf:
+    invocations2 = len(cf.readlines())
+assert invocations2 == 1, f"Expected cache hit (still 1 invocation), got {invocations2}"
+
+# 4. failure-not-cached
+ez.clear_harness_probe_cache()
+fail_counter_file = os.path.join(tempfile.mkdtemp(prefix="ez_fail_counter_"), "fail_count.txt")
+stub_fail_bat = os.path.join(tempfile.mkdtemp(prefix="ez_fail_bat_"), "stub_fail.bat")
+with open(stub_fail_bat, "w", encoding="utf-8") as f:
+    f.write(f'@echo off\necho fail>>"{fail_counter_file}"\nexit /b 1\n')
+
+ok_f1, err_f1 = ez.harness_available({"backend": "harness", "harness_path": temp_probe_harness_dir, "harness_python": stub_fail_bat})
+assert ok_f1 is False
+assert len(ez._harness_probe_cache) == 0, "Failed probe must not be cached"
+
+ok_f2, err_f2 = ez.harness_available({"backend": "harness", "harness_path": temp_probe_harness_dir, "harness_python": stub_fail_bat})
+assert ok_f2 is False
+with open(fail_counter_file, "r", encoding="utf-8") as fcf:
+    fail_invocations = len(fcf.readlines())
+assert fail_invocations == 2, f"Expected 2 invocations since failures are not cached, got {fail_invocations}"
+
+# 5. dedup (two sends while not-ready = one status line)
+ez.clear_harness_probe_cache()
+notready_spot = ez.Spotlight(worker)
+notready_spot.agent_client.config = {
+    "backend": "endpoint",
+    "api_key": "",
+}
+notready_spot.set_mode("agent")
+initial_text = notready_spot.transcript.toPlainText().strip()
+assert "Setup required: No API key configured" in initial_text
+
+notready_spot.edit.setText("test message 1")
+notready_spot.send_agent_message()
+after_send1 = notready_spot.transcript.toPlainText().strip()
+lines1 = [l.strip() for l in after_send1.splitlines() if l.strip()]
+assert len(lines1) == 1, f"Expected 1 line after send 1, got {len(lines1)}: {lines1}"
+
+notready_spot.edit.setText("test message 2")
+notready_spot.send_agent_message()
+after_send2 = notready_spot.transcript.toPlainText().strip()
+lines2 = [l.strip() for l in after_send2.splitlines() if l.strip()]
+assert len(lines2) == 1, f"Expected 1 line after send 2 (deduped), got {len(lines2)}: {lines2}"
+assert lines2[0] == lines1[0]
+
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")
+sys.stdout.flush()
+os._exit(0)

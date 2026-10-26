@@ -163,12 +163,13 @@ def clear_harness_probe_cache():
 def harness_available(cfg=None):
     if cfg is None:
         cfg = load_agent_config()
+    backend = str(cfg.get("backend") or "harness").strip().lower()
     hp = (cfg.get("harness_path") or "").strip()
     python_bin = (cfg.get("harness_python") or "py").strip() or "py"
     if not hp or not os.path.isdir(hp):
         return False, f"Directory does not exist: '{hp}'" if hp else "Path is empty"
 
-    cache_key = (os.path.normcase(os.path.abspath(hp)), python_bin)
+    cache_key = (backend, hp, python_bin)
     if cache_key in _harness_probe_cache:
         return _harness_probe_cache[cache_key]
 
@@ -178,19 +179,20 @@ def harness_available(cfg=None):
             cwd=hp,
             capture_output=True,
             text=True,
-            timeout=5.0,
+            timeout=30.0,
         )
         if proc.returncode == 0:
             res = (True, "")
+            _harness_probe_cache[cache_key] = res
+            return res
         else:
             stderr_lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
             last_line = stderr_lines[-1] if stderr_lines else f"Exited with code {proc.returncode}"
-            res = (False, last_line)
+            return (False, last_line)
+    except subprocess.TimeoutExpired as e:
+        return (False, f"Harness availability check timed out after 30s: {e}")
     except Exception as e:
-        res = (False, str(e))
-
-    _harness_probe_cache[cache_key] = res
-    return res
+        return (False, str(e))
 
 
 def agent_config_path():
@@ -219,6 +221,7 @@ def save_agent_config(cfg):
             full_cfg.update(cfg)
         with open(agent_config_path(), "w", encoding="utf-8") as fh:
             json.dump(full_cfg, fh, indent=2)
+        clear_harness_probe_cache()
     except Exception:
         pass
 
@@ -5372,6 +5375,18 @@ class BridgeWorker(QThread):
 HarnessWorker = BridgeWorker
 
 
+class ProbeWorker(QThread):
+    probed = Signal(bool, str)
+
+    def __init__(self, cfg=None, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+
+    def run(self):
+        ready, status_msg = agent_status(self.cfg)
+        self.probed.emit(ready, status_msg)
+
+
 class Spotlight(FramelessWindow):
     W, H = 660, 470
 
@@ -5466,17 +5481,48 @@ class Spotlight(FramelessWindow):
         self.agent_messages = []
         self._bridge_worker = None
         self._harness_banner_shown = False
+        self._probe_worker = None
+        self._probe_in_progress = False
 
     def _open_endpoint(self):
         dlg = AgentSettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.agent_client.config = load_agent_config()
+            clear_harness_probe_cache()
             if self.mode == "agent":
                 self.set_mode("agent")
+
+    def _on_probed(self, ready, status_msg):
+        self._probe_in_progress = False
+        if self.mode == "agent":
+            cur = self.transcript.toPlainText().strip()
+            if cur == "Organism Harness: checking…" or not self.agent_messages:
+                if status_msg:
+                    self.transcript.setPlainText(status_msg)
+                else:
+                    self.transcript.clear()
+            else:
+                if status_msg:
+                    self._append_status_dedup(status_msg)
+
+    def _append_status_dedup(self, msg):
+        msg = msg.strip()
+        if not msg:
+            return
+        current_text = self.transcript.toPlainText().strip()
+        if not current_text:
+            self.transcript.setPlainText(msg)
+            return
+        last_block = self.transcript.document().lastBlock().text().strip()
+        lines = [l.strip() for l in current_text.splitlines() if l.strip()]
+        last_line = lines[-1] if lines else ""
+        if last_block == msg or last_line == msg:
+            return
+        self.transcript.appendPlainText(msg + "\n")
 
     def set_mode(self, mode):
         self.mode = mode
         if mode == "agent":
-            clear_harness_probe_cache()
             self.btn_search.setChecked(False)
             self.btn_agent.setChecked(True)
             self.tree.hide()
@@ -5485,11 +5531,34 @@ class Spotlight(FramelessWindow):
             self.foot.setText("  ⏎  Send      Esc  Close  ")
             self.edit.setPlaceholderText("Ask the agent...")
             cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
-            ready, status_msg = agent_status(cfg)
-            if not self.agent_messages:
-                self.transcript.clear()
-                if status_msg:
-                    self.transcript.setPlainText(status_msg)
+            backend = (cfg.get("backend") or "endpoint").lower()
+            if backend == "harness":
+                hp = (cfg.get("harness_path") or "").strip()
+                python_bin = (cfg.get("harness_python") or "py").strip() or "py"
+                cache_key = (backend, hp, python_bin)
+                if cache_key in _harness_probe_cache:
+                    ready, status_msg = agent_status(cfg)
+                    if not self.agent_messages:
+                        self.transcript.clear()
+                        if status_msg:
+                            self.transcript.setPlainText(status_msg)
+                else:
+                    self._probe_in_progress = True
+                    if not self.agent_messages:
+                        self.transcript.clear()
+                        self.transcript.setPlainText("Organism Harness: checking…")
+                    if self._probe_worker is not None and self._probe_worker.isRunning():
+                        self._probe_worker.quit()
+                        self._probe_worker.wait()
+                    self._probe_worker = ProbeWorker(cfg, self)
+                    self._probe_worker.probed.connect(self._on_probed)
+                    self._probe_worker.start()
+            else:
+                ready, status_msg = agent_status(cfg)
+                if not self.agent_messages:
+                    self.transcript.clear()
+                    if status_msg:
+                        self.transcript.setPlainText(status_msg)
         else:
             self.btn_search.setChecked(True)
             self.btn_agent.setChecked(False)
@@ -5518,11 +5587,14 @@ class Spotlight(FramelessWindow):
         text = self.edit.text().strip()
         if not text:
             return
+        if self._probe_in_progress:
+            self._append_status_dedup("Organism Harness: checking…")
+            return
         cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
         ready, status_msg = agent_status(cfg)
         if not ready:
             if status_msg:
-                self.transcript.appendPlainText(status_msg + "\n")
+                self._append_status_dedup(status_msg)
             return
 
         backend = (cfg.get("backend") or "endpoint").lower()
