@@ -744,6 +744,7 @@ try:
     expected_defaults = {
         "backend": "endpoint",
         "harness_path": "",
+        "harness_python": "py",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "model": "meta/llama-3.3-70b-instruct",
         "api_key": "",
@@ -755,6 +756,7 @@ try:
     test_cfg = {
         "backend": "endpoint",
         "harness_path": "",
+        "harness_python": "py",
         "base_url": "http://127.0.0.1:5555/v1",
         "model": "meta/llama-test",
         "api_key": "local-test-key",
@@ -1204,133 +1206,160 @@ finally:
 
 
 # ====================================================================
-# Organism Harness integration tests (stub harness only; no real checkout, no network, no keys)
+# Organism Harness integration tests (stub harness runner via subprocess; no real checkout, no network, no keys)
 # ---------------------------------------------------------------------------
 fake_harness_root = tempfile.mkdtemp(prefix="fake_harness_")
 fake_harness_pkg = os.path.join(fake_harness_root, "harness")
 fake_runtime_pkg = os.path.join(fake_harness_pkg, "runtime")
 os.makedirs(fake_runtime_pkg, exist_ok=True)
 
+with open(os.path.join(fake_harness_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+    fh.write("# stub harness package\n")
+
 with open(os.path.join(fake_runtime_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
     fh.write("")
 
-with open(os.path.join(fake_runtime_pkg, "tools.py"), "w", encoding="utf-8") as fh:
-    fh.write('''
-class ToolResult:
-    def __init__(self, ok=True, output="", error=None):
-        self.ok = ok
-        self.output = output
-        self.error = error
+# Write stub host_runner.py in fake_harness_pkg
+host_runner_code = r"""import sys
+import json
+import os
+import time
 
-    def __repr__(self):
-        return f"ToolResult(ok={self.ok}, output={self.output!r}, error={self.error!r})"
-''')
+def main():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ctrl_path = os.path.join(root, "control.json")
 
-with open(os.path.join(fake_harness_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
-    fh.write('''
-from harness.runtime.tools import ToolResult
+    def load_control():
+        if os.path.exists(ctrl_path):
+            with open(ctrl_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
 
-class FakeTaskResult:
-    def __init__(self, output_markdown="canned response from fake harness", atp_burned=42.0, total_cycle_latency_ms=123.45):
-        self.output_markdown = output_markdown
-        self.output = output_markdown
-        self.atp_burned = atp_burned
-        self.total_cycle_latency_ms = total_cycle_latency_ms
+    ctrl = load_control()
+    mode = ctrl.get("mode", os.environ.get("EZ_TEST_RUNNER_MODE", "happy"))
 
-class Harness:
-    instances = []
-    run_calls = []
-    should_raise = False
-    sabotage_disable = False
-    tool_to_call_during_run = None
-    last_tool_result = None
+    # Read setup
+    line = sys.stdin.readline()
+    if not line:
+        return
+    setup_msg = json.loads(line)
+    with open(os.path.join(root, "setup_received.json"), "w", encoding="utf-8") as f:
+        json.dump(setup_msg, f)
 
-    def __init__(self, workspace=None, providers=None, tools=None, disable_tools=None):
-        self.workspace = workspace
-        self.providers = providers
-        self.constructor_disable_tools = disable_tools
-        self._active_tools = {
-            "shell": {"name": "shell", "description": "native shell", "parameters": {}, "func": None},
-            "read_file": {"name": "read_file", "description": "native read", "parameters": {}, "func": None},
-            "write_file": {"name": "write_file", "description": "native write", "parameters": {}, "func": None},
-            "edit_file": {"name": "edit_file", "description": "native edit", "parameters": {}, "func": None},
-            "list_dir": {"name": "list_dir", "description": "native list", "parameters": {}, "func": None},
+    if mode == "error":
+        err_msg = ctrl.get("error_message", "simulated harness explosion")
+        sys.stdout.write(json.dumps({"type": "error", "message": err_msg}) + "\n")
+        sys.stdout.flush()
+        sys.exit(1)
+
+    if mode == "sabotage":
+        ready_msg = {
+            "type": "ready",
+            "tools": ["create_file", "create_folder", "list_folder", "open_file", "search_files", "shell"]
         }
-        if disable_tools and not Harness.sabotage_disable:
-            self.disable_tools(disable_tools)
-        if tools:
-            for t in tools:
-                self.register_tool(t["name"], t["description"], t["parameters"], t["func"])
-        Harness.instances.append(self)
+        sys.stdout.write(json.dumps(ready_msg) + "\n")
+        sys.stdout.flush()
+        time.sleep(10)
+        return
 
-    def register_tool(self, name, description, parameters, func, replace=False):
-        self._active_tools[name] = {
-            "name": name,
-            "description": description,
-            "parameters": parameters,
-            "func": func,
+    # Normal ready
+    ready_msg = {
+        "type": "ready",
+        "tools": sorted(["create_file", "create_folder", "list_folder", "open_file", "search_files"])
+    }
+    sys.stdout.write(json.dumps(ready_msg) + "\n")
+    sys.stdout.flush()
+
+    # Read task
+    line = sys.stdin.readline()
+    if not line:
+        return
+    task_msg = json.loads(line)
+    with open(os.path.join(root, "task_received.json"), "w", encoding="utf-8") as f:
+        json.dump(task_msg, f)
+
+    # Optional tool call
+    tool_call = ctrl.get("tool_call")
+    if tool_call:
+        call_msg = {
+            "type": "tool_call",
+            "id": "call_1",
+            "name": tool_call["name"],
+            "arguments": tool_call.get("arguments", {}),
         }
+        sys.stdout.write(json.dumps(call_msg) + "\n")
+        sys.stdout.flush()
 
-    def disable_tools(self, names):
-        for n in names:
-            self._active_tools.pop(n, None)
+        res_line = sys.stdin.readline()
+        if res_line:
+            tool_res = json.loads(res_line)
+            with open(os.path.join(root, "tool_result_received.json"), "w", encoding="utf-8") as f:
+                json.dump(tool_res, f)
 
-    def tool_names(self):
-        return list(self._active_tools.keys())
+    # Final
+    final_msg = {
+        "type": "final",
+        "text": ctrl.get("final_text", "canned response from fake harness"),
+        "tokens": 42.0,
+        "ms": 123.45,
+    }
+    sys.stdout.write(json.dumps(final_msg) + "\n")
+    sys.stdout.flush()
 
-    def tool_schemas(self):
-        return [
-            {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["parameters"],
-            }
-            for t in self._active_tools.values()
-        ]
+if __name__ == "__main__":
+    main()
+"""
 
-    def run(self, task, mode="pipeline", **kwargs):
-        Harness.run_calls.append({
-            "task": task,
-            "mode": mode,
-            "workspace": self.workspace,
-            "providers": self.providers,
-            "kwargs": kwargs,
-        })
-        if Harness.should_raise:
-            raise RuntimeError("simulated harness explosion")
-        if Harness.tool_to_call_during_run:
-            name, call_kwargs = Harness.tool_to_call_during_run
-            fn = self._active_tools[name]["func"]
-            res = fn(**call_kwargs)
-            Harness.last_tool_result = res
-        return FakeTaskResult()
-''')
+with open(os.path.join(fake_harness_pkg, "host_runner.py"), "w", encoding="utf-8") as fh:
+    fh.write(host_runner_code)
 
-# 1. Detection
-_orig_sys_path = list(sys.path)
-_orig_harness_mod = sys.modules.pop("harness", None)
-try:
-    # with harness_path pointing at fake package, harness_available returns True
-    ok, err = ez.harness_available({"harness_path": fake_harness_root})
-    assert ok is True, f"Expected True with fake harness, got: {err}"
-    assert err == ""
+def set_control(data):
+    with open(os.path.join(fake_harness_root, "control.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f)
 
-    # with a bogus path, False + non-empty error string
-    sys.modules.pop("harness", None)
-    sys.path = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(fake_harness_root)]
-    ok, err = ez.harness_available({"harness_path": os.path.join(fake_harness_root, "nonexistent_dir_xyz")})
-    assert ok is False, "Expected False with bogus harness path"
-    assert len(err) > 0, "Expected non-empty error string"
+def remove_control_files():
+    for fname in ["control.json", "setup_received.json", "task_received.json", "tool_result_received.json"]:
+        p = os.path.join(fake_harness_root, fname)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
-    # with no fake package importable, False
-    sys.modules.pop("harness", None)
-    sys.path = [p for p in sys.path if "harness" not in p.lower() and "organism" not in p.lower()]
-    ok, err = ez.harness_available({"harness_path": ""})
-    assert ok is False, "Expected False with no package importable"
-finally:
-    sys.path = _orig_sys_path
-    if _orig_harness_mod is not None:
-        sys.modules["harness"] = _orig_harness_mod
+# 1. Detection & Non-Import Probe Caching
+ez.clear_harness_probe_cache()
+assert len(ez._harness_probe_cache) == 0
+
+# with harness_path pointing at fake package, harness_available returns True
+ok, err = ez.harness_available({"harness_path": fake_harness_root, "harness_python": "py"})
+assert ok is True, f"Expected True with fake harness, got: {err}"
+assert err == ""
+assert len(ez._harness_probe_cache) == 1
+
+# cached hit returns same without re-running probe
+ok_cached, err_cached = ez.harness_available({"harness_path": fake_harness_root, "harness_python": "py"})
+assert ok_cached is True
+assert err_cached == ""
+
+# with a bogus path, False + non-empty error string (fast path: no spawn)
+ok, err = ez.harness_available({"harness_path": os.path.join(fake_harness_root, "nonexistent_dir_xyz"), "harness_python": "py"})
+assert ok is False, "Expected False with bogus harness path"
+assert len(err) > 0, "Expected non-empty error string"
+
+# with an existing empty dir without harness, probe spawns, fails, and caches
+empty_probe_dir = tempfile.mkdtemp(prefix="empty_probe_")
+ok, err = ez.harness_available({"harness_path": empty_probe_dir, "harness_python": "py"})
+assert ok is False
+assert len(err) > 0
+assert len(ez._harness_probe_cache) == 2
+
+# with empty harness_path, False
+ok, err = ez.harness_available({"harness_path": ""})
+assert ok is False, "Expected False with no package importable"
+
+# clearing cache
+ez.clear_harness_probe_cache()
+assert len(ez._harness_probe_cache) == 0
 
 # 2. Config round-trip
 test_cfg_dir = tempfile.mkdtemp(prefix="ez_cfg_test_")
@@ -1344,17 +1373,20 @@ try:
     loaded_legacy = ez.load_agent_config()
     assert loaded_legacy["backend"] == "endpoint", f"Expected default backend 'endpoint', got {loaded_legacy.get('backend')}"
     assert loaded_legacy["harness_path"] == "", f"Expected default harness_path '', got {loaded_legacy.get('harness_path')}"
+    assert loaded_legacy["harness_python"] == "py", f"Expected default harness_python 'py', got {loaded_legacy.get('harness_python')}"
     assert loaded_legacy["base_url"] == "http://legacy.test"
 
-    # Save new config with backend=harness and harness_path
+    # Save new config with backend=harness, harness_path, harness_python
     ez.save_agent_config({
         "backend": "harness",
         "harness_path": fake_harness_root,
+        "harness_python": "py",
         "grant_dir": test_cfg_dir,
     })
     loaded_new = ez.load_agent_config()
     assert loaded_new["backend"] == "harness"
     assert loaded_new["harness_path"] == fake_harness_root
+    assert loaded_new["harness_python"] == "py"
     assert loaded_new["grant_dir"] == test_cfg_dir
 finally:
     ez.APP_DIR = _orig_ez_app_dir
@@ -1374,11 +1406,13 @@ try:
     assert hasattr(dlg, "edit_key") and dlg.edit_key is not None
     assert hasattr(dlg, "edit_model") and dlg.edit_model is not None
     assert hasattr(dlg, "edit_harness") and dlg.edit_harness is not None
+    assert hasattr(dlg, "edit_python") and dlg.edit_python is not None
     assert hasattr(dlg, "edit_grant") and dlg.edit_grant is not None
 
     # Fill every field and accept via _on_save
     dlg.combo_backend.setCurrentIndex(1)
     dlg.edit_harness.setText(fake_harness_root)
+    dlg.edit_python.setText("py")
     dlg.edit_url.setText("https://test.endpoint/v1")
     dlg.edit_model.setText("test-custom-model")
     dlg.edit_key.setText("test-secret-key-456")
@@ -1389,6 +1423,7 @@ try:
     persisted = ez.load_agent_config()
     assert persisted["backend"] == "harness"
     assert persisted["harness_path"] == fake_harness_root
+    assert persisted["harness_python"] == "py"
     assert persisted["base_url"] == "https://test.endpoint/v1"
     assert persisted["model"] == "test-custom-model"
     assert persisted["api_key"] == "test-secret-key-456"
@@ -1398,6 +1433,7 @@ try:
     dlg2 = ez.AgentSettingsDialog(spot)
     assert dlg2.combo_backend.currentIndex() == 1
     assert dlg2.edit_harness.text() == fake_harness_root
+    assert dlg2.edit_python.text() == "py"
     assert dlg2.edit_url.text() == "https://test.endpoint/v1"
     assert dlg2.edit_model.text() == "test-custom-model"
     assert dlg2.edit_key.text() == "test-secret-key-456"
@@ -1419,24 +1455,24 @@ assert st2_ok is True
 assert st2_msg == ""
 
 # State 3: harness, harness_available False
-st3_ok, st3_msg = ez.agent_status({"backend": "harness", "harness_path": os.path.join(fake_harness_root, "bogus_dir_xyz")})
+st3_ok, st3_msg = ez.agent_status({"backend": "harness", "harness_path": os.path.join(fake_harness_root, "bogus_dir_xyz"), "harness_python": "py"})
 assert st3_ok is False
 assert st3_msg.startswith("Organism Harness not available:")
 assert "Set the harness folder via 'Endpoint…' above." in st3_msg
 
 # State 4: harness, available, no grant
-st4_ok, st4_msg = ez.agent_status({"backend": "harness", "harness_path": fake_harness_root, "grant_dir": ""})
+st4_ok, st4_msg = ez.agent_status({"backend": "harness", "harness_path": fake_harness_root, "harness_python": "py", "grant_dir": ""})
 assert st4_ok is False
 assert st4_msg == "Set a grant folder via 'Endpoint…' above — it becomes the harness workspace."
 
 # State 5: harness, available + grant
-st5_ok, st5_msg = ez.agent_status({"backend": "harness", "harness_path": fake_harness_root, "grant_dir": grant_temp})
+st5_ok, st5_msg = ez.agent_status({"backend": "harness", "harness_path": fake_harness_root, "harness_python": "py", "grant_dir": grant_temp})
 assert st5_ok is True
 assert st5_msg == f"Organism Harness ready · workspace: {grant_temp}"
 
 # 2c. Panel-level status and regression pinning
 # Harness configured + fake harness + grant -> ready line visible, NOT "No API key configured"
-spot.agent_client.config = {"backend": "harness", "harness_path": fake_harness_root, "grant_dir": grant_temp}
+spot.agent_client.config = {"backend": "harness", "harness_path": fake_harness_root, "harness_python": "py", "grant_dir": grant_temp}
 spot.agent_messages.clear()
 spot.set_mode("agent")
 panel_harness_txt = spot.transcript.toPlainText()
@@ -1450,40 +1486,24 @@ spot.set_mode("agent")
 panel_ep_txt = spot.transcript.toPlainText()
 assert "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key." in panel_ep_txt
 
-# 2d. Send while not-ready -> no worker constructed, fake harness records nothing
-Harness = None
-if os.path.abspath(fake_harness_root) not in [os.path.abspath(p) for p in sys.path]:
-    sys.path.insert(0, fake_harness_root)
-sys.modules.pop("harness", None)
-from harness import Harness
-
-Harness.run_calls.clear()
+# 2d. Send while not-ready -> no worker constructed
 spot.agent_client.config = {"backend": "endpoint", "api_key": ""}
 spot.transcript.clear()
 spot.edit.setText("Attempt send while not ready")
 spot.send_agent_message()
-assert len(Harness.run_calls) == 0, "No worker or run call should be initiated when not ready"
-assert spot._harness_worker is None or not spot._harness_worker.isRunning()
+assert spot._bridge_worker is None or not spot._bridge_worker.isRunning()
 assert "Setup required: No API key configured" in spot.transcript.toPlainText()
 
 # 3. Case A: Run wiring, public tool injection, schema equality, and Case A banner
+remove_control_files()
+set_control({"mode": "happy"})
+
 harness_cfg = {
     "backend": "harness",
     "harness_path": fake_harness_root,
+    "harness_python": "py",
     "grant_dir": grant_temp,
 }
-
-if os.path.abspath(fake_harness_root) not in [os.path.abspath(p) for p in sys.path]:
-    sys.path.insert(0, fake_harness_root)
-sys.modules.pop("harness", None)
-from harness import Harness
-
-Harness.instances.clear()
-Harness.run_calls.clear()
-Harness.should_raise = False
-Harness.sabotage_disable = False
-Harness.tool_to_call_during_run = None
-Harness.last_tool_result = None
 
 spot.agent_client.config = harness_cfg
 spot.set_mode("agent")
@@ -1492,110 +1512,146 @@ spot._harness_banner_shown = False
 spot.edit.setText("hello harness")
 spot.send_agent_message()
 
-assert spot._harness_worker is not None, "Worker should be created"
-spot._harness_worker.wait(5000)
+assert spot._bridge_worker is not None, "Worker should be created"
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
 qapp.processEvents()
 
-assert len(Harness.run_calls) == 1, f"Expected 1 run call, got {len(Harness.run_calls)}"
-call = Harness.run_calls[0]
-assert call["workspace"] == grant_temp, f"Expected workspace {grant_temp}, got {call['workspace']}"
-assert call["providers"] == ["groq", "openrouter"], f"Expected providers ['groq', 'openrouter'], got {call['providers']}"
-assert call["mode"] == "pipeline", f"Expected mode 'pipeline', got {call['mode']}"
-assert call["task"] == "hello harness", f"Expected task 'hello harness', got {call['task']}"
-
-transcript_txt = spot.transcript.toPlainText()
-assert "canned response from fake harness" in transcript_txt, f"Canned text missing from transcript: {transcript_txt}"
-assert "Tokens: 42.0" in transcript_txt, f"Token budget missing: {transcript_txt}"
-assert "Time: 123.45ms" in transcript_txt, f"Latency missing: {transcript_txt}"
-assert "Tools: EzExp catalog + grant tools via the harness (native harness tools disabled)." in transcript_txt, f"Case A banner missing: {transcript_txt}"
-
-# Assert all 5 native tools were disabled at construction
-assert len(Harness.instances) >= 1
-inst = Harness.instances[-1]
-assert inst.constructor_disable_tools == ["shell", "read_file", "write_file", "edit_file", "list_dir"], f"Expected all 5 native tools disabled at construction, got: {inst.constructor_disable_tools}"
-
-# Assert exactly the 5 EzExp tools are registered
+# Verify setup received
+setup_file = os.path.join(fake_harness_root, "setup_received.json")
+assert os.path.exists(setup_file), "Runner should have received setup"
+with open(setup_file, "r", encoding="utf-8") as f:
+    setup_data = json.load(f)
+assert setup_data["providers"] == ["groq", "openrouter"]
+assert setup_data["disable"] == ["shell", "read_file", "write_file", "edit_file", "list_dir"]
+manifest_names = sorted([t["name"] for t in setup_data["tools"]])
 expected_five = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
-assert sorted(inst.tool_names()) == expected_five, f"Expected active tools {expected_five}, got {inst.tool_names()}"
+assert manifest_names == expected_five, f"Expected manifest tools {expected_five}, got {manifest_names}"
 
-# Assert registered tool schemas equal endpoint tool dicts
+# Verify tool schemas match AGENT_TOOLS
 endpoint_tool_map = {t["function"]["name"]: t["function"] for t in ez.AGENT_TOOLS}
-for t_schema in inst.tool_schemas():
+for t_schema in setup_data["tools"]:
     t_name = t_schema["name"]
     assert t_name in endpoint_tool_map, f"Unexpected tool {t_name}"
     expected_spec = endpoint_tool_map[t_name]
     assert t_schema["description"] == expected_spec["description"], f"Description mismatch for {t_name}"
     assert t_schema["parameters"] == expected_spec["parameters"], f"Parameters mismatch for {t_name}"
 
-# 4. Fail-closed tool set assertion (sabotaged harness ignoring disable_tools)
-Harness.sabotage_disable = True
+# Verify task received
+task_file = os.path.join(fake_harness_root, "task_received.json")
+assert os.path.exists(task_file), "Runner should have received task"
+with open(task_file, "r", encoding="utf-8") as f:
+    task_data = json.load(f)
+assert task_data["text"] == "hello harness"
+
+# Verify transcript
+transcript_txt = spot.transcript.toPlainText()
+assert "canned response from fake harness" in transcript_txt, f"Canned text missing from transcript: {transcript_txt}"
+assert "Tokens: 42.0" in transcript_txt, f"Token budget missing: {transcript_txt}"
+assert "Time: 123.45ms" in transcript_txt, f"Latency missing: {transcript_txt}"
+assert "Tools: EzExp catalog + grant tools via the harness (native harness tools disabled)." in transcript_txt, f"Case A banner missing: {transcript_txt}"
+
+# 4. Fail-closed tool set assertion (sabotaged runner emitting shell tool)
+remove_control_files()
+set_control({"mode": "sabotage"})
 spot.transcript.clear()
 spot.edit.setText("test sabotage")
 spot.send_agent_message()
-assert spot._harness_worker is not None
-spot._harness_worker.wait(5000)
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
 qapp.processEvents()
 
-# Run should have been refused BEFORE h.run
-assert len(Harness.run_calls) == 1, "h.run should NOT have been called when tool set mismatched"
+# Run should have been refused BEFORE task execution
 refusal_transcript = spot.transcript.toPlainText()
 assert "Refused to run: harness tool set mismatch — expected EzExp tools only, got:" in refusal_transcript, f"Refusal line missing: {refusal_transcript}"
 assert "shell" in refusal_transcript, f"Sabotaged tool 'shell' should be mentioned in refusal message: {refusal_transcript}"
-Harness.sabotage_disable = False
+assert not os.path.exists(os.path.join(fake_harness_root, "task_received.json")), "Task line must NOT have been sent on refusal"
 
-# 5. Real tool dispatch through fake harness loop
-Harness.tool_to_call_during_run = ("search_files", {"query": "test"})
+# 5. Real tool dispatch through bridge
+remove_control_files()
+set_control({
+    "mode": "happy",
+    "tool_call": {"name": "search_files", "arguments": {"query": "test"}}
+})
 spot.transcript.clear()
 spot.edit.setText("run real search")
 spot.send_agent_message()
-assert spot._harness_worker is not None
-spot._harness_worker.wait(5000)
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
 qapp.processEvents()
-assert Harness.last_tool_result is not None, "Tool should have executed"
-assert Harness.last_tool_result.ok is True, f"search_files failed: {Harness.last_tool_result}"
-assert isinstance(Harness.last_tool_result.output, str)
-Harness.tool_to_call_during_run = None
+
+tool_res_file = os.path.join(fake_harness_root, "tool_result_received.json")
+assert os.path.exists(tool_res_file), "Tool result should have been received by runner"
+with open(tool_res_file, "r", encoding="utf-8") as f:
+    tool_res = json.load(f)
+assert tool_res["ok"] is True, f"search_files failed: {tool_res}"
+assert isinstance(tool_res["output"], str)
 
 # 6. Confirmer gates create_file: Deny vs Allow
 # 6a. Deny
 spot.agent_client.confirmer = lambda text: False
 deny_rel_path = "denied_file.txt"
-Harness.tool_to_call_during_run = ("create_file", {"rel_path": deny_rel_path, "content": "should be blocked"})
+remove_control_files()
+set_control({
+    "mode": "happy",
+    "tool_call": {"name": "create_file", "arguments": {"rel_path": deny_rel_path, "content": "should be blocked"}}
+})
 spot.transcript.clear()
 spot.edit.setText("create denied file")
 spot.send_agent_message()
-assert spot._harness_worker is not None
-spot._harness_worker.wait(5000)
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
 qapp.processEvents()
 assert not os.path.exists(os.path.join(grant_temp, deny_rel_path)), "Denied file should NOT exist on disk"
-assert Harness.last_tool_result.ok is False, "Declined tool call should return ok=False"
-assert Harness.last_tool_result.error == "user declined", f"Expected 'user declined', got: {Harness.last_tool_result}"
+tool_res_file = os.path.join(fake_harness_root, "tool_result_received.json")
+with open(tool_res_file, "r", encoding="utf-8") as f:
+    tool_res = json.load(f)
+assert tool_res["ok"] is False, "Declined tool call should return ok=False"
+assert tool_res["output"] == "user declined", f"Expected 'user declined', got: {tool_res}"
 
 # 6b. Allow
 spot.agent_client.confirmer = lambda text: True
 allow_rel_path = "allowed_file.txt"
-Harness.tool_to_call_during_run = ("create_file", {"rel_path": allow_rel_path, "content": "approved content 123"})
+remove_control_files()
+set_control({
+    "mode": "happy",
+    "tool_call": {"name": "create_file", "arguments": {"rel_path": allow_rel_path, "content": "approved content 123"}}
+})
 spot.transcript.clear()
 spot.edit.setText("create allowed file")
 spot.send_agent_message()
-assert spot._harness_worker is not None
-spot._harness_worker.wait(5000)
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
 qapp.processEvents()
 allowed_full_path = os.path.join(grant_temp, allow_rel_path)
 assert os.path.exists(allowed_full_path), "Allowed file should exist on disk"
 with open(allowed_full_path, "r", encoding="utf-8") as f:
     created_content = f.read()
 assert created_content == "approved content 123", f"Created content mismatch: {created_content}"
-assert Harness.last_tool_result.ok is True, f"Expected ok=True, got: {Harness.last_tool_result}"
-Harness.tool_to_call_during_run = None
+tool_res_file = os.path.join(fake_harness_root, "tool_result_received.json")
+with open(tool_res_file, "r", encoding="utf-8") as f:
+    tool_res = json.load(f)
+assert tool_res["ok"] is True
 
-# 7. Failure honesty
-Harness.should_raise = True
+# 7. Failure honesty (Setup error)
+remove_control_files()
+set_control({"mode": "error", "error_message": "simulated harness explosion"})
 spot.transcript.clear()
 spot.edit.setText("test failure")
 spot.send_agent_message()
-assert spot._harness_worker is not None
-spot._harness_worker.wait(5000)
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
 qapp.processEvents()
 
 fail_transcript = spot.transcript.toPlainText()
@@ -1612,7 +1668,6 @@ _orig_qmessagebox_question = ez.QMessageBox.question
 
 try:
     # 8a. Cross-thread confirm returning Yes:
-    # Monkeypatch QMessageBox.question with a stub that records QThread.currentThread() and returns Yes
     def stub_question_yes(parent, title, text, *args, **kwargs):
         recorded_threads.append(ez.QThread.currentThread())
         return ez.QMessageBox.StandardButton.Yes
@@ -1669,22 +1724,32 @@ try:
     guard_res_yes = bridge.ask_from_worker("Direct UI call with stub Yes")
     assert guard_res_yes is True, f"Expected True from UI guard, got {guard_res_yes}"
 
-    # 8d. Real HarnessWorker with production bridge (no injected confirmer)
-    Harness.should_raise = False
+    # 8d. Real BridgeWorker with production bridge (no injected confirmer)
     spot.agent_client.confirmer = None
-    Harness.tool_to_call_during_run = ("create_file", {"rel_path": "bridge_approved.txt", "content": "bridge content"})
+    ez.QMessageBox.question = stub_question_yes
+    bridge_rel_path = "bridge_approved.txt"
+    remove_control_files()
+    set_control({
+        "mode": "happy",
+        "tool_call": {"name": "create_file", "arguments": {"rel_path": bridge_rel_path, "content": "bridge content"}}
+    })
     spot.transcript.clear()
     spot.edit.setText("test bridge worker")
     spot.send_agent_message()
-    assert spot._harness_worker is not None
-    while spot._harness_worker.isRunning():
+    assert spot._bridge_worker is not None
+    while spot._bridge_worker.isRunning():
         qapp.processEvents()
-    spot._harness_worker.wait(5000)
+    spot._bridge_worker.wait(5000)
     qapp.processEvents()
 
-    assert os.path.exists(os.path.join(grant_temp, "bridge_approved.txt")), "File should exist when bridge approved"
-    assert Harness.last_tool_result.ok is True
-    Harness.tool_to_call_during_run = None
+    assert os.path.exists(os.path.join(grant_temp, bridge_rel_path)), "File should exist when bridge approved"
+    with open(os.path.join(grant_temp, bridge_rel_path), "r", encoding="utf-8") as f:
+        content_br = f.read()
+    assert content_br == "bridge content"
+    tool_res_file = os.path.join(fake_harness_root, "tool_result_received.json")
+    with open(tool_res_file, "r", encoding="utf-8") as f:
+        tool_res = json.load(f)
+    assert tool_res["ok"] is True
 
 finally:
     ez.QMessageBox.question = _orig_qmessagebox_question

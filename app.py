@@ -23,6 +23,8 @@ import zlib
 import ctypes
 import threading
 import subprocess
+import queue
+import collections
 import shutil
 import sqlite3
 from collections import deque
@@ -143,26 +145,52 @@ def remove_launch_count(path):
 DEFAULT_AGENT_CONFIG = {
     "backend": "endpoint",
     "harness_path": "",
+    "harness_python": "py",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "model": "meta/llama-3.3-70b-instruct",
     "api_key": "",
     "grant_dir": "",
 }
 
+_harness_probe_cache = {}
+
+
+def clear_harness_probe_cache():
+    global _harness_probe_cache
+    _harness_probe_cache.clear()
+
 
 def harness_available(cfg=None):
+    if cfg is None:
+        cfg = load_agent_config()
+    hp = (cfg.get("harness_path") or "").strip()
+    python_bin = (cfg.get("harness_python") or "py").strip() or "py"
+    if not hp or not os.path.isdir(hp):
+        return False, f"Directory does not exist: '{hp}'" if hp else "Path is empty"
+
+    cache_key = (os.path.normcase(os.path.abspath(hp)), python_bin)
+    if cache_key in _harness_probe_cache:
+        return _harness_probe_cache[cache_key]
+
     try:
-        if cfg is None:
-            cfg = load_agent_config()
-        hp = (cfg.get("harness_path") or "").strip()
-        if hp:
-            hp_abs = os.path.abspath(hp)
-            if hp_abs not in sys.path:
-                sys.path.insert(0, hp_abs)
-        from harness import Harness
-        return True, ""
+        proc = subprocess.run(
+            [python_bin, "-c", "import harness"],
+            cwd=hp,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if proc.returncode == 0:
+            res = (True, "")
+        else:
+            stderr_lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
+            last_line = stderr_lines[-1] if stderr_lines else f"Exited with code {proc.returncode}"
+            res = (False, last_line)
     except Exception as e:
-        return False, str(e)
+        res = (False, str(e))
+
+    _harness_probe_cache[cache_key] = res
+    return res
 
 
 def agent_config_path():
@@ -249,6 +277,13 @@ class AgentSettingsDialog(QDialog):
         harness_row.addWidget(self.btn_choose_harness)
         lay.addLayout(harness_row)
 
+        self.lbl_python = QLabel("Harness Python executable:", self)
+        lay.addWidget(self.lbl_python)
+        self.edit_python = QLineEdit(self)
+        self.edit_python.setText(self.cfg.get("harness_python", "py"))
+        self.edit_python.setPlaceholderText("py")
+        lay.addWidget(self.edit_python)
+
         lbl_url = QLabel("Base URL:", self)
         self.edit_url = QLineEdit(self)
         self.edit_url.setText(self.cfg.get("base_url", ""))
@@ -304,6 +339,13 @@ class AgentSettingsDialog(QDialog):
         self.lbl_harness.setEnabled(is_harness)
         self.edit_harness.setEnabled(is_harness)
         self.btn_choose_harness.setEnabled(is_harness)
+        self.lbl_python.setEnabled(is_harness)
+        self.edit_python.setEnabled(is_harness)
+        self.lbl_harness.setVisible(is_harness)
+        self.edit_harness.setVisible(is_harness)
+        self.btn_choose_harness.setVisible(is_harness)
+        self.lbl_python.setVisible(is_harness)
+        self.edit_python.setVisible(is_harness)
 
     def _choose_harness(self):
         curr = self.edit_harness.text().strip() or os.path.expanduser("~")
@@ -321,12 +363,14 @@ class AgentSettingsDialog(QDialog):
         cfg = {
             "backend": "harness" if self.combo_backend.currentIndex() == 1 else "endpoint",
             "harness_path": self.edit_harness.text().strip(),
+            "harness_python": self.edit_python.text().strip() or "py",
             "base_url": self.edit_url.text().strip(),
             "model": self.edit_model.text().strip(),
             "api_key": self.edit_key.text().strip(),
             "grant_dir": self.edit_grant.text().strip(),
         }
         save_agent_config(cfg)
+        clear_harness_probe_cache()
         self.cfg = cfg
         self.accept()
 
@@ -5102,116 +5146,229 @@ class AgentClient(QObject):
 # Spotlight-style quick search
 # ---------------------------------------------------------------------------
 
-class HarnessWorker(QThread):
+class BridgeWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, task, grant_dir, harness_path="", client=None, bridge=None, parent=None):
+    def __init__(self, task, grant_dir, harness_path="", harness_python="py", client=None, bridge=None, parent=None):
         super().__init__(parent)
         self.task = task
         self.grant_dir = grant_dir
         self.harness_path = harness_path
+        self.harness_python = harness_python or "py"
         self.client = client
         self.bridge = bridge
+        self._proc = None
+
+    def __del__(self):
+        self._terminate_proc()
+
+    def _terminate_proc(self):
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        proc.kill()
+            except Exception:
+                pass
 
     def run(self):
         try:
-            if self.harness_path:
-                hp = os.path.abspath(self.harness_path)
-                if hp not in sys.path:
-                    sys.path.insert(0, hp)
-            from harness import Harness
-            try:
-                from harness.runtime.tools import ToolResult
-            except ImportError:
-                ToolResult = None
+            cmd = [self.harness_python, "-m", "harness.host_runner"]
+            if self.grant_dir:
+                cmd.extend(["--workspace", self.grant_dir])
 
-            # Case A: disable ALL native harness tools at construction
-            h = Harness(
-                self.grant_dir,
-                ["groq", "openrouter"],
-                None,
-                ["shell", "read_file", "write_file", "edit_file", "list_dir"],
+            self._proc = subprocess.Popen(
+                cmd,
+                cwd=self.harness_path if self.harness_path else None,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
             )
 
+            q = queue.Queue()
+            recent_stderr = collections.deque(maxlen=30)
+
+            def stdout_reader():
+                if self._proc and self._proc.stdout:
+                    for line in iter(self._proc.stdout.readline, ""):
+                        q.put(line)
+                q.put(None)
+
+            def stderr_reader():
+                if self._proc and self._proc.stderr:
+                    for line in iter(self._proc.stderr.readline, ""):
+                        recent_stderr.append(line)
+
+            t_out = threading.Thread(target=stdout_reader, daemon=True)
+            t_out.start()
+            t_err = threading.Thread(target=stderr_reader, daemon=True)
+            t_err.start()
+
+            # 1. Setup line
+            tools_manifest = []
+            for t_spec in AGENT_TOOLS:
+                fn = t_spec["function"]
+                tools_manifest.append({
+                    "name": fn["name"],
+                    "description": fn["description"],
+                    "parameters": fn["parameters"],
+                })
+
+            setup_msg = {
+                "type": "setup",
+                "providers": ["groq", "openrouter"],
+                "disable": ["shell", "read_file", "write_file", "edit_file", "list_dir"],
+                "tools": tools_manifest,
+            }
+            self._proc.stdin.write(json.dumps(setup_msg) + "\n")
+            self._proc.stdin.flush()
+
+            # 2. Read until ready (30s timeout)
+            try:
+                ready_line = q.get(timeout=30.0)
+            except queue.Empty:
+                self._terminate_proc()
+                self.failed.emit("Harness runner timed out waiting for ready (30s).")
+                return
+
+            if ready_line is None:
+                ret = self._proc.poll()
+                err_detail = "".join(recent_stderr).strip()
+                self._terminate_proc()
+                suffix = f": {err_detail}" if err_detail else f" (code {ret})"
+                self.failed.emit(f"Harness runner exited unexpectedly during setup{suffix}")
+                return
+
+            ready_line = ready_line.strip()
+            try:
+                ready_data = json.loads(ready_line)
+            except Exception:
+                self._terminate_proc()
+                self.failed.emit(f"Protocol error: invalid ready line: {ready_line}")
+                return
+
+            if ready_data.get("type") == "error":
+                self._terminate_proc()
+                self.failed.emit(ready_data.get("message", "Runner initialization error"))
+                return
+
+            if ready_data.get("type") != "ready":
+                self._terminate_proc()
+                self.failed.emit(f"Protocol error: expected 'ready', got '{ready_data.get('type')}'")
+                return
+
+            # Fail closed assertion
+            expected_names = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
+            actual_names = sorted(ready_data.get("tools", []))
+            if actual_names != expected_names:
+                msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {actual_names}."
+                self._terminate_proc()
+                self.failed.emit(msg)
+                return
+
+            # 3. Write task line
+            task_msg = {"type": "task", "text": self.task}
+            self._proc.stdin.write(json.dumps(task_msg) + "\n")
+            self._proc.stdin.flush()
+
+            # 4. Wire client bridge
             client = self.client if self.client is not None else AgentClient(config=load_agent_config())
             orig_bridge = getattr(client, "confirm_bridge", None)
             if self.bridge is not None:
                 client.confirm_bridge = self.bridge
 
             try:
-                def make_tool_fn(tool_name):
-                    def tool_fn(**kwargs):
-                        res = client.dispatch_tool(tool_name, kwargs)
-                        if ToolResult is not None:
+                while True:
+                    try:
+                        line = q.get(timeout=180.0)
+                    except queue.Empty:
+                        self.failed.emit("Harness runner timed out during task execution.")
+                        break
+
+                    if line is None:
+                        ret = self._proc.poll()
+                        err_detail = "".join(recent_stderr).strip()
+                        suffix = f": {err_detail}" if err_detail else f" (code {ret})"
+                        self.failed.emit(f"Harness runner exited unexpectedly{suffix}")
+                        break
+
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        self.failed.emit(f"Protocol error: malformed JSON from runner: {line[:200]}")
+                        break
+
+                    m_type = msg.get("type")
+                    if m_type == "tool_call":
+                        t_id = msg.get("id")
+                        t_name = msg.get("name")
+                        t_args = msg.get("arguments", {})
+                        try:
+                            res = client.dispatch_tool(t_name, t_args)
                             if isinstance(res, str) and (res.startswith("Error:") or res == "user declined"):
-                                return ToolResult(ok=False, error=res)
-                            return ToolResult(ok=True, output=str(res))
-                        return res
-                    return tool_fn
+                                ok = False
+                                out = res
+                            else:
+                                ok = True
+                                out = str(res)
+                        except Exception as ex:
+                            ok = False
+                            out = f"Error: {str(ex)}"
 
-                for t in AGENT_TOOLS:
-                    fn_spec = t["function"]
-                    t_name = fn_spec["name"]
-                    t_desc = fn_spec["description"]
-                    t_params = fn_spec["parameters"]
-                    h.register_tool(
-                        name=t_name,
-                        description=t_desc,
-                        parameters=t_params,
-                        func=make_tool_fn(t_name),
-                    )
+                        res_msg = {
+                            "type": "tool_result",
+                            "id": t_id,
+                            "ok": ok,
+                            "output": out,
+                        }
+                        self._proc.stdin.write(json.dumps(res_msg) + "\n")
+                        self._proc.stdin.flush()
 
-                expected_names = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
-                actual_names = sorted(h.tool_names())
-                if actual_names != expected_names:
-                    msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {actual_names}."
-                    self.failed.emit(msg)
-                    return
+                    elif m_type == "final":
+                        text = msg.get("text", "")
+                        parts = []
+                        tokens = msg.get("tokens")
+                        if tokens is not None:
+                            parts.append(f"Tokens: {tokens}")
+                        ms = msg.get("ms")
+                        if ms is not None:
+                            parts.append(f"Time: {ms}ms")
+                        if parts:
+                            final_text = f"{text}\n[{', '.join(parts)}]"
+                        else:
+                            final_text = text
+                        self.done.emit(final_text)
+                        break
 
-                run_kwargs = {"mode": "pipeline"}
-                llm = getattr(client, "llm_client", None)
-                if llm is not None:
-                    run_kwargs["llm_client"] = llm
-                res = h.run(self.task, **run_kwargs)
+                    elif m_type == "error":
+                        self.failed.emit(msg.get("message", "Unknown runner error"))
+                        break
+
+                    else:
+                        self.failed.emit(f"Protocol error: unexpected message '{m_type}'")
+                        break
             finally:
                 client.confirm_bridge = orig_bridge
 
-            if isinstance(res, str):
-                final_text = res
-            elif hasattr(res, "output_markdown") and res.output_markdown:
-                final_text = res.output_markdown
-            elif hasattr(res, "output") and res.output:
-                final_text = res.output
-            elif hasattr(res, "final_text") and res.final_text:
-                final_text = res.final_text
-            elif hasattr(res, "text") and res.text:
-                final_text = res.text
-            else:
-                final_text = str(res)
-
-            # Budget / usage data
-            parts = []
-            tokens = getattr(res, "atp_burned", None)
-            if tokens is None:
-                tokens = getattr(res, "tokens", None)
-            if tokens is not None:
-                parts.append(f"Tokens: {tokens}")
-
-            latency = getattr(res, "total_cycle_latency_ms", None)
-            if latency is None:
-                latency = getattr(res, "duration_sec", None)
-                if latency is not None:
-                    parts.append(f"Time: {latency}s")
-            else:
-                parts.append(f"Time: {latency}ms")
-
-            if parts:
-                final_text = f"{final_text}\n[{', '.join(parts)}]"
-
-            self.done.emit(final_text)
         except Exception as e:
             self.failed.emit(str(e))
+        finally:
+            self._terminate_proc()
+
+
+HarnessWorker = BridgeWorker
 
 
 class Spotlight(FramelessWindow):
@@ -5306,7 +5463,7 @@ class Spotlight(FramelessWindow):
         self.agent_client.agent_text.connect(self.on_agent_text)
         self.agent_client.agent_error.connect(self.on_agent_error)
         self.agent_messages = []
-        self._harness_worker = None
+        self._bridge_worker = None
         self._harness_banner_shown = False
 
     def _open_endpoint(self):
@@ -5318,6 +5475,7 @@ class Spotlight(FramelessWindow):
     def set_mode(self, mode):
         self.mode = mode
         if mode == "agent":
+            clear_harness_probe_cache()
             self.btn_search.setChecked(False)
             self.btn_agent.setChecked(True)
             self.tree.hide()
@@ -5378,22 +5536,31 @@ class Spotlight(FramelessWindow):
             self.agent_messages.append({"role": "user", "content": text})
             grant_dir = (cfg.get("grant_dir") or "").strip()
             hp = (cfg.get("harness_path") or "").strip()
-            self._start_harness_task(text, grant_dir, hp)
+            hpython = (cfg.get("harness_python") or "py").strip() or "py"
+            self._start_harness_task(text, grant_dir, hp, hpython)
         else:
             self.edit.clear()
             self.transcript.appendPlainText(f"You: {text}\n")
             self.agent_messages.append({"role": "user", "content": text})
             self.agent_client.send(self.agent_messages)
 
-    def _start_harness_task(self, text, grant_dir, harness_path=""):
+    @property
+    def _harness_worker(self):
+        return self._bridge_worker
+
+    @_harness_worker.setter
+    def _harness_worker(self, val):
+        self._bridge_worker = val
+
+    def _start_harness_task(self, text, grant_dir, harness_path="", harness_python="py"):
         self.edit.setEnabled(False)
         self.foot.setText("  Agent working…      Esc  Close  ")
-        self._harness_worker = HarnessWorker(
-            text, grant_dir, harness_path, client=self.agent_client, bridge=self.confirm_bridge, parent=self
+        self._bridge_worker = BridgeWorker(
+            text, grant_dir, harness_path, harness_python, client=self.agent_client, bridge=self.confirm_bridge, parent=self
         )
-        self._harness_worker.done.connect(self._on_harness_done)
-        self._harness_worker.failed.connect(self._on_harness_failed)
-        self._harness_worker.start()
+        self._bridge_worker.done.connect(self._on_harness_done)
+        self._bridge_worker.failed.connect(self._on_harness_failed)
+        self._bridge_worker.start()
 
     def _on_harness_done(self, final_text):
         self.edit.setEnabled(True)
