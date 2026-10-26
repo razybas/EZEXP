@@ -4,3 +4,7 @@ build/
 dist/
 *.db
 ezexp.ico
+agent.json
+.env
+*.key
+

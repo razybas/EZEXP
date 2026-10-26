@@ -695,6 +695,214 @@ try:
 finally:
     win.start_indexer = _orig_start5
 
+# ===========================================================================
+# Part E tests: Agent mode in Spotlight (LOCAL ONLY, stub server, no network)
+# ===========================================================================
+import json
+import http.server
+
+# 1. .gitignore contains agent.json, .env, *.key
+repo_root = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(repo_root, ".gitignore"), "r", encoding="utf-8") as f:
+    gi_text = f.read()
+assert "agent.json" in gi_text, "agent.json missing from .gitignore"
+assert ".env" in gi_text, ".env missing from .gitignore"
+assert "*.key" in gi_text, "*.key missing from .gitignore"
+
+# 2. Config round-trip
+_orig_app_dir = ez.APP_DIR
+_test_cfg_dir = os.path.join(tmp, "agent_cfg_test")
+os.makedirs(_test_cfg_dir, exist_ok=True)
+ez.APP_DIR = _test_cfg_dir
+try:
+    # Defaults load when no file exists
+    defaults = ez.load_agent_config()
+    expected_defaults = {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "model": "meta/llama-3.3-70b-instruct",
+        "api_key": "",
+        "grant_dir": "",
+    }
+    assert defaults == expected_defaults, f"Expected {expected_defaults}, got {defaults}"
+
+    # Save a config, load it back, assert equality
+    test_cfg = {
+        "base_url": "http://127.0.0.1:5555/v1",
+        "model": "meta/llama-test",
+        "api_key": "local-test-key",
+        "grant_dir": _test_cfg_dir,
+    }
+    ez.save_agent_config(test_cfg)
+    loaded = ez.load_agent_config()
+    assert loaded == test_cfg, f"Expected {test_cfg}, got {loaded}"
+
+    # Corrupt JSON -> defaults without raising
+    with open(ez.agent_config_path(), "w", encoding="utf-8") as f:
+        f.write("corrupted JSON {[{")
+    assert ez.load_agent_config() == expected_defaults
+finally:
+    ez.APP_DIR = _orig_app_dir
+
+# 3. Grant gates
+# create_file with no grant -> error
+client_no_grant = ez.AgentClient(config={"grant_dir": "", "api_key": "dummy"})
+res = client_no_grant.dispatch_tool("create_file", {"rel_path": "foo.txt", "content": "bar"})
+assert "error" in res.lower() or "no grant" in res.lower(), f"Expected error, got: {res}"
+
+# with a grant but ../escape.txt -> error
+grant_test_dir = os.path.join(tmp, "grant_sandbox")
+os.makedirs(grant_test_dir, exist_ok=True)
+client_grant = ez.AgentClient(config={"grant_dir": grant_test_dir, "api_key": "dummy"})
+res_esc = client_grant.dispatch_tool("create_file", {"rel_path": "../escape.txt", "content": "bar"})
+assert "error" in res_esc.lower() or "escape" in res_esc.lower(), f"Expected escape error, got: {res_esc}"
+assert not os.path.exists(os.path.join(grant_test_dir, "../escape.txt"))
+
+# inside the grant with confirmer stubbed to False -> no file, "declined" returned
+client_declined = ez.AgentClient(
+    config={"grant_dir": grant_test_dir, "api_key": "dummy"},
+    confirmer=lambda txt: False,
+)
+res_dec = client_declined.dispatch_tool("create_file", {"rel_path": "declined.txt", "content": "bar"})
+assert "declined" in res_dec.lower(), f"Expected 'declined', got: {res_dec}"
+assert not os.path.exists(os.path.join(grant_test_dir, "declined.txt"))
+
+# inside the grant with confirmer stubbed to True -> file exists on disk
+client_ok = ez.AgentClient(
+    config={"grant_dir": grant_test_dir, "api_key": "dummy"},
+    confirmer=lambda txt: True,
+)
+res_ok = client_ok.dispatch_tool("create_file", {"rel_path": "sub/ok.txt", "content": "hello disk"})
+target_ok = os.path.join(grant_test_dir, "sub", "ok.txt")
+assert os.path.isfile(target_ok), f"Expected file on disk at {target_ok}"
+assert os.path.realpath(res_ok) == os.path.realpath(target_ok)
+with open(target_ok, "r", encoding="utf-8") as f:
+    assert f.read() == "hello disk"
+
+# create_folder tests
+res_fld = client_ok.dispatch_tool("create_folder", {"rel_path": "my_sub_dir"})
+target_fld = os.path.join(grant_test_dir, "my_sub_dir")
+assert os.path.isdir(target_fld), f"Expected directory at {target_fld}"
+# refuse if already exists
+res_exist = client_ok.dispatch_tool("create_file", {"rel_path": "sub/ok.txt", "content": "new"})
+assert "error" in res_exist.lower() or "already exists" in res_exist.lower()
+
+# 4. Client against a stub server (http.server on 127.0.0.1)
+stub_requests = []
+stub_final_reply = "I found your meeting notes in the catalog."
+
+class StubServerHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        len_hdr = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(len_hdr)
+        req_json = json.loads(body.decode("utf-8"))
+        stub_requests.append(req_json)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+
+        if len(stub_requests) == 1:
+            # (a) First: tool_calls response asking for search_files
+            resp = {
+                "id": "chatcmpl-test-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_search_notes",
+                            "type": "function",
+                            "function": {
+                                "name": "search_files",
+                                "arguments": json.dumps({"query": "meeting"})
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }
+        else:
+            # (b) Then: final text reply
+            resp = {
+                "id": "chatcmpl-test-2",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": stub_final_reply
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+        self.wfile.write(json.dumps(resp).encode("utf-8"))
+
+httpd = http.server.HTTPServer(("127.0.0.1", 0), StubServerHandler)
+server_port = httpd.server_port
+t_server = threading.Thread(target=httpd.serve_forever, daemon=True)
+t_server.start()
+
+try:
+    # Point Spotlight's agent client to the stub server
+    spot.agent_client.config = {
+        "base_url": f"http://127.0.0.1:{server_port}/v1",
+        "model": "meta/llama-3.3-70b-instruct",
+        "api_key": "stub-test-key",
+        "grant_dir": grant_test_dir,
+    }
+    # Switch Spotlight to Agent mode
+    spot.set_mode("agent")
+    assert spot.mode == "agent"
+    assert not spot.transcript.isHidden()
+    assert spot.tree.isHidden()
+    assert "Send" in spot.foot.text()
+    assert not spot.btn_endpoint.isHidden()
+
+    spot.transcript.clear()
+    spot.edit.setText("Please find the meeting notes")
+
+    # Drive one user message and wait for agent reply
+    loop = QEventLoop()
+    spot.agent_client.agent_text.connect(lambda txt: loop.quit())
+    spot.agent_client.agent_error.connect(lambda err: loop.quit())
+    QTimer.singleShot(8000, loop.quit)
+
+    spot.send_agent_message()
+    loop.exec()
+
+    # Assert transcript ends with stub's final text
+    actual_transcript = spot.transcript.toPlainText().strip()
+    assert actual_transcript.endswith(stub_final_reply), (
+        f"Transcript did not end with '{stub_final_reply}'. Full transcript:\n{actual_transcript}"
+    )
+
+    # Assert tool actually ran against the test catalog
+    assert len(stub_requests) >= 2, f"Expected 2 HTTP requests to stub, got {len(stub_requests)}"
+    round_2_messages = stub_requests[1]["messages"]
+    tool_msgs = [m for m in round_2_messages if m.get("role") == "tool"]
+    assert len(tool_msgs) >= 1, f"Expected tool message in round 2: {round_2_messages}"
+    tool_content = tool_msgs[0].get("content", "")
+    assert "meeting-notes.txt" in tool_content, (
+        f"Tool should have run against test catalog and found 'meeting-notes.txt', got:\n{tool_content}"
+    )
+
+    # Verify opening Spotlight resets it to Search mode
+    spot.open_spotlight()
+    assert spot.mode == "search"
+    assert not spot.tree.isHidden()
+    assert spot.transcript.isHidden()
+    assert spot.btn_endpoint.isHidden()
+    assert "Open" in spot.foot.text()
+    spot.hide()
+finally:
+    httpd.shutdown()
+    httpd.server_close()
+
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")

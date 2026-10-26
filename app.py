@@ -32,6 +32,7 @@ from PySide6.QtCore import (
     Qt, QFileInfo, QTimer, QThread, QUrl, QSize, QPointF, QRectF, QLineF,
     QMimeData,
     QEvent, QSettings, Signal, QAbstractNativeEventFilter, QLockFile,
+    QByteArray, QObject,
 )
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient,
@@ -45,7 +46,10 @@ from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QStyle,
     QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QDialog, QPlainTextEdit,
+)
+from PySide6.QtNetwork import (
+    QNetworkAccessManager, QNetworkRequest, QNetworkReply,
 )
 
 if sys.platform != "win32":
@@ -128,6 +132,125 @@ def remove_launch_count(path):
          if p.lower() != path.lower()}
     s.setValue("launch_counts", json.dumps(d))
     s.sync()
+
+
+# ---------------------------------------------------------------------------
+# Agent configuration (agent.json in APP_DIR)
+# ---------------------------------------------------------------------------
+
+DEFAULT_AGENT_CONFIG = {
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "model": "meta/llama-3.3-70b-instruct",
+    "api_key": "",
+    "grant_dir": "",
+}
+
+
+def agent_config_path():
+    return os.path.join(APP_DIR, "agent.json")
+
+
+def load_agent_config():
+    cfg = dict(DEFAULT_AGENT_CONFIG)
+    p = agent_config_path()
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception:
+            pass
+    return cfg
+
+
+def save_agent_config(cfg):
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        full_cfg = dict(DEFAULT_AGENT_CONFIG)
+        if isinstance(cfg, dict):
+            full_cfg.update(cfg)
+        with open(agent_config_path(), "w", encoding="utf-8") as fh:
+            json.dump(full_cfg, fh, indent=2)
+    except Exception:
+        pass
+
+
+class AgentSettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Agent Endpoint Settings")
+        self.setMinimumWidth(440)
+        self.cfg = load_agent_config()
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(18, 18, 18, 18)
+
+        lbl_url = QLabel("Base URL:", self)
+        self.edit_url = QLineEdit(self)
+        self.edit_url.setText(self.cfg.get("base_url", ""))
+        self.edit_url.setPlaceholderText("https://integrate.api.nvidia.com/v1")
+        lay.addWidget(lbl_url)
+        lay.addWidget(self.edit_url)
+
+        lbl_model = QLabel("Model:", self)
+        self.edit_model = QLineEdit(self)
+        self.edit_model.setText(self.cfg.get("model", ""))
+        self.edit_model.setPlaceholderText("meta/llama-3.3-70b-instruct")
+        lay.addWidget(lbl_model)
+        lay.addWidget(self.edit_model)
+
+        lbl_key = QLabel("API key:", self)
+        self.edit_key = QLineEdit(self)
+        self.edit_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_key.setText(self.cfg.get("api_key", ""))
+        self.edit_key.setPlaceholderText("API key (stored locally only)")
+        lay.addWidget(lbl_key)
+        lay.addWidget(self.edit_key)
+
+        lbl_grant = QLabel("Grant folder (agent write sandbox):", self)
+        lay.addWidget(lbl_grant)
+        grant_row = QHBoxLayout()
+        self.edit_grant = QLineEdit(self)
+        self.edit_grant.setText(self.cfg.get("grant_dir", ""))
+        self.edit_grant.setPlaceholderText("Folder where agent is allowed to create files")
+        btn_choose = QPushButton("Choose…", self)
+        btn_choose.clicked.connect(self._choose_grant)
+        grant_row.addWidget(self.edit_grant, 1)
+        grant_row.addWidget(btn_choose)
+        lay.addLayout(grant_row)
+
+        lay.addSpacing(6)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Cancel", self)
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Save", self)
+        btn_save.setObjectName("btnPrimary")
+        btn_save.clicked.connect(self._on_save)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
+        lay.addLayout(btn_row)
+
+    def _choose_grant(self):
+        curr = self.edit_grant.text().strip() or os.path.expanduser("~")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose Grant Folder", curr)
+        if chosen:
+            self.edit_grant.setText(os.path.normpath(chosen))
+
+    def _on_save(self):
+        cfg = {
+            "base_url": self.edit_url.text().strip(),
+            "model": self.edit_model.text().strip(),
+            "api_key": self.edit_key.text().strip(),
+            "grant_dir": self.edit_grant.text().strip(),
+        }
+        save_agent_config(cfg)
+        self.cfg = cfg
+        self.accept()
+
 
 ACCENT = "#0a84ff"
 TEXT = "#1d1d1f"
@@ -4442,6 +4565,356 @@ class DetailsPane(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# Agent prompt, tools & client
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = (
+    "You are EzExp Agent, a desktop assistant with file tools.\n"
+    "Available tools:\n"
+    "- search_files(query, limit=25): search files in the local PC catalog.\n"
+    "- list_folder(path): list direct children in a directory.\n"
+    "- open_file(path): open a file using its default application.\n"
+    "- create_file(rel_path, content): create a new file in the granted folder.\n"
+    "- create_folder(rel_path): create a new folder in the granted folder.\n\n"
+    "Rules:\n"
+    "1. Grant rule: you may only create files inside the granted folder; if none is granted, say so.\n"
+    "2. Honesty rule: never invent a path — call search_files or list_folder first; report tool errors verbatim."
+)
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Search files in the PC catalog by query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Filename or keyword query to search for",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of search results to return (default: 25)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_folder",
+            "description": "List files and folders directly inside a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path of folder to list",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_file",
+            "description": "Open a file with the system default application.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to open",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": "Create a file with content inside the granted folder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {
+                        "type": "string",
+                        "description": "Relative path inside the granted folder",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to write to the file",
+                    },
+                },
+                "required": ["rel_path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_folder",
+            "description": "Create a folder inside the granted folder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {
+                        "type": "string",
+                        "description": "Relative path inside the granted folder",
+                    },
+                },
+                "required": ["rel_path"],
+            },
+        },
+    },
+]
+
+
+class AgentClient(QObject):
+    agent_text = Signal(str)
+    agent_error = Signal(str)
+
+    def __init__(self, parent=None, config=None, confirmer=None):
+        super().__init__(parent)
+        self.nam = QNetworkAccessManager(self)
+        self.config = config
+        self.confirmer = confirmer
+        self._current_reply = None
+
+    def _confirm_action(self, text: str) -> bool:
+        if self.confirmer is not None:
+            return bool(self.confirmer(text))
+        ret = QMessageBox.question(
+            None,
+            "Agent Permission Request",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return ret == QMessageBox.StandardButton.Yes
+
+    def send(self, messages):
+        try:
+            cfg = self.config if self.config is not None else load_agent_config()
+            api_key = (cfg.get("api_key") or "").strip()
+            base_url = (cfg.get("base_url") or "").strip().rstrip("/")
+            model = (cfg.get("model") or "").strip() or "meta/llama-3.3-70b-instruct"
+
+            if not api_key:
+                self.agent_error.emit("Missing API key. Please configure your API key in Endpoint settings.")
+                return
+            if not base_url:
+                self.agent_error.emit("Missing Base URL. Please configure the endpoint in Endpoint settings.")
+                return
+
+            if isinstance(messages, str):
+                msgs = [{"role": "user", "content": messages}]
+            else:
+                msgs = list(messages)
+
+            if not msgs or msgs[0].get("role") != "system":
+                msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+
+            self._send_round(msgs, 0, base_url, model, api_key)
+        except Exception as e:
+            self.agent_error.emit(f"Send failed: {e}")
+
+    def _send_round(self, messages, round_count, base_url, model, api_key):
+        if round_count >= 6:
+            self.agent_error.emit("Tool round limit reached (max 6 rounds).")
+            return
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "tools": AGENT_TOOLS,
+        }
+        body = json.dumps(payload).encode("utf-8")
+
+        url = f"{base_url}/chat/completions"
+        req = QNetworkRequest(QUrl(url))
+        req.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        req.setRawHeader(b"Authorization", QByteArray(f"Bearer {api_key}".encode("utf-8")))
+
+        reply = self.nam.post(req, body)
+        self._current_reply = reply
+        reply.finished.connect(
+            lambda: self._on_reply(reply, messages, round_count, base_url, model, api_key)
+        )
+
+    def _on_reply(self, reply, messages, round_count, base_url, model, api_key):
+        try:
+            err = reply.error()
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            raw = bytes(reply.readAll())
+            reply.deleteLater()
+            if self._current_reply == reply:
+                self._current_reply = None
+
+            if err != QNetworkReply.NetworkError.NoError or (status is not None and status >= 400):
+                body_excerpt = raw[:200].decode("utf-8", "replace")
+                if status:
+                    self.agent_error.emit(f"HTTP {status}: {body_excerpt}")
+                else:
+                    self.agent_error.emit(f"Network error: {reply.errorString()} {body_excerpt}")
+                return
+
+            try:
+                resp = json.loads(raw.decode("utf-8"))
+            except Exception as e:
+                self.agent_error.emit(f"Bad JSON response: {e}")
+                return
+
+            choices = resp.get("choices")
+            if not choices or not isinstance(choices, list):
+                self.agent_error.emit("No choices returned in API response.")
+                return
+
+            choice = choices[0]
+            msg = choice.get("message", {})
+            tool_calls = msg.get("tool_calls")
+
+            if tool_calls and isinstance(tool_calls, list):
+                messages.append(msg)
+                for tc in tool_calls:
+                    call_id = tc.get("id", "")
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name", "")
+                    fn_args = fn.get("arguments", "{}")
+                    tool_result = self.dispatch_tool(fn_name, fn_args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": fn_name,
+                        "content": str(tool_result),
+                    })
+                self._send_round(messages, round_count + 1, base_url, model, api_key)
+            else:
+                content = msg.get("content") or ""
+                self.agent_text.emit(content)
+        except Exception as ex:
+            self.agent_error.emit(f"Client error: {ex}")
+
+    def dispatch_tool(self, name, args):
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+
+        if name == "search_files":
+            query = args.get("query", "")
+            limit = args.get("limit", 25)
+            try:
+                limit = int(limit)
+            except (TypeError, ValueError):
+                limit = 25
+            rows, _ = do_search(thread_conn(), query, None, "all", limit)
+            if not rows:
+                return "No files found."
+            return "\n".join(f"{r['name']} — {r['parent']} ({r.get('kind', '')})" for r in rows)
+        elif name == "list_folder":
+            path = args.get("path", "")
+            rows, _ = do_search(thread_conn(), "", place=path, limit=100)
+            if not rows:
+                return "No files found."
+            return "\n".join(f"{r['name']} — {r['parent']} ({r.get('kind', '')})" for r in rows)
+        elif name == "open_file":
+            path = args.get("path", "")
+            try:
+                os.startfile(path)
+                return "opened"
+            except OSError as e:
+                return str(e)
+        elif name == "create_file":
+            return self._tool_create_file(args.get("rel_path", ""), args.get("content", ""))
+        elif name == "create_folder":
+            return self._tool_create_folder(args.get("rel_path", ""))
+        else:
+            return f"Error: Unknown tool '{name}'"
+
+    def _tool_create_file(self, rel_path, content):
+        cfg = self.config if self.config is not None else load_agent_config()
+        grant_dir = (cfg.get("grant_dir") or "").strip()
+        if not grant_dir:
+            return "Error: grant_dir is not configured."
+        if not rel_path or not str(rel_path).strip():
+            return "Error: rel_path cannot be empty."
+        rel_path = str(rel_path).strip()
+        if os.path.isabs(rel_path) or rel_path.startswith("/") or rel_path.startswith("\\") or re.match(r"^[a-zA-Z]:", rel_path):
+            return "Error: Path escapes granted folder (absolute paths not allowed)."
+        norm_grant = os.path.realpath(os.path.abspath(grant_dir))
+        norm_target = os.path.realpath(os.path.abspath(os.path.join(norm_grant, rel_path)))
+        try:
+            common = os.path.commonpath([norm_grant, norm_target])
+        except ValueError:
+            return "Error: Path escapes granted folder."
+        if common.lower() != norm_grant.lower() or norm_target.lower() == norm_grant.lower():
+            return "Error: Path escapes granted folder."
+        parts = [p for p in re.split(r"[\\/]", rel_path) if p]
+        if ".." in parts:
+            return "Error: Path escapes granted folder."
+        if os.path.exists(norm_target):
+            return f"Error: Target already exists: {norm_target}"
+
+        confirm_text = f"Create file at:\n{norm_target}\nContent length: {len(content)} characters.\nAllow?"
+        if not self._confirm_action(confirm_text):
+            return "user declined"
+
+        try:
+            os.makedirs(os.path.dirname(norm_target), exist_ok=True)
+            with open(norm_target, "x", encoding="utf-8") as f:
+                f.write(content)
+            return norm_target
+        except Exception as e:
+            return f"Error: Failed to create file: {e}"
+
+    def _tool_create_folder(self, rel_path):
+        cfg = self.config if self.config is not None else load_agent_config()
+        grant_dir = (cfg.get("grant_dir") or "").strip()
+        if not grant_dir:
+            return "Error: grant_dir is not configured."
+        if not rel_path or not str(rel_path).strip():
+            return "Error: rel_path cannot be empty."
+        rel_path = str(rel_path).strip()
+        if os.path.isabs(rel_path) or rel_path.startswith("/") or rel_path.startswith("\\") or re.match(r"^[a-zA-Z]:", rel_path):
+            return "Error: Path escapes granted folder (absolute paths not allowed)."
+        norm_grant = os.path.realpath(os.path.abspath(grant_dir))
+        norm_target = os.path.realpath(os.path.abspath(os.path.join(norm_grant, rel_path)))
+        try:
+            common = os.path.commonpath([norm_grant, norm_target])
+        except ValueError:
+            return "Error: Path escapes granted folder."
+        if common.lower() != norm_grant.lower() or norm_target.lower() == norm_grant.lower():
+            return "Error: Path escapes granted folder."
+        parts = [p for p in re.split(r"[\\/]", rel_path) if p]
+        if ".." in parts:
+            return "Error: Path escapes granted folder."
+        if os.path.exists(norm_target):
+            return f"Error: Target already exists: {norm_target}"
+
+        confirm_text = f"Create folder at:\n{norm_target}\nAllow?"
+        if not self._confirm_action(confirm_text):
+            return "user declined"
+
+        try:
+            os.makedirs(norm_target, exist_ok=False)
+            return norm_target
+        except Exception as e:
+            return f"Error: Failed to create folder: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Spotlight-style quick search
 # ---------------------------------------------------------------------------
 
@@ -4462,6 +4935,35 @@ class Spotlight(FramelessWindow):
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
+
+        # Mode selector chips & Endpoint button
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(18, 12, 18, 0)
+        mode_row.setSpacing(6)
+
+        self.btn_search = QPushButton("Search", panel)
+        self.btn_search.setCheckable(True)
+        self.btn_search.setChecked(True)
+        self.btn_search.setObjectName("spotModeBtn")
+        self.btn_search.clicked.connect(lambda: self.set_mode("search"))
+        mode_row.addWidget(self.btn_search)
+
+        self.btn_agent = QPushButton("Agent", panel)
+        self.btn_agent.setCheckable(True)
+        self.btn_agent.setChecked(False)
+        self.btn_agent.setObjectName("spotModeBtn")
+        self.btn_agent.clicked.connect(lambda: self.set_mode("agent"))
+        mode_row.addWidget(self.btn_agent)
+
+        mode_row.addStretch(1)
+
+        self.btn_endpoint = QPushButton("Endpoint…", panel)
+        self.btn_endpoint.setObjectName("spotEndpointBtn")
+        self.btn_endpoint.clicked.connect(self._open_endpoint)
+        self.btn_endpoint.hide()
+        mode_row.addWidget(self.btn_endpoint)
+
+        lay.addLayout(mode_row)
 
         srow = QHBoxLayout()
         srow.setContentsMargins(18, 14, 18, 14)
@@ -4486,18 +4988,78 @@ class Spotlight(FramelessWindow):
         self.tree.setItemDelegateForColumn(0, SpotDelegate(self.tree))
         lay.addWidget(self.tree, 1)
 
-        foot = QLabel("  ⏎  Open      Ctrl ⏎  Show in Folder      Esc  Close  ", panel)
-        foot.setObjectName("spotFooter")
-        foot.setFixedHeight(34)
-        lay.addWidget(foot)
+        self.transcript = QPlainTextEdit(panel)
+        self.transcript.setObjectName("spotTranscript")
+        self.transcript.setReadOnly(True)
+        self.transcript.hide()
+        lay.addWidget(self.transcript, 1)
+
+        self.foot = QLabel("  ⏎  Open      Ctrl ⏎  Show in Folder      Esc  Close  ", panel)
+        self.foot.setObjectName("spotFooter")
+        self.foot.setFixedHeight(34)
+        lay.addWidget(self.foot)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(panel)
         self.resize(self.W, self.H)
 
+        self.mode = "search"
+        self.agent_client = AgentClient(self)
+        self.agent_client.agent_text.connect(self.on_agent_text)
+        self.agent_client.agent_error.connect(self.on_agent_error)
+        self.agent_messages = []
+
+    def _open_endpoint(self):
+        dlg = AgentSettingsDialog(self)
+        dlg.exec()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        if mode == "agent":
+            self.btn_search.setChecked(False)
+            self.btn_agent.setChecked(True)
+            self.tree.hide()
+            self.transcript.show()
+            self.btn_endpoint.show()
+            self.foot.setText("  ⏎  Send      Esc  Close  ")
+            self.edit.setPlaceholderText("Ask the agent...")
+            cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+            if not (cfg.get("api_key") or "").strip():
+                if not self.transcript.toPlainText().strip():
+                    self.transcript.appendPlainText(
+                        "Setup required: No API key configured. Click 'Endpoint…' above to configure your OpenAI-compatible endpoint and API key."
+                    )
+        else:
+            self.btn_search.setChecked(True)
+            self.btn_agent.setChecked(False)
+            self.transcript.hide()
+            self.tree.show()
+            self.btn_endpoint.hide()
+            self.foot.setText("  ⏎  Open      Ctrl ⏎  Show in Folder      Esc  Close  ")
+            self.edit.setPlaceholderText("Search your entire PC")
+
     def on_text(self, text):
-        self.spot_seq = self.worker.submit(text, None, "all")
+        if self.mode == "search":
+            self.spot_seq = self.worker.submit(text, None, "all")
+
+    def on_agent_text(self, text):
+        if text:
+            self.transcript.appendPlainText(text)
+            self.agent_messages.append({"role": "assistant", "content": text})
+
+    def on_agent_error(self, err):
+        if err:
+            self.transcript.appendPlainText(f"Error: {err}")
+
+    def send_agent_message(self):
+        text = self.edit.text().strip()
+        if not text:
+            return
+        self.edit.clear()
+        self.transcript.appendPlainText(f"You: {text}\n")
+        self.agent_messages.append({"role": "user", "content": text})
+        self.agent_client.send(self.agent_messages)
 
     def on_results(self, seq, q, rows, note):
         if seq != self.spot_seq:
@@ -4554,6 +5116,9 @@ class Spotlight(FramelessWindow):
             self.hide()
             return
         if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self.mode == "agent":
+                self.send_agent_message()
+                return
             row = self.current_row()
             if row:
                 path = join_path(row["parent"], row["name"])
@@ -4577,11 +5142,13 @@ class Spotlight(FramelessWindow):
                     self.hide()
             return
         if e.key() == Qt.Key_Down:
-            self._move_sel(1)
-            return
+            if self.mode == "search":
+                self._move_sel(1)
+                return
         if e.key() == Qt.Key_Up:
-            self._move_sel(-1)
-            return
+            if self.mode == "search":
+                self._move_sel(-1)
+                return
         super().keyPressEvent(e)
 
     def _move_sel(self, delta):
@@ -4601,6 +5168,7 @@ class Spotlight(FramelessWindow):
             self.tree.setCurrentItem(item)
 
     def open_spotlight(self):
+        self.set_mode("search")
         self.edit.clear()
         self.spot_seq = self.worker.submit("", None, "all")
         scr = QGuiApplication.primaryScreen().availableGeometry()
@@ -4791,6 +5359,14 @@ QPushButton#dots:hover { background: #e0e0e6; }
 #spotInput { font-size: 20px; border: none; background: transparent; }
 #spotFooter { color: #86868b; font-size: 12px; border-top: 1px solid #ececf0;
     background: #fafafa; border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+QPushButton#spotModeBtn { background: #f1f1f4; border: none; border-radius: 999px;
+    padding: 3px 12px; font-size: 12px; color: #3a3a3c; }
+QPushButton#spotModeBtn:hover:!checked { background: #e8e8ed; }
+QPushButton#spotModeBtn:checked { background: #0a84ff; color: #ffffff; font-weight: 500; }
+QPushButton#spotEndpointBtn { background: #f1f1f4; border: none; border-radius: 8px;
+    padding: 3px 10px; font-size: 11px; color: #6e6e73; }
+QPushButton#spotEndpointBtn:hover { background: #e8e8ed; color: #1d1d1f; }
+#spotTranscript { background: #ffffff; border: none; padding: 12px 18px; font-size: 13px; color: #1d1d1f; }
 
 QMenu { background: #ffffff; border: 1px solid #e3e3e8; border-radius: 10px; padding: 5px; }
 QMenu::item { padding: 6px 24px 6px 12px; border-radius: 6px; background: transparent; }
