@@ -695,6 +695,31 @@ try:
 finally:
     win.start_indexer = _orig_start5
 
+# --- HotkeyFilter: nativeEventFilter receives WM_HOTKEY ---
+import ctypes  # noqa: E402
+from ctypes import wintypes  # noqa: E402
+from PySide6.QtCore import QByteArray  # noqa: E402
+
+hotkey_events = []
+filt = ez.HotkeyFilter(lambda: hotkey_events.append(1))
+
+msg = wintypes.MSG()
+msg.message = 0x0312  # WM_HOTKEY
+msg.wParam = 0xB00B   # HOTKEY_ID
+
+filt.nativeEventFilter(QByteArray(b"windows_generic_MSG"), ctypes.addressof(msg))
+assert len(hotkey_events) == 1, f"Expected 1 hotkey fire, got {len(hotkey_events)}"
+
+# Negative 1: same call with msg.wParam = 0x1234 -> no additional fire
+msg.wParam = 0x1234
+filt.nativeEventFilter(QByteArray(b"windows_generic_MSG"), ctypes.addressof(msg))
+assert len(hotkey_events) == 1, f"Expected 1 hotkey fire, got {len(hotkey_events)}"
+
+# Negative 2: same call with event type QByteArray(b"windows_dbt_DEVICEARRIVAL") -> no additional fire
+msg.wParam = 0xB00B
+filt.nativeEventFilter(QByteArray(b"windows_dbt_DEVICEARRIVAL"), ctypes.addressof(msg))
+assert len(hotkey_events) == 1, f"Expected 1 hotkey fire, got {len(hotkey_events)}"
+
 # ===========================================================================
 # Part E tests: Agent mode in Spotlight (LOCAL ONLY, stub server, no network)
 # ===========================================================================
