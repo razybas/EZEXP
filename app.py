@@ -4486,7 +4486,7 @@ class Spotlight(FramelessWindow):
         self.tree.setItemDelegateForColumn(0, SpotDelegate(self.tree))
         lay.addWidget(self.tree, 1)
 
-        foot = QLabel("  ⏎  Open      Ctrl ⏎  Show in Folder      Esc  Close  ", panel)
+        foot = QLabel("  ⏎  Open      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ", panel)
         foot.setObjectName("spotFooter")
         foot.setFixedHeight(34)
         lay.addWidget(foot)
@@ -4504,10 +4504,51 @@ class Spotlight(FramelessWindow):
             return
         self.tree.clear()
         if not q.strip():
-            rows = rows[:8]
-            if rows:
+            manual = get_quicklaunch()
+            existing = set()
+            candidates = []
+            for p in manual:
+                np = os.path.normpath(p)
+                if np.lower() not in existing:
+                    existing.add(np.lower())
+                    candidates.append(np)
+            counts = get_launch_counts()
+            frequent = sorted(
+                (p for p in counts.keys() if os.path.normpath(p).lower() not in existing),
+                key=lambda p: -counts[p],
+            )
+            for p in frequent:
+                np = os.path.normpath(p)
+                if np.lower() not in existing:
+                    existing.add(np.lower())
+                    candidates.append(np)
+
+            ql_rows = []
+            conn = thread_conn()
+            for p in candidates:
+                p_lookup = p
+                if len(p_lookup) == 3 and p_lookup[1:3] == ":\\":
+                    p_lookup = p_lookup[:2]
+                parent, name = split_path(p_lookup)
+                cur = conn.execute(
+                    "SELECT " + ROW_FIELDS + " FROM files WHERE parent = ? COLLATE NOCASE AND name = ? COLLATE NOCASE LIMIT 1",
+                    (parent, name),
+                )
+                r = cur.fetchone()
+                if r:
+                    ql_rows.append(_row_dict(r))
+                    if len(ql_rows) == 8:
+                        break
+
+            if ql_rows:
+                self.tree.addTopLevelItem(self._header("Quick Launch"))
+                for r in ql_rows:
+                    self.tree.addTopLevelItem(self._item(r))
+
+            recent_rows = rows[:8]
+            if recent_rows:
                 self.tree.addTopLevelItem(self._header("Recent"))
-                for r in rows:
+                for r in recent_rows:
                     self.tree.addTopLevelItem(self._item(r))
             return
         if not rows:
@@ -4515,18 +4556,51 @@ class Spotlight(FramelessWindow):
             item.setFlags(Qt.NoItemFlags)
             self.tree.addTopLevelItem(item)
             return
-        self.tree.addTopLevelItem(self._header("Top Hit"))
-        self.tree.addTopLevelItem(self._item(rows[0]))
-        groups = [("folder", "Folders"), ("doc", "Documents"), ("img", "Images"),
-                  ("vid", "Video"), ("aud", "Audio"), ("zip", "Archives"),
-                  ("code", "Code"), ("other", "Other")]
-        rest = rows[1:]
-        for cat, label in groups:
-            hits = [r for r in rest if r["category"] == cat][:3]
-            if hits:
-                self.tree.addTopLevelItem(self._header(label))
-                for r in hits:
-                    self.tree.addTopLevelItem(self._item(r))
+
+        def row_path_norm(r):
+            p = join_path(r["parent"], r["name"])
+            if len(p) == 2 and p[1] == ":":
+                p += "\\"
+            return os.path.normpath(p).lower()
+
+        pins_set = {os.path.normpath(p).lower() for p in get_quicklaunch()}
+        counts_map = {os.path.normpath(p).lower(): c for p, c in get_launch_counts().items()}
+
+        launchables = []
+        launchable_paths = set()
+        for r in rows:
+            p_norm = row_path_norm(r)
+            if p_norm in launchable_paths:
+                continue
+            name_lower = r["name"].lower()
+            if name_lower.endswith(".lnk") or name_lower.endswith(".exe"):
+                parent_norm = "\\" + r["parent"].strip("\\").lower() + "\\"
+                if ("\\start menu\\" in parent_norm or "\\programs\\" in parent_norm or
+                        p_norm in pins_set or counts_map.get(p_norm, 0) > 0):
+                    launchable_paths.add(p_norm)
+                    launchables.append(r)
+                    if len(launchables) == 5:
+                        break
+
+        if launchables:
+            self.tree.addTopLevelItem(self._header("Apps"))
+            for r in launchables:
+                self.tree.addTopLevelItem(self._item(r))
+
+        remaining = [r for r in rows if row_path_norm(r) not in launchable_paths]
+        if remaining:
+            self.tree.addTopLevelItem(self._header("Top Hit"))
+            self.tree.addTopLevelItem(self._item(remaining[0]))
+            groups = [("folder", "Folders"), ("doc", "Documents"), ("img", "Images"),
+                      ("vid", "Video"), ("aud", "Audio"), ("zip", "Archives"),
+                      ("code", "Code"), ("other", "Other")]
+            rest = remaining[1:]
+            for cat, label in groups:
+                hits = [r for r in rest if r["category"] == cat][:3]
+                if hits:
+                    self.tree.addTopLevelItem(self._header(label))
+                    for r in hits:
+                        self.tree.addTopLevelItem(self._item(r))
         self.tree.setCurrentItem(self.tree.topLevelItem(1))
 
     def _header(self, text):
@@ -4562,7 +4636,7 @@ class Spotlight(FramelessWindow):
                 if e.modifiers() & Qt.ControlModifier:
                     reveal_in_explorer(path)
                     self.hide()
-                elif row["is_dir"]:
+                elif e.modifiers() & Qt.AltModifier:
                     if self.main is not None:
                         self.main.show()
                         self.main.raise_()
