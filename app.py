@@ -5150,7 +5150,7 @@ class BridgeWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, task, grant_dir, harness_path="", harness_python="py", client=None, bridge=None, parent=None):
+    def __init__(self, task, grant_dir, harness_path="", harness_python="py", client=None, bridge=None, parent=None, mode="pipeline"):
         super().__init__(parent)
         self.task = task
         self.grant_dir = grant_dir
@@ -5158,6 +5158,7 @@ class BridgeWorker(QThread):
         self.harness_python = harness_python or "py"
         self.client = client
         self.bridge = bridge
+        self.mode = mode or "pipeline"
         self._proc = None
 
     def __del__(self):
@@ -5275,7 +5276,7 @@ class BridgeWorker(QThread):
                 return
 
             # 3. Write task line
-            task_msg = {"type": "task", "text": self.task}
+            task_msg = {"type": "task", "text": self.task, "mode": self.mode}
             self._proc.stdin.write(json.dumps(task_msg) + "\n")
             self._proc.stdin.flush()
 
@@ -5552,11 +5553,11 @@ class Spotlight(FramelessWindow):
     def _harness_worker(self, val):
         self._bridge_worker = val
 
-    def _start_harness_task(self, text, grant_dir, harness_path="", harness_python="py"):
+    def _start_harness_task(self, text, grant_dir, harness_path="", harness_python="py", mode="pipeline"):
         self.edit.setEnabled(False)
         self.foot.setText("  Agent working…      Esc  Close  ")
         self._bridge_worker = BridgeWorker(
-            text, grant_dir, harness_path, harness_python, client=self.agent_client, bridge=self.confirm_bridge, parent=self
+            text, grant_dir, harness_path, harness_python, client=self.agent_client, bridge=self.confirm_bridge, parent=self, mode=mode
         )
         self._bridge_worker.done.connect(self._on_harness_done)
         self._bridge_worker.failed.connect(self._on_harness_failed)

@@ -1275,6 +1275,10 @@ def main():
     if not line:
         return
     task_msg = json.loads(line)
+    if task_msg.get("mode") != "pipeline":
+        sys.stdout.write(json.dumps({"type": "error", "message": f"Expected mode pipeline, got {task_msg.get('mode')}"}) + "\n")
+        sys.stdout.flush()
+        sys.exit(1)
     with open(os.path.join(root, "task_received.json"), "w", encoding="utf-8") as f:
         json.dump(task_msg, f)
 
@@ -1544,6 +1548,7 @@ assert os.path.exists(task_file), "Runner should have received task"
 with open(task_file, "r", encoding="utf-8") as f:
     task_data = json.load(f)
 assert task_data["text"] == "hello harness"
+assert task_data.get("mode") == "pipeline", f"Expected mode 'pipeline', got {task_data.get('mode')}"
 
 # Verify transcript
 transcript_txt = spot.transcript.toPlainText()
