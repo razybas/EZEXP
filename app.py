@@ -63,7 +63,7 @@ if sys.platform != "win32":
     sys.exit(1)
 
 APP_NAME = "EzExp"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_DIR = DB_DIR = os.environ.get(
     "EZEXP_DB_DIR",
     os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "EzExp"),
@@ -5760,7 +5760,7 @@ class Spotlight(FramelessWindow):
     def toggle_workspace_pane(self, checked=None):
         """Toggle visibility of the IDE-style workspace pane."""
         if checked is None:
-            new_vis = not self.workspace_pane.isVisible()
+            new_vis = self.workspace_pane.isHidden()
         else:
             new_vis = bool(checked)
         self.workspace_pane.setVisible(new_vis)

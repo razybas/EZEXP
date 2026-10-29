@@ -166,7 +166,7 @@ follows the current tab:
 - **Crash log**: if anything ever goes wrong, the traceback is
   appended to `%LOCALAPPDATA%\EzExp\error.log` — send that file with
   a bug report.
-- **Version**: 1.0.0 (stamped into the exe's file properties).
+- **Version**: 1.1.0 (stamped into the exe's file properties).
 
 ## How it works
 
