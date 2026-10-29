@@ -14,6 +14,9 @@ os.environ["EZEXP_NO_AUTOSCAN"] = "1"
 sys.path.insert(0, r"D:\exp\ezexp")
 
 import app as ez  # noqa: E402
+_test_settings = ez.QSettings('ezexp', 'EzExp')
+_test_settings.remove('agent_dock_visible')
+_test_settings.sync()
 
 # --- fake "drive" tree ------------------------------------------------------
 data = os.path.join(tmp, "data")
@@ -2036,23 +2039,50 @@ lines2 = [l.strip() for l in after_send2.splitlines() if l.strip()]
 assert len(lines2) == 1, f"Expected 1 line after send 2 (deduped), got {len(lines2)}: {lines2}"
 assert lines2[0] == lines1[0]
 
-# 6. Step 3: IDE-style workspace pane tests
+# 6. Step 2 (v1.2): Spotlight cleanup check (NO workspace pane / splitter)
 ws_spot = ez.Spotlight(worker)
 ws_spot.set_mode("agent")
-assert not ws_spot.workspace_pane.isHidden(), "Workspace pane should be visible initially in agent mode"
-assert not ws_spot.agent_splitter.isHidden(), "Agent splitter should be visible in agent mode"
-assert ws_spot.btn_toggle_workspace.isChecked(), "Workspace toggle button should be checked"
+assert not hasattr(ws_spot, "workspace_pane"), "Spotlight must not have workspace_pane"
+assert not hasattr(ws_spot, "agent_splitter"), "Spotlight must not have agent_splitter"
+assert not hasattr(ws_spot, "btn_toggle_workspace"), "Spotlight must not have btn_toggle_workspace"
+assert not ws_spot.transcript.isHidden(), "Spotlight transcript should be visible in agent mode"
+ws_spot.set_mode("search")
+assert ws_spot.transcript.isHidden()
+assert not ws_spot.tree.isHidden()
 
-# Test toggle collapse/expand
-ws_spot.toggle_workspace_pane()
-assert ws_spot.workspace_pane.isHidden(), "Workspace pane should be hidden after toggle"
-assert not ws_spot.btn_toggle_workspace.isChecked()
-ws_spot.toggle_workspace_pane()
-assert not ws_spot.workspace_pane.isHidden(), "Workspace pane should be visible after toggle back"
-assert ws_spot.btn_toggle_workspace.isChecked()
+# 7. Step 2 (v1.2): MainWindow Agent dock & workspace tests
+main_win = ez.MainWindow(worker)
+main_win.show()
 
-# Setup test workspace grant folder
-test_ws_grant = tempfile.mkdtemp(prefix="ezexp_ws_test_")
+# (a) Dock exists in MainWindow, hidden by default; toggle shows/hides it
+assert main_win.agent_dock is not None, "agent_dock must exist in MainWindow"
+# Fresh settings simulation
+ez.QSettings("ezexp", "EzExp").setValue("agent_dock_visible", "false")
+main_win.agent_dock.hide()
+main_win.btn_toggle_agent.setChecked(False)
+assert main_win.agent_dock.isHidden(), "agent_dock should be hidden by default"
+
+main_win.btn_toggle_agent.click()
+assert not main_win.agent_dock.isHidden(), "agent_dock should be visible after toggle click"
+assert main_win.btn_toggle_agent.isChecked()
+
+main_win.btn_toggle_agent.click()
+assert main_win.agent_dock.isHidden(), "agent_dock should be hidden after toggle click again"
+assert not main_win.btn_toggle_agent.isChecked()
+
+# Re-open dock for workspace tests
+main_win.toggle_agent_dock(True)
+assert not main_win.agent_dock.isHidden()
+
+# (b) Navigating to a folder updates the dock's Context label to that folder
+main_win.drill_to_path(r"D:\exp\test_nav_dir", "test_nav_dir")
+assert "D:\\exp\\test_nav_dir" in main_win.ws_lbl_context.text(), f"Context not updated: {main_win.ws_lbl_context.text()}"
+
+main_win.current_place = r"D:\games\gta 5"
+assert "D:\\games\\gta 5" in main_win.ws_lbl_context.text(), f"Context not updated: {main_win.ws_lbl_context.text()}"
+
+# (c) Grant table lists files; text preview shows content; binary shows the note
+test_ws_grant = tempfile.mkdtemp(prefix="ezexp_dock_ws_")
 f_txt = os.path.join(test_ws_grant, "sample.txt")
 with open(f_txt, "w", encoding="utf-8") as fh:
     fh.write("Hello from sample text file")
@@ -2065,61 +2095,83 @@ f_big = os.path.join(test_ws_grant, "large.txt")
 with open(f_big, "w", encoding="utf-8") as fh:
     fh.write("A" * (250 * 1024))
 
-ws_spot.agent_client.config = {"grant_dir": test_ws_grant}
-ws_spot.grant_dir = test_ws_grant
-ws_spot.current_folder = r"D:\exp"
-ws_spot.refresh_workspace_pane()
+main_win.agent_client.config = {"grant_dir": test_ws_grant}
+main_win.grant_dir = test_ws_grant
+main_win.refresh_workspace_pane()
 
-# (a) Header labels check
-assert "Context: D:\\exp" in ws_spot.ws_lbl_context.text(), f"Context mismatch: {ws_spot.ws_lbl_context.text()}"
-assert test_ws_grant in ws_spot.ws_lbl_grant.text(), f"Grant mismatch: {ws_spot.ws_lbl_grant.text()}"
+# Context & Grant labels
+assert "Context: D:\\games\\gta 5" in main_win.ws_lbl_context.text()
+assert test_ws_grant in main_win.ws_lbl_grant.text()
 
-# (b) File list check
-assert ws_spot.ws_file_list.rowCount() == 3, f"Expected 3 rows, got {ws_spot.ws_file_list.rowCount()}"
-listed_names = [ws_spot.ws_file_list.item(r, 0).text() for r in range(ws_spot.ws_file_list.rowCount())]
+# File list
+assert main_win.ws_file_list.rowCount() == 3, f"Expected 3 rows, got {main_win.ws_file_list.rowCount()}"
+listed_names = [main_win.ws_file_list.item(r, 0).text() for r in range(main_win.ws_file_list.rowCount())]
 assert "sample.txt" in listed_names
 assert "binary.dat" in listed_names
 assert "large.txt" in listed_names
 
-# (c) Preview checks
 # Text preview
 sample_row = listed_names.index("sample.txt")
-ws_spot.ws_file_list.selectRow(sample_row)
-ws_spot._on_ws_file_selected()
-assert ws_spot.ws_preview.toPlainText() == "Hello from sample text file", f"Preview text mismatch: {ws_spot.ws_preview.toPlainText()}"
+main_win.ws_file_list.selectRow(sample_row)
+main_win._on_ws_file_selected()
+assert main_win.ws_preview.toPlainText() == "Hello from sample text file"
 
 # Binary preview -> note
 bin_row = listed_names.index("binary.dat")
-ws_spot.ws_file_list.selectRow(bin_row)
-ws_spot._on_ws_file_selected()
-assert ws_spot.ws_preview.toPlainText() == "binary or too large to preview", f"Expected binary note, got: {ws_spot.ws_preview.toPlainText()}"
+main_win.ws_file_list.selectRow(bin_row)
+main_win._on_ws_file_selected()
+assert main_win.ws_preview.toPlainText() == "binary or too large to preview"
 
 # Oversize preview (>200 KB) -> note
 big_row = listed_names.index("large.txt")
-ws_spot.ws_file_list.selectRow(big_row)
-ws_spot._on_ws_file_selected()
-assert ws_spot.ws_preview.toPlainText() == "binary or too large to preview", f"Expected large file note, got: {ws_spot.ws_preview.toPlainText()}"
+main_win.ws_file_list.selectRow(big_row)
+main_win._on_ws_file_selected()
+assert main_win.ws_preview.toPlainText() == "binary or too large to preview"
 
-# Refresh picks up newly created file
+# Refresh button picks up newly created file
 f_new = os.path.join(test_ws_grant, "added_later.py")
 with open(f_new, "w", encoding="utf-8") as fh:
     fh.write("print('new code')")
 
-ws_spot.ws_btn_refresh.click()
-assert ws_spot.ws_file_list.rowCount() == 4, f"Expected 4 rows after refresh, got {ws_spot.ws_file_list.rowCount()}"
-updated_names = [ws_spot.ws_file_list.item(r, 0).text() for r in range(ws_spot.ws_file_list.rowCount())]
+main_win.ws_btn_refresh.click()
+assert main_win.ws_file_list.rowCount() == 4
+updated_names = [main_win.ws_file_list.item(r, 0).text() for r in range(main_win.ws_file_list.rowCount())]
 assert "added_later.py" in updated_names
 new_row = updated_names.index("added_later.py")
-ws_spot.ws_file_list.selectRow(new_row)
-ws_spot._on_ws_file_selected()
-assert ws_spot.ws_preview.toPlainText() == "print('new code')", f"New file preview mismatch: {ws_spot.ws_preview.toPlainText()}"
+main_win.ws_file_list.selectRow(new_row)
+main_win._on_ws_file_selected()
+assert main_win.ws_preview.toPlainText() == "print('new code')"
 
-# Switching back to search mode hides workspace pane & splitter
-ws_spot.set_mode("search")
-assert ws_spot.agent_splitter.isHidden()
-assert ws_spot.transcript.isHidden()
-assert not ws_spot.tree.isHidden()
+# (d) Task sent from the dock carries context.current_folder = the navigated folder
+remove_control_files()
+set_control({"mode": "happy"})
+main_win.agent_client.config = {
+    "backend": "harness",
+    "harness_path": fake_harness_root,
+    "harness_python": "py",
+    "grant_dir": test_ws_grant,
+}
+main_win.current_place = r"D:\games\gta 5"
+main_win.dock_transcript.clear()
+main_win.dock_input.setText("test folder context from dock")
+main_win.send_agent_message()
 
+t0 = time.time()
+while main_win._harness_worker is not None and main_win._harness_worker.isRunning():
+    qapp.processEvents()
+    time.sleep(0.05)
+    if time.time() - t0 > 10:
+        break
+
+task_file = os.path.join(fake_harness_root, "task_received.json")
+assert os.path.exists(task_file), "Runner should have received task from dock"
+with open(task_file, "r", encoding="utf-8") as f:
+    task_data_dock = json.load(f)
+assert task_data_dock.get("context") == {"current_folder": os.path.abspath(r"D:\games\gta 5")}, f"Unexpected context from dock: {task_data_dock.get('context')}"
+assert "test folder context from dock" in task_data_dock.get("text", "")
+
+_test_settings.remove('agent_dock_visible')
+_test_settings.sync()
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")

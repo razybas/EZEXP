@@ -14,11 +14,15 @@ from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QPixmap, QShortcut,
     QDesktopServices, QGuiApplication
 )
+import datetime
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QMenu, QMessageBox, QFileDialog, QWidget,
-    QInputDialog
+    QInputDialog, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QSplitter, QPlainTextEdit, QDialog
 )
+from ezexp.agent import AgentClient, BridgeWorker, ConfirmBridge, AgentSettingsDialog
+from ezexp.agent_config import load_agent_config, agent_status
 
 from ezexp import APP_NAME
 from ezexp.fsutil import (
@@ -69,7 +73,7 @@ class MainWindow(FramelessWindow):
         self.links_progress.connect(self.on_links_progress)
         self.links_done.connect(self.on_links_done)
         self.view_seq = 0
-        self.current_place = None
+        self._current_place = None
         self.current_place_name = "All Files"
         self.current_cat = "all"
         self.current_rows = []
@@ -90,6 +94,27 @@ class MainWindow(FramelessWindow):
         self.titlebar = TitleBar(self, with_search=True)
         self.titlebar.search.edit.textChanged.connect(self.on_search_changed)
         root.addWidget(self.titlebar)
+
+        self.btn_toggle_agent = QPushButton("Agent", self.titlebar)
+        self.btn_toggle_agent.setObjectName("btnToggleAgent")
+        self.btn_toggle_agent.setCheckable(True)
+        self.btn_toggle_agent.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_agent.setFixedHeight(28)
+        self.btn_toggle_agent.setStyleSheet(
+            "QPushButton#btnToggleAgent { background: #e8e8ed; border: none; border-radius: 6px; padding: 0 10px; font-size: 12px; font-weight: 500; color: #1d1d1f; }"
+            "QPushButton#btnToggleAgent:checked { background: #0a84ff; color: #ffffff; }"
+            "QPushButton#btnToggleAgent:hover:!checked { background: #dedee3; }"
+        )
+        self.btn_toggle_agent.clicked.connect(self.toggle_agent_dock)
+        self.titlebar.layout().addWidget(self.btn_toggle_agent)
+
+        self.agent_client = AgentClient(self)
+        self.agent_client.agent_text.connect(self._on_agent_text)
+        self.agent_client.agent_error.connect(self._on_agent_error)
+        self.confirm_bridge = ConfirmBridge(self)
+        self.agent_messages = []
+        self._bridge_worker = None
+        self._harness_banner_shown = False
 
         self._history = []
         self.titlebar.btn_back.clicked.connect(self.go_back)
@@ -182,6 +207,133 @@ class MainWindow(FramelessWindow):
         # ---- details pane ----
         self.details = DetailsPane(self)
         body.addWidget(self.details)
+
+        # ---- agent dock (extreme right) ----
+        self.agent_dock = QFrame(self)
+        self.agent_dock.setObjectName("agentDock")
+        self.agent_dock.setFixedWidth(340)
+        self.agent_dock.setStyleSheet("#agentDock { background: #fafafc; border-left: 1px solid #ececf0; }")
+        dock_lay = QVBoxLayout(self.agent_dock)
+        dock_lay.setContentsMargins(8, 8, 8, 8)
+        dock_lay.setSpacing(6)
+
+        dock_header = QHBoxLayout()
+        self.agent_status_lbl = QLabel(self.agent_dock)
+        self.agent_status_lbl.setObjectName("agentStatusLbl")
+        self.agent_status_lbl.setStyleSheet("font-size: 11px; color: #6e6e73;")
+        dock_header.addWidget(self.agent_status_lbl, 1)
+
+        self.btn_endpoint = QPushButton("Endpoint…", self.agent_dock)
+        self.btn_endpoint.setObjectName("btnEndpoint")
+        self.btn_endpoint.setCursor(Qt.PointingHandCursor)
+        self.btn_endpoint.clicked.connect(self._open_endpoint)
+        dock_header.addWidget(self.btn_endpoint)
+        dock_lay.addLayout(dock_header)
+
+        self.agent_splitter = QSplitter(Qt.Orientation.Vertical, self.agent_dock)
+        self.agent_splitter.setObjectName("agentSplitter")
+
+        chat_container = QWidget(self.agent_splitter)
+        chat_lay = QVBoxLayout(chat_container)
+        chat_lay.setContentsMargins(0, 0, 0, 0)
+        chat_lay.setSpacing(6)
+
+        self.dock_transcript = QPlainTextEdit(chat_container)
+        self.dock_transcript.setObjectName("dockTranscript")
+        self.dock_transcript.setReadOnly(True)
+        chat_lay.addWidget(self.dock_transcript, 1)
+
+        input_row = QHBoxLayout()
+        self.dock_input = QLineEdit(chat_container)
+        self.dock_input.setObjectName("dockInput")
+        self.dock_input.setPlaceholderText("Ask the agent…")
+        self.dock_input.returnPressed.connect(self.send_agent_message)
+        input_row.addWidget(self.dock_input, 1)
+
+        self.dock_btn_send = QPushButton("Send", chat_container)
+        self.dock_btn_send.setObjectName("dockBtnSend")
+        self.dock_btn_send.clicked.connect(self.send_agent_message)
+        input_row.addWidget(self.dock_btn_send)
+        chat_lay.addLayout(input_row)
+
+        self.agent_splitter.addWidget(chat_container)
+
+        self.workspace_pane = QFrame(self.agent_splitter)
+        self.workspace_pane.setObjectName("workspacePane")
+        ws_lay = QVBoxLayout(self.workspace_pane)
+        ws_lay.setContentsMargins(0, 6, 0, 0)
+        ws_lay.setSpacing(6)
+
+        ws_header_row = QHBoxLayout()
+        ws_title = QLabel("Workspace", self.workspace_pane)
+        ws_title.setObjectName("wsTitle")
+        ws_title.setStyleSheet("font-weight: 600; font-size: 12px; color: #1d1d1f;")
+        ws_header_row.addWidget(ws_title)
+        ws_header_row.addStretch(1)
+
+        self.ws_btn_refresh = QPushButton("Refresh", self.workspace_pane)
+        self.ws_btn_refresh.setObjectName("wsBtnRefresh")
+        self.ws_btn_refresh.clicked.connect(self.refresh_workspace_pane)
+        ws_header_row.addWidget(self.ws_btn_refresh)
+        ws_lay.addLayout(ws_header_row)
+
+        self.ws_lbl_context = QLabel("Context: (none)", self.workspace_pane)
+        self.ws_lbl_context.setObjectName("wsLblContext")
+        self.ws_lbl_context.setStyleSheet("font-size: 11px; color: #6e6e73;")
+        self.ws_lbl_context.setWordWrap(True)
+        ws_lay.addWidget(self.ws_lbl_context)
+
+        self.ws_lbl_grant = QLabel("Grant: (none)", self.workspace_pane)
+        self.ws_lbl_grant.setObjectName("wsLblGrant")
+        self.ws_lbl_grant.setStyleSheet("font-size: 11px; color: #6e6e73;")
+        self.ws_lbl_grant.setWordWrap(True)
+        ws_lay.addWidget(self.ws_lbl_grant)
+
+        self.ws_file_list = QTableWidget(self.workspace_pane)
+        self.ws_file_list.setObjectName("wsFileList")
+        self.ws_file_list.setColumnCount(3)
+        self.ws_file_list.setHorizontalHeaderLabels(["Name", "Size", "Modified"])
+        self.ws_file_list.horizontalHeader().setStretchLastSection(True)
+        self.ws_file_list.verticalHeader().setVisible(False)
+        self.ws_file_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.ws_file_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ws_file_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.ws_file_list.itemSelectionChanged.connect(self._on_ws_file_selected)
+        ws_lay.addWidget(self.ws_file_list, 1)
+
+        self.ws_preview = QPlainTextEdit(self.workspace_pane)
+        self.ws_preview.setObjectName("wsPreview")
+        self.ws_preview.setReadOnly(True)
+        self.ws_preview.setPlaceholderText("Select a file to preview…")
+        self.ws_preview.setMaximumHeight(140)
+        ws_lay.addWidget(self.ws_preview, 1)
+
+        self.agent_splitter.addWidget(self.workspace_pane)
+        self.agent_splitter.setSizes([260, 260])
+
+        dock_lay.addWidget(self.agent_splitter, 1)
+        body.addWidget(self.agent_dock)
+
+        # Convenient aliases on self.agent_dock
+        self.agent_dock.ws_lbl_context = self.ws_lbl_context
+        self.agent_dock.ws_lbl_grant = self.ws_lbl_grant
+        self.agent_dock.ws_file_list = self.ws_file_list
+        self.agent_dock.ws_preview = self.ws_preview
+        self.agent_dock.ws_btn_refresh = self.ws_btn_refresh
+        self.agent_dock.dock_transcript = self.dock_transcript
+        self.agent_dock.transcript = self.dock_transcript
+        self.agent_dock.dock_input = self.dock_input
+        self.agent_dock.input = self.dock_input
+        self.agent_dock.dock_btn_send = self.dock_btn_send
+
+        # Restore visibility from settings (default hidden on fresh install)
+        saved_vis = QSettings("ezexp", "EzExp").value("agent_dock_visible", "false")
+        init_vis = (saved_vis is True or str(saved_vis).lower() in ("true", "1"))
+        self.agent_dock.setVisible(init_vis)
+        self.btn_toggle_agent.setChecked(init_vis)
+        if init_vis:
+            self.refresh_workspace_pane()
+            self.update_agent_status()
 
         # ---- status bar ----
         self.status_bar = QFrame(self)
@@ -1151,6 +1303,210 @@ class MainWindow(FramelessWindow):
         rebuild = self._index_pending
         self._index_pending = None
         QTimer.singleShot(400, lambda: self.start_indexer(rebuild))
+
+    @property
+    def current_place(self):
+        return self._current_place
+
+    @current_place.setter
+    def current_place(self, val):
+        self._current_place = val
+        if hasattr(self, "ws_lbl_context"):
+            cur = self.get_current_folder()
+            self.ws_lbl_context.setText(f"Context: {cur}" if cur else "Context: (none)")
+
+    def toggle_agent_dock(self, checked=None):
+        if checked is None:
+            new_vis = self.agent_dock.isHidden()
+        else:
+            new_vis = bool(checked)
+        self.agent_dock.setVisible(new_vis)
+        self.btn_toggle_agent.setChecked(new_vis)
+        QSettings("ezexp", "EzExp").setValue("agent_dock_visible", "true" if new_vis else "false")
+        if new_vis:
+            self.refresh_workspace_pane()
+            self.update_agent_status()
+
+    def update_agent_status(self):
+        cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+        ready, status_msg = agent_status(cfg)
+        self.agent_status_lbl.setText(status_msg or "")
+
+    def _open_endpoint(self):
+        dlg = AgentSettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.agent_client.config = load_agent_config()
+            self.update_agent_status()
+            self.refresh_workspace_pane()
+
+    def get_current_folder(self):
+        if hasattr(self, "_current_folder_override") and self._current_folder_override is not None:
+            return os.path.abspath(self._current_folder_override) if self._current_folder_override else None
+        if getattr(self, "_current_place", None):
+            return os.path.abspath(self._current_place)
+        cf = getattr(self, "current_folder", None)
+        return os.path.abspath(cf) if cf else None
+
+    @property
+    def _harness_worker(self):
+        return self._bridge_worker
+
+    @_harness_worker.setter
+    def _harness_worker(self, val):
+        self._bridge_worker = val
+
+    def send_agent_message(self):
+        if self._harness_worker is not None and self._harness_worker.isRunning():
+            return
+        text = self.dock_input.text().strip()
+        if not text:
+            return
+        cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+        ready, status_msg = agent_status(cfg)
+        if not ready:
+            if status_msg:
+                self.dock_transcript.appendPlainText(status_msg + "\n")
+            return
+
+        backend = (cfg.get("backend") or "endpoint").lower()
+        if backend == "harness":
+            self.dock_input.clear()
+            if not self._harness_banner_shown:
+                self.dock_transcript.appendPlainText(
+                    "Tools: EzExp catalog + grant tools via the harness (native harness tools disabled).\n"
+                )
+                self._harness_banner_shown = True
+            self.dock_transcript.appendPlainText(f"You: {text}\n")
+            self.agent_messages.append({"role": "user", "content": text})
+            grant_dir = (cfg.get("grant_dir") or "").strip()
+            hp = (cfg.get("harness_path") or "").strip()
+            hpython = (cfg.get("harness_python") or "py").strip() or "py"
+            cur_folder = self.get_current_folder()
+            self._start_harness_task(text, grant_dir, hp, hpython, mode="single", current_folder=cur_folder)
+        else:
+            self.dock_input.clear()
+            self.dock_transcript.appendPlainText(f"You: {text}\n")
+            self.agent_messages.append({"role": "user", "content": text})
+            self.agent_client.send(self.agent_messages)
+
+    def _start_harness_task(self, text, grant_dir, harness_path="", harness_python="py", mode="single", current_folder=None):
+        self.dock_input.setEnabled(False)
+        self.dock_btn_send.setEnabled(False)
+        if current_folder is None:
+            current_folder = self.get_current_folder()
+        self._bridge_worker = BridgeWorker(
+            text, grant_dir, harness_path, harness_python, client=self.agent_client, bridge=self.confirm_bridge, parent=self, mode=mode, current_folder=current_folder
+        )
+        self._bridge_worker.done.connect(self._on_harness_done)
+        self._bridge_worker.failed.connect(self._on_harness_failed)
+        self._bridge_worker.start()
+
+    def _on_harness_done(self, final_text):
+        self.dock_input.setEnabled(True)
+        self.dock_btn_send.setEnabled(True)
+        self.dock_input.setFocus()
+        if final_text:
+            self.dock_transcript.appendPlainText(final_text + "\n")
+            self.agent_messages.append({"role": "assistant", "content": final_text})
+        self.refresh_workspace_pane()
+
+    def _on_harness_failed(self, err_text):
+        self.dock_input.setEnabled(True)
+        self.dock_btn_send.setEnabled(True)
+        self.dock_input.setFocus()
+        self.dock_transcript.appendPlainText(f"Error: {err_text}\n")
+        self.refresh_workspace_pane()
+
+    def _on_agent_text(self, text):
+        if text:
+            self.dock_transcript.appendPlainText(text)
+            self.agent_messages.append({"role": "assistant", "content": text})
+            self.refresh_workspace_pane()
+
+    def _on_agent_error(self, err):
+        if err:
+            self.dock_transcript.appendPlainText(f"Error: {err}\n")
+
+    def refresh_workspace_pane(self):
+        """Update context/grant labels and refresh file list from grant_dir."""
+        cur_folder = self.get_current_folder()
+        self.ws_lbl_context.setText(f"Context: {cur_folder}" if cur_folder else "Context: (none)")
+
+        cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+        grant_dir = (cfg.get("grant_dir") or "").strip() or getattr(self, "grant_dir", None) or ""
+        self.ws_lbl_grant.setText(f"Grant: {grant_dir}" if grant_dir else "Grant: (none)")
+
+        self.ws_file_list.setRowCount(0)
+        self.ws_preview.clear()
+
+        if not grant_dir or not os.path.isdir(grant_dir):
+            return
+
+        try:
+            entries = list(os.scandir(grant_dir))
+            entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
+
+            self.ws_file_list.setRowCount(len(entries))
+            for row_idx, entry in enumerate(entries):
+                try:
+                    stat = entry.stat()
+                    size_str = f"{stat.st_size:,} B" if not entry.is_dir() else "<DIR>"
+                    mtime_str = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    size_str = "—"
+                    mtime_str = "—"
+
+                item_name = QTableWidgetItem(entry.name)
+                item_name.setData(Qt.ItemDataRole.UserRole, entry.path)
+                item_size = QTableWidgetItem(size_str)
+                item_mtime = QTableWidgetItem(mtime_str)
+
+                self.ws_file_list.setItem(row_idx, 0, item_name)
+                self.ws_file_list.setItem(row_idx, 1, item_size)
+                self.ws_file_list.setItem(row_idx, 2, item_mtime)
+        except Exception:
+            pass
+
+    def _on_ws_file_selected(self):
+        """Read-only preview of selected workspace file (capped at 200 KB; binary note on non-text)."""
+        items = self.ws_file_list.selectedItems()
+        if not items:
+            self.ws_preview.clear()
+            return
+        row = items[0].row()
+        name_item = self.ws_file_list.item(row, 0)
+        if not name_item:
+            self.ws_preview.clear()
+            return
+        path = name_item.data(Qt.ItemDataRole.UserRole)
+        if not path or not os.path.isfile(path):
+            self.ws_preview.clear()
+            return
+
+        try:
+            sz = os.path.getsize(path)
+            if sz > 200 * 1024:
+                self.ws_preview.setPlainText("binary or too large to preview")
+                return
+
+            with open(path, "rb") as fh:
+                data = fh.read(200 * 1024 + 1)
+            if len(data) > 200 * 1024:
+                self.ws_preview.setPlainText("binary or too large to preview")
+                return
+
+            if b"\x00" in data:
+                self.ws_preview.setPlainText("binary or too large to preview")
+                return
+
+            try:
+                text = data.decode("utf-8")
+                self.ws_preview.setPlainText(text)
+            except UnicodeDecodeError:
+                self.ws_preview.setPlainText("binary or too large to preview")
+        except Exception:
+            self.ws_preview.setPlainText("binary or too large to preview")
+
 
 class ClickableLabel(QLabel):
     clicked = Signal()
