@@ -27,6 +27,7 @@ import queue
 import collections
 import shutil
 import sqlite3
+import datetime
 from collections import deque
 from ctypes import wintypes
 
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QStyle,
     QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QDialog, QPlainTextEdit,
+    QSplitter, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkRequest, QNetworkReply,
@@ -5435,6 +5437,14 @@ class Spotlight(FramelessWindow):
 
         mode_row.addStretch(1)
 
+        self.btn_toggle_workspace = QPushButton("Workspace", panel)
+        self.btn_toggle_workspace.setCheckable(True)
+        self.btn_toggle_workspace.setChecked(True)
+        self.btn_toggle_workspace.setObjectName("spotWorkspaceBtn")
+        self.btn_toggle_workspace.clicked.connect(lambda: self.toggle_workspace_pane())
+        self.btn_toggle_workspace.hide()
+        mode_row.addWidget(self.btn_toggle_workspace)
+
         self.btn_endpoint = QPushButton("Endpoint…", panel)
         self.btn_endpoint.setObjectName("spotEndpointBtn")
         self.btn_endpoint.clicked.connect(self._open_endpoint)
@@ -5466,11 +5476,78 @@ class Spotlight(FramelessWindow):
         self.tree.setItemDelegateForColumn(0, SpotDelegate(self.tree))
         lay.addWidget(self.tree, 1)
 
-        self.transcript = QPlainTextEdit(panel)
+        # Agent view: horizontal splitter (conversation on left, workspace pane on right)
+        self.agent_splitter = QSplitter(Qt.Orientation.Horizontal, panel)
+        self.agent_splitter.setObjectName("spotAgentSplitter")
+        self.agent_splitter.hide()
+
+        self.transcript = QPlainTextEdit(self.agent_splitter)
         self.transcript.setObjectName("spotTranscript")
         self.transcript.setReadOnly(True)
         self.transcript.hide()
-        lay.addWidget(self.transcript, 1)
+        self.agent_splitter.addWidget(self.transcript)
+
+        # Workspace pane (viewer only, bounded scope)
+        self.workspace_pane = QFrame(self.agent_splitter)
+        self.workspace_pane.setObjectName("spotWorkspacePane")
+        ws_lay = QVBoxLayout(self.workspace_pane)
+        ws_lay.setContentsMargins(8, 6, 8, 6)
+        ws_lay.setSpacing(6)
+
+        ws_header_row = QHBoxLayout()
+        ws_title = QLabel("Workspace", self.workspace_pane)
+        ws_title.setObjectName("wsTitle")
+        ws_title.setStyleSheet("font-weight: 600; font-size: 12px; color: #1d1d1f;")
+        ws_header_row.addWidget(ws_title)
+        ws_header_row.addStretch(1)
+
+        self.ws_btn_refresh = QPushButton("Refresh", self.workspace_pane)
+        self.ws_btn_refresh.setObjectName("wsBtnRefresh")
+        self.ws_btn_refresh.clicked.connect(self.refresh_workspace_pane)
+        ws_header_row.addWidget(self.ws_btn_refresh)
+
+        self.ws_btn_collapse = QPushButton("✕", self.workspace_pane)
+        self.ws_btn_collapse.setObjectName("wsBtnCollapse")
+        self.ws_btn_collapse.setFixedSize(20, 20)
+        self.ws_btn_collapse.clicked.connect(lambda: self.toggle_workspace_pane(False))
+        ws_header_row.addWidget(self.ws_btn_collapse)
+        ws_lay.addLayout(ws_header_row)
+
+        self.ws_lbl_context = QLabel("Context: (none)", self.workspace_pane)
+        self.ws_lbl_context.setObjectName("wsLblContext")
+        self.ws_lbl_context.setStyleSheet("font-size: 11px; color: #6e6e73;")
+        self.ws_lbl_context.setWordWrap(True)
+        ws_lay.addWidget(self.ws_lbl_context)
+
+        self.ws_lbl_grant = QLabel("Grant: (none)", self.workspace_pane)
+        self.ws_lbl_grant.setObjectName("wsLblGrant")
+        self.ws_lbl_grant.setStyleSheet("font-size: 11px; color: #6e6e73;")
+        self.ws_lbl_grant.setWordWrap(True)
+        ws_lay.addWidget(self.ws_lbl_grant)
+
+        self.ws_file_list = QTableWidget(self.workspace_pane)
+        self.ws_file_list.setObjectName("wsFileList")
+        self.ws_file_list.setColumnCount(3)
+        self.ws_file_list.setHorizontalHeaderLabels(["Name", "Size", "Modified"])
+        self.ws_file_list.horizontalHeader().setStretchLastSection(True)
+        self.ws_file_list.verticalHeader().setVisible(False)
+        self.ws_file_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.ws_file_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ws_file_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.ws_file_list.itemSelectionChanged.connect(self._on_ws_file_selected)
+        ws_lay.addWidget(self.ws_file_list, 1)
+
+        self.ws_preview = QPlainTextEdit(self.workspace_pane)
+        self.ws_preview.setObjectName("wsPreview")
+        self.ws_preview.setReadOnly(True)
+        self.ws_preview.setPlaceholderText("Select a file to preview…")
+        self.ws_preview.setMaximumHeight(140)
+        ws_lay.addWidget(self.ws_preview, 1)
+
+        self.agent_splitter.addWidget(self.workspace_pane)
+        self.agent_splitter.setSizes([420, 240])
+
+        lay.addWidget(self.agent_splitter, 1)
 
         self.foot = QLabel("  ⏎  Open (folders in EzExp)      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ", panel)
         self.foot.setObjectName("spotFooter")
@@ -5535,10 +5612,13 @@ class Spotlight(FramelessWindow):
             self.btn_search.setChecked(False)
             self.btn_agent.setChecked(True)
             self.tree.hide()
+            self.agent_splitter.show()
             self.transcript.show()
             self.btn_endpoint.show()
+            self.btn_toggle_workspace.show()
             self.foot.setText("  ⏎  Send      Esc  Close  ")
             self.edit.setPlaceholderText("Ask the agent...")
+            self.refresh_workspace_pane()
             cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
             backend = (cfg.get("backend") or "endpoint").lower()
             if backend == "harness":
@@ -5569,10 +5649,13 @@ class Spotlight(FramelessWindow):
                     if status_msg:
                         self.transcript.setPlainText(status_msg)
         else:
+            self.mode = "search"
             self.btn_search.setChecked(True)
             self.btn_agent.setChecked(False)
+            self.agent_splitter.hide()
             self.transcript.hide()
             self.tree.show()
+            self.btn_toggle_workspace.hide()
             self.btn_endpoint.hide()
             self.foot.setText("  ⏎  Open (folders in EzExp)      Ctrl ⏎  Show in Folder      Alt ⏎  In EzExp      Esc  Close  ")
             self.edit.setPlaceholderText("Search your entire PC")
@@ -5585,6 +5668,7 @@ class Spotlight(FramelessWindow):
         if text:
             self.transcript.appendPlainText(text)
             self.agent_messages.append({"role": "assistant", "content": text})
+            self.refresh_workspace_pane()
 
     def on_agent_error(self, err):
         if err:
@@ -5664,12 +5748,111 @@ class Spotlight(FramelessWindow):
         if final_text:
             self.transcript.appendPlainText(final_text + "\n")
             self.agent_messages.append({"role": "assistant", "content": final_text})
+        self.refresh_workspace_pane()
 
     def _on_harness_failed(self, err_text):
         self.edit.setEnabled(True)
         self.foot.setText("  ⏎  Send      Esc  Close  ")
         self.edit.setFocus()
         self.transcript.appendPlainText(f"Error: {err_text}\n")
+        self.refresh_workspace_pane()
+
+    def toggle_workspace_pane(self, checked=None):
+        """Toggle visibility of the IDE-style workspace pane."""
+        if checked is None:
+            new_vis = not self.workspace_pane.isVisible()
+        else:
+            new_vis = bool(checked)
+        self.workspace_pane.setVisible(new_vis)
+        self.btn_toggle_workspace.setChecked(new_vis)
+        if new_vis:
+            self.refresh_workspace_pane()
+            sizes = self.agent_splitter.sizes()
+            if len(sizes) == 2 and sizes[1] == 0:
+                tot = sum(sizes) or self.width()
+                self.agent_splitter.setSizes([int(tot * 0.6), int(tot * 0.4)])
+
+    def refresh_workspace_pane(self):
+        """Update context/grant labels and refresh file list from grant_dir."""
+        cur_folder = self.get_current_folder()
+        self.ws_lbl_context.setText(f"Context: {cur_folder}" if cur_folder else "Context: (none)")
+
+        cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
+        grant_dir = (cfg.get("grant_dir") or "").strip() or getattr(self, "grant_dir", None) or ""
+        self.ws_lbl_grant.setText(f"Grant: {grant_dir}" if grant_dir else "Grant: (none)")
+
+        self.ws_file_list.setRowCount(0)
+        self.ws_preview.clear()
+
+        if not grant_dir or not os.path.isdir(grant_dir):
+            return
+
+        try:
+            entries = []
+            for entry in os.scandir(grant_dir):
+                entries.append(entry)
+            entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
+
+            self.ws_file_list.setRowCount(len(entries))
+            for row_idx, entry in enumerate(entries):
+                try:
+                    stat = entry.stat()
+                    size_str = f"{stat.st_size:,} B" if not entry.is_dir() else "<DIR>"
+                    mtime_str = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    size_str = "—"
+                    mtime_str = "—"
+
+                item_name = QTableWidgetItem(entry.name)
+                item_name.setData(Qt.ItemDataRole.UserRole, entry.path)
+                item_size = QTableWidgetItem(size_str)
+                item_mtime = QTableWidgetItem(mtime_str)
+
+                self.ws_file_list.setItem(row_idx, 0, item_name)
+                self.ws_file_list.setItem(row_idx, 1, item_size)
+                self.ws_file_list.setItem(row_idx, 2, item_mtime)
+        except Exception:
+            pass
+
+    def _on_ws_file_selected(self):
+        """Read-only preview of selected workspace file (capped at 200 KB; binary note on non-text)."""
+        items = self.ws_file_list.selectedItems()
+        if not items:
+            self.ws_preview.clear()
+            return
+        row = items[0].row()
+        name_item = self.ws_file_list.item(row, 0)
+        if not name_item:
+            self.ws_preview.clear()
+            return
+        path = name_item.data(Qt.ItemDataRole.UserRole)
+        if not path or not os.path.isfile(path):
+            self.ws_preview.clear()
+            return
+
+        try:
+            sz = os.path.getsize(path)
+            if sz > 200 * 1024:
+                self.ws_preview.setPlainText("binary or too large to preview")
+                return
+
+            with open(path, "rb") as fh:
+                data = fh.read(200 * 1024 + 1)
+            if len(data) > 200 * 1024:
+                self.ws_preview.setPlainText("binary or too large to preview")
+                return
+
+            if b"\x00" in data:
+                self.ws_preview.setPlainText("binary or too large to preview")
+                return
+
+            try:
+                text = data.decode("utf-8")
+                self.ws_preview.setPlainText(text)
+            except UnicodeDecodeError:
+                self.ws_preview.setPlainText("binary or too large to preview")
+        except Exception:
+            self.ws_preview.setPlainText("binary or too large to preview")
 
     def on_results(self, seq, q, rows, note):
         if seq != self.spot_seq:
@@ -6116,6 +6299,17 @@ QPushButton#spotModeBtn:checked { background: #0a84ff; color: #ffffff; font-weig
 QPushButton#spotEndpointBtn { background: #f1f1f4; border: none; border-radius: 8px;
     padding: 3px 10px; font-size: 11px; color: #6e6e73; }
 QPushButton#spotEndpointBtn:hover { background: #e8e8ed; color: #1d1d1f; }
+QPushButton#spotWorkspaceBtn { background: #f1f1f4; border: none; border-radius: 8px;
+    padding: 3px 10px; font-size: 11px; color: #6e6e73; }
+QPushButton#spotWorkspaceBtn:hover { background: #e8e8ed; color: #1d1d1f; }
+QPushButton#spotWorkspaceBtn:checked { background: #0a84ff; color: #ffffff; font-weight: 500; }
+#spotWorkspacePane { background: #fafafc; border-left: 1px solid #e6e6ea; }
+#wsFileList { background: #ffffff; border: 1px solid #e6e6ea; border-radius: 6px; font-size: 11px; }
+#wsPreview { background: #ffffff; border: 1px solid #e6e6ea; border-radius: 6px; font-size: 11px; font-family: Consolas, monospace; }
+QPushButton#wsBtnRefresh { background: #f1f1f4; border: none; border-radius: 4px; padding: 2px 8px; font-size: 11px; color: #3a3a3c; }
+QPushButton#wsBtnRefresh:hover { background: #e8e8ed; }
+QPushButton#wsBtnCollapse { background: transparent; border: none; border-radius: 4px; font-size: 12px; color: #86868b; }
+QPushButton#wsBtnCollapse:hover { background: #e8e8ed; color: #1d1d1f; }
 #spotTranscript { background: #ffffff; border: none; padding: 12px 18px; font-size: 13px; color: #1d1d1f; }
 
 QMenu { background: #ffffff; border: 1px solid #e3e3e8; border-radius: 10px; padding: 5px; }

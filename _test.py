@@ -2036,6 +2036,90 @@ lines2 = [l.strip() for l in after_send2.splitlines() if l.strip()]
 assert len(lines2) == 1, f"Expected 1 line after send 2 (deduped), got {len(lines2)}: {lines2}"
 assert lines2[0] == lines1[0]
 
+# 6. Step 3: IDE-style workspace pane tests
+ws_spot = ez.Spotlight(worker)
+ws_spot.set_mode("agent")
+assert not ws_spot.workspace_pane.isHidden(), "Workspace pane should be visible initially in agent mode"
+assert not ws_spot.agent_splitter.isHidden(), "Agent splitter should be visible in agent mode"
+assert ws_spot.btn_toggle_workspace.isChecked(), "Workspace toggle button should be checked"
+
+# Test toggle collapse/expand
+ws_spot.toggle_workspace_pane()
+assert ws_spot.workspace_pane.isHidden(), "Workspace pane should be hidden after toggle"
+assert not ws_spot.btn_toggle_workspace.isChecked()
+ws_spot.toggle_workspace_pane()
+assert not ws_spot.workspace_pane.isHidden(), "Workspace pane should be visible after toggle back"
+assert ws_spot.btn_toggle_workspace.isChecked()
+
+# Setup test workspace grant folder
+test_ws_grant = tempfile.mkdtemp(prefix="ezexp_ws_test_")
+f_txt = os.path.join(test_ws_grant, "sample.txt")
+with open(f_txt, "w", encoding="utf-8") as fh:
+    fh.write("Hello from sample text file")
+
+f_bin = os.path.join(test_ws_grant, "binary.dat")
+with open(f_bin, "wb") as fh:
+    fh.write(b"\x00\x01\x02\xff" * 100)
+
+f_big = os.path.join(test_ws_grant, "large.txt")
+with open(f_big, "w", encoding="utf-8") as fh:
+    fh.write("A" * (250 * 1024))
+
+ws_spot.agent_client.config = {"grant_dir": test_ws_grant}
+ws_spot.grant_dir = test_ws_grant
+ws_spot.current_folder = r"D:\exp"
+ws_spot.refresh_workspace_pane()
+
+# (a) Header labels check
+assert "Context: D:\\exp" in ws_spot.ws_lbl_context.text(), f"Context mismatch: {ws_spot.ws_lbl_context.text()}"
+assert test_ws_grant in ws_spot.ws_lbl_grant.text(), f"Grant mismatch: {ws_spot.ws_lbl_grant.text()}"
+
+# (b) File list check
+assert ws_spot.ws_file_list.rowCount() == 3, f"Expected 3 rows, got {ws_spot.ws_file_list.rowCount()}"
+listed_names = [ws_spot.ws_file_list.item(r, 0).text() for r in range(ws_spot.ws_file_list.rowCount())]
+assert "sample.txt" in listed_names
+assert "binary.dat" in listed_names
+assert "large.txt" in listed_names
+
+# (c) Preview checks
+# Text preview
+sample_row = listed_names.index("sample.txt")
+ws_spot.ws_file_list.selectRow(sample_row)
+ws_spot._on_ws_file_selected()
+assert ws_spot.ws_preview.toPlainText() == "Hello from sample text file", f"Preview text mismatch: {ws_spot.ws_preview.toPlainText()}"
+
+# Binary preview -> note
+bin_row = listed_names.index("binary.dat")
+ws_spot.ws_file_list.selectRow(bin_row)
+ws_spot._on_ws_file_selected()
+assert ws_spot.ws_preview.toPlainText() == "binary or too large to preview", f"Expected binary note, got: {ws_spot.ws_preview.toPlainText()}"
+
+# Oversize preview (>200 KB) -> note
+big_row = listed_names.index("large.txt")
+ws_spot.ws_file_list.selectRow(big_row)
+ws_spot._on_ws_file_selected()
+assert ws_spot.ws_preview.toPlainText() == "binary or too large to preview", f"Expected large file note, got: {ws_spot.ws_preview.toPlainText()}"
+
+# Refresh picks up newly created file
+f_new = os.path.join(test_ws_grant, "added_later.py")
+with open(f_new, "w", encoding="utf-8") as fh:
+    fh.write("print('new code')")
+
+ws_spot.ws_btn_refresh.click()
+assert ws_spot.ws_file_list.rowCount() == 4, f"Expected 4 rows after refresh, got {ws_spot.ws_file_list.rowCount()}"
+updated_names = [ws_spot.ws_file_list.item(r, 0).text() for r in range(ws_spot.ws_file_list.rowCount())]
+assert "added_later.py" in updated_names
+new_row = updated_names.index("added_later.py")
+ws_spot.ws_file_list.selectRow(new_row)
+ws_spot._on_ws_file_selected()
+assert ws_spot.ws_preview.toPlainText() == "print('new code')", f"New file preview mismatch: {ws_spot.ws_preview.toPlainText()}"
+
+# Switching back to search mode hides workspace pane & splitter
+ws_spot.set_mode("search")
+assert ws_spot.agent_splitter.isHidden()
+assert ws_spot.transcript.isHidden()
+assert not ws_spot.tree.isHidden()
+
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")
