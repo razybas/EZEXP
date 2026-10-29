@@ -5153,7 +5153,7 @@ class BridgeWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, task, grant_dir, harness_path="", harness_python="py", client=None, bridge=None, parent=None, mode="single"):
+    def __init__(self, task, grant_dir, harness_path="", harness_python="py", client=None, bridge=None, parent=None, mode="single", current_folder=None):
         super().__init__(parent)
         self.task = task
         self.grant_dir = grant_dir
@@ -5162,6 +5162,7 @@ class BridgeWorker(QThread):
         self.client = client
         self.bridge = bridge
         self.mode = mode or "single"
+        self.current_folder = current_folder
         self._proc = None
 
     def __del__(self):
@@ -5282,7 +5283,12 @@ class BridgeWorker(QThread):
                 return
 
             # 3. Write task line
-            task_msg = {"type": "task", "text": self.task, "mode": self.mode}
+            task_msg = {
+                "type": "task",
+                "text": self.task,
+                "mode": self.mode,
+                "context": {"current_folder": self.current_folder if self.current_folder else None},
+            }
             self._proc.stdin.write(json.dumps(task_msg) + "\n")
             self._proc.stdin.flush()
 
@@ -5613,12 +5619,23 @@ class Spotlight(FramelessWindow):
             grant_dir = (cfg.get("grant_dir") or "").strip()
             hp = (cfg.get("harness_path") or "").strip()
             hpython = (cfg.get("harness_python") or "py").strip() or "py"
-            self._start_harness_task(text, grant_dir, hp, hpython, mode="single")
+            cur_folder = self.get_current_folder()
+            self._start_harness_task(text, grant_dir, hp, hpython, mode="single", current_folder=cur_folder)
         else:
             self.edit.clear()
             self.transcript.appendPlainText(f"You: {text}\n")
             self.agent_messages.append({"role": "user", "content": text})
             self.agent_client.send(self.agent_messages)
+
+    def get_current_folder(self):
+        """Returns the absolute path of the folder currently open/navigated in EzExp, or None."""
+        if hasattr(self, "_current_folder_override") and self._current_folder_override is not None:
+            return os.path.abspath(self._current_folder_override) if self._current_folder_override else None
+        if self.main is not None and getattr(self.main, "current_place", None):
+            p = self.main.current_place
+            return os.path.abspath(p) if p else None
+        cf = getattr(self, "current_folder", None)
+        return os.path.abspath(cf) if cf else None
 
     @property
     def _harness_worker(self):
@@ -5628,11 +5645,13 @@ class Spotlight(FramelessWindow):
     def _harness_worker(self, val):
         self._bridge_worker = val
 
-    def _start_harness_task(self, text, grant_dir, harness_path="", harness_python="py", mode="single"):
+    def _start_harness_task(self, text, grant_dir, harness_path="", harness_python="py", mode="single", current_folder=None):
         self.edit.setEnabled(False)
         self.foot.setText("  Agent working…      Esc  Close  ")
+        if current_folder is None:
+            current_folder = self.get_current_folder()
         self._bridge_worker = BridgeWorker(
-            text, grant_dir, harness_path, harness_python, client=self.agent_client, bridge=self.confirm_bridge, parent=self, mode=mode
+            text, grant_dir, harness_path, harness_python, client=self.agent_client, bridge=self.confirm_bridge, parent=self, mode=mode, current_folder=current_folder
         )
         self._bridge_worker.done.connect(self._on_harness_done)
         self._bridge_worker.failed.connect(self._on_harness_failed)

@@ -1549,6 +1549,8 @@ with open(task_file, "r", encoding="utf-8") as f:
     task_data = json.load(f)
 assert task_data["text"] == "hello harness"
 assert task_data.get("mode") == "single", f"Expected mode 'single', got {task_data.get('mode')}"
+# Step 2: verify context field when no folder is open
+assert task_data.get("context") == {"current_folder": None}, f"Expected null current_folder, got: {task_data.get('context')}"
 
 # Verify transcript
 transcript_txt = spot.transcript.toPlainText()
@@ -1556,6 +1558,24 @@ assert "canned response from fake harness" in transcript_txt, f"Canned text miss
 assert "Tokens: 42.0" in transcript_txt, f"Token budget missing: {transcript_txt}"
 assert "Time: 123.45ms" in transcript_txt, f"Latency missing: {transcript_txt}"
 assert "Tools: EzExp catalog + grant tools via the harness (native harness tools disabled)." in transcript_txt, f"Case A banner missing: {transcript_txt}"
+
+# Step 2: verify context field when folder is open
+remove_control_files()
+set_control({"mode": "happy"})
+spot.current_folder = r"D:\games\gta 5"
+spot.transcript.clear()
+spot.edit.setText("test folder context")
+spot.send_agent_message()
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
+qapp.processEvents()
+
+with open(task_file, "r", encoding="utf-8") as f:
+    task_data_folder = json.load(f)
+assert task_data_folder.get("context") == {"current_folder": os.path.abspath(r"D:\games\gta 5")}, f"Unexpected context: {task_data_folder.get('context')}"
+spot.current_folder = None
 
 # 4. Fail-closed tool set assertion (sabotaged runner emitting shell tool)
 remove_control_files()
