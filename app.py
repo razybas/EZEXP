@@ -5187,15 +5187,18 @@ class BridgeWorker(QThread):
             if self.grant_dir:
                 cmd.extend(["--workspace", self.grant_dir])
 
-            self._proc = subprocess.Popen(
-                cmd,
-                cwd=self.harness_path if self.harness_path else None,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-            )
+            popen_kwargs = {
+                "cwd": self.harness_path if self.harness_path else None,
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+            self._proc = subprocess.Popen(cmd, **popen_kwargs)
 
             q = queue.Queue()
             recent_stderr = collections.deque(maxlen=30)
