@@ -166,12 +166,13 @@ follows the current tab:
 - **Crash log**: if anything ever goes wrong, the traceback is
   appended to `%LOCALAPPDATA%\EzExp\error.log` — send that file with
   a bug report.
-- **Version**: 1.1.0 (stamped into the exe's file properties).
+- **Version**: 1.2.0 (stamped into the exe's file properties).
 
 ## How it works
 
-EzExp is a **single-file PySide6 application** (`app.py`, ~4,900
-lines) built into a portable exe with PyInstaller. Around that file:
+EzExp is structured as a modular PySide6 application package (`ezexp/`)
+with a lightweight `app.py` entry shim, built into a portable exe with PyInstaller. Key components:
+
 
 - **Index engine (SQLite).** One row per file in a `files` table
   (parent, name, kind, size, mtime, drive, category), a full-text
@@ -216,7 +217,8 @@ the rest:
 
 | File | Purpose |
 |---|---|
-| `app.py` | The entire application: UI, index engine, search, graph, actions |
+| `ezexp/` | Core package: UI, widgets, indexer, search, graph, shell, agent runtime |
+| `app.py` | Application entry point and re-export shim |
 | `_test.py` | Self-contained test suite — run `py _test.py` |
 | `build.bat` | One-click build (bootstraps Python via winget if missing) |
 | `make_icon.py` | Generates `ezexp.ico` from the app's artwork |
