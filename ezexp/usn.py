@@ -53,8 +53,6 @@ FSCTL_QUERY_USN_JOURNAL = 0x000900F4
 FSCTL_READ_USN_JOURNAL = 0x000900BB
 FSCTL_ENUM_USN_DATA = 0x000900B3
 
-USN_VERSION_ID = 2
-
 ERROR_ACCESS_DENIED = 5
 ERROR_HANDLE_EOF = 38
 ERROR_JOURNAL_NOT_ACTIVE = 1176
@@ -81,6 +79,17 @@ ROOT_FRN = 5
 
 READ_CHUNK = 1 << 18  # bytes per FSCTL_READ_USN_JOURNAL (~2.5k records)
 MAX_CHUNKS_PER_POLL = 64  # ~16M bytes drained per poll cycle, then reschedule
+
+ERROR_JOURNAL_ENTRY_DELETED = 1181
+
+
+def _read_request(start_usn, journal_id):
+    """READ_USN_JOURNAL_DATA_V0 wire layout: StartUsn FIRST, UsnJournalID
+    LAST (StartUsn; ReasonMask; ReturnOnlyOnClose; Timeout; BytesToWaitFor;
+    UsnJournalID — 40 bytes packed). StartUsn is the explicit resume
+    cursor; a nonzero value below the journal's FirstUsn fails with
+    ERROR_JOURNAL_ENTRY_DELETED, which the caller treats as a wrap."""
+    return struct.pack("<qIIqqQ", start_usn, 0xFFFFFFFF, 1, 0, 0, journal_id)
 
 QueryInfo = namedtuple("QueryInfo", "journal_id first_usn next_usn")
 Checkpoint = namedtuple("Checkpoint", "journal_id next_usn")
@@ -154,11 +163,11 @@ class UsnJournal:
     def read(self, start_usn, max_bytes=READ_CHUNK):
         """One FSCTL_READ_USN_JOURNAL call from start_usn, close records
         only. Returns (next_usn_after_this_buffer, records_bytes); an
-        empty buffer means no records are available right now."""
+        empty buffer (next_usn == start_usn) means no records are
+        available right now."""
         if self._jid is None:
             self._jid = self.query().journal_id
-        inbuf = struct.pack("<QIIQQI", self._jid, 0xFFFFFFFF, 1, 0, 0,
-                            USN_VERSION_ID)
+        inbuf = _read_request(start_usn, self._jid)
         try:
             raw = self._ioctl(FSCTL_READ_USN_JOURNAL, inbuf, max_bytes)
         except OSError as exc:

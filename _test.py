@@ -2474,6 +2474,16 @@ ez.set_meta(_u1conn, "usn.%s.journal_id" % _u1drive, "777")
 assert usn.poll(_u1conn, _u1fj, _u1drive) is None
 _u1conn.close()
 
+# Fix A: READ_USN_JOURNAL_DATA_V0 wire layout — StartUsn first, UsnJournalID
+# last (the U1 code packed V1-style with the journal id first and no StartUsn)
+_req = usn._read_request(0x1000, 0xA11CE)
+assert len(_req) == 40, len(_req)
+assert _req == _struct.pack("<qIIqqQ", 0x1000, 0xFFFFFFFF, 1, 0, 0, 0xA11CE), _req.hex()
+assert _struct.unpack_from("<q", _req, 0)[0] == 0x1000, "StartUsn must be the first field"
+assert _struct.unpack_from("<I", _req, 8)[0] == 0xFFFFFFFF, "ReasonMask second"
+assert _struct.unpack_from("<I", _req, 12)[0] == 1, "ReturnOnlyOnClose third"
+assert _struct.unpack_from("<q", _req, 32)[0] == 0xA11CE, "UsnJournalID must be the last field"
+
 # --- U1 end ------------------------------------------------------------------
 
 
