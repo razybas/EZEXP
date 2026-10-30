@@ -864,6 +864,12 @@ QPushButton#wsBtnRefresh:hover { background: #e8e8ed; }
 QPushButton#wsBtnCollapse { background: transparent; border: none; border-radius: 4px; font-size: 12px; color: #86868b; }
 QPushButton#wsBtnCollapse:hover { background: #e8e8ed; color: #1d1d1f; }
 #spotTranscript { background: #ffffff; border: none; padding: 12px 18px; font-size: 13px; color: #1d1d1f; }
+#dockTranscript { background: #ffffff; color: #1d1d1f; border: 1px solid #e6e6ea; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+#dockInput { background: #ffffff; color: #1d1d1f; border: 1px solid #e6e6ea; border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+#dockInput:focus { border: 1px solid #0a84ff; }
+QPushButton#dockBtnSend { background: #0a84ff; color: #ffffff; border: none; border-radius: 8px; padding: 6px 12px; font-weight: 500; font-size: 13px; }
+QPushButton#dockBtnSend:hover { background: #0071e3; }
+QPushButton#dockBtnSend:disabled { background: #b7d7ff; }
 
 QMenu { background: #ffffff; border: 1px solid #e3e3e8; border-radius: 10px; padding: 5px; }
 QMenu::item { padding: 6px 24px 6px 12px; border-radius: 6px; background: transparent; }

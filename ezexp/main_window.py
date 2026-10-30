@@ -226,6 +226,10 @@ class MainWindow(FramelessWindow):
         self.btn_endpoint = QPushButton("Endpoint…", self.agent_dock)
         self.btn_endpoint.setObjectName("btnEndpoint")
         self.btn_endpoint.setCursor(Qt.PointingHandCursor)
+        self.btn_endpoint.setStyleSheet(
+            "QPushButton { background: #f1f1f4; border: none; border-radius: 6px; padding: 3px 8px; font-size: 11px; color: #6e6e73; }"
+            "QPushButton:hover { background: #e8e8ed; color: #1d1d1f; }"
+        )
         self.btn_endpoint.clicked.connect(self._open_endpoint)
         dock_header.addWidget(self.btn_endpoint)
         dock_lay.addLayout(dock_header)
@@ -241,17 +245,28 @@ class MainWindow(FramelessWindow):
         self.dock_transcript = QPlainTextEdit(chat_container)
         self.dock_transcript.setObjectName("dockTranscript")
         self.dock_transcript.setReadOnly(True)
+        self.dock_transcript.setStyleSheet(
+            "background: #ffffff; color: #1d1d1f; border: 1px solid #e6e6ea; border-radius: 8px; padding: 8px 10px; font-size: 13px;"
+        )
         chat_lay.addWidget(self.dock_transcript, 1)
 
         input_row = QHBoxLayout()
         self.dock_input = QLineEdit(chat_container)
         self.dock_input.setObjectName("dockInput")
         self.dock_input.setPlaceholderText("Ask the agent…")
+        self.dock_input.setStyleSheet(
+            "background: #ffffff; color: #1d1d1f; border: 1px solid #e6e6ea; border-radius: 8px; padding: 6px 10px; font-size: 13px;"
+        )
         self.dock_input.returnPressed.connect(self.send_agent_message)
         input_row.addWidget(self.dock_input, 1)
 
         self.dock_btn_send = QPushButton("Send", chat_container)
         self.dock_btn_send.setObjectName("dockBtnSend")
+        self.dock_btn_send.setStyleSheet(
+            "QPushButton { background: #0a84ff; color: #ffffff; border: none; border-radius: 8px; padding: 6px 12px; font-weight: 500; font-size: 13px; }"
+            "QPushButton:hover { background: #0071e3; }"
+            "QPushButton:disabled { background: #b7d7ff; }"
+        )
         self.dock_btn_send.clicked.connect(self.send_agent_message)
         input_row.addWidget(self.dock_btn_send)
         chat_lay.addLayout(input_row)

@@ -2264,6 +2264,17 @@ with open(task_file, "r", encoding="utf-8") as f:
     task_data_none = json.load(f)
 assert task_data_none.get("context") == {"current_folder": None}, f"Unexpected context when no folder open: {task_data_none.get('context')}"
 
+# (f) T2: Dock chat light theme styling (guard against near-black regression)
+# Old values: dock_transcript.styleSheet() == "" and dock_input.styleSheet() == ""
+# (unstyled widgets rendered near-black background with dark grey text in Windows dark theme)
+assert main_win.dock_transcript.styleSheet() != "", "dock_transcript styleSheet must not be empty (old unstyled value was '')"
+assert main_win.dock_input.styleSheet() != "", "dock_input styleSheet must not be empty (old unstyled value was '')"
+assert "#ffffff" in main_win.dock_transcript.styleSheet().lower(), "dock_transcript must have light #ffffff background"
+assert "#1d1d1f" in main_win.dock_transcript.styleSheet().lower(), "dock_transcript must have dark #1d1d1f text"
+assert "#ffffff" in main_win.dock_input.styleSheet().lower(), "dock_input must have light #ffffff background"
+assert "#1d1d1f" in main_win.dock_input.styleSheet().lower(), "dock_input must have dark #1d1d1f text"
+
+
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()
 worker.stop()
