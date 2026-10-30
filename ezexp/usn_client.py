@@ -80,6 +80,8 @@ class PipeClientTransport:
                 (n,) = struct.unpack("<I", self._read_exact(4))
                 if n == 0:
                     raise ConnectionError("empty frame from helper")
+                # feed prefix + payload: the decoder expects whole frames
+                self._dec.feed(struct.pack("<I", n))
                 self._dec.feed(self._read_exact(n))
                 self._pending = self._dec.pop_messages()
                 continue
