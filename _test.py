@@ -2486,6 +2486,165 @@ assert _struct.unpack_from("<q", _req, 32)[0] == 0xA11CE, "UsnJournalID must be 
 
 # --- U1 end ------------------------------------------------------------------
 
+# --- U2a: helper protocol codec + session (tails, enum, stale, purity) -------
+from ezexp import usn_proto as proto  # noqa: E402
+import usn_helper_main as helper  # noqa: E402
+
+# codec round-trip for every message type
+for _m in [
+    proto.m_ping(),
+    proto.m_subscribe("C:", 0x1000),
+    proto.m_enum("D:"),
+    proto.m_ready({"C:": "ok", "D:": "access_denied"}),
+    proto.m_journal_info("C:", usn.QueryInfo(7, 100, 200)),
+    proto.m_enum_batch("C:", [(5, 0, "C:"), (12, 5, "windows")]),
+    proto.m_enum_done("C:", 7, 200),
+    proto.m_records("C:", [usn.USNRecord(12, 5, 33, 0x80000100, 0x20, "a.txt")], 34),
+    proto.m_stale("C:"),
+    proto.m_error("C:", "boom"),
+]:
+    _dec = proto.FrameDecoder()
+    _dec.feed(proto.frame(_m))
+    assert _dec.pop_messages() == [_m], _m
+
+# incremental framing: a partial frame yields nothing until complete
+_dec = proto.FrameDecoder()
+_f = proto.frame(proto.m_subscribe("C:", 5))
+_dec.feed(_f[:3])
+assert _dec.pop_messages() == []
+_dec.feed(_f[3:])
+assert _dec.pop_messages() == [proto.m_subscribe("C:", 5)]
+
+# absurd frame length and unknown type are refused
+try:
+    _bad = proto.FrameDecoder()
+    _bad.feed(b"\xff\xff\xff\xff")
+    _bad.pop_messages()
+    raise AssertionError("oversize frame length must raise")
+except ValueError:
+    pass
+try:
+    proto.parse_frame(proto.frame({"type": "nope"}))
+    raise AssertionError("unknown message type must raise")
+except ValueError:
+    pass
+
+
+class _FakePipe:
+    def __init__(self, commands=()):
+        self.commands = list(commands)
+        self.outbox = []
+
+    def send_msg(self, msg):
+        self.outbox.append(msg)
+
+    def recv_msg(self):
+        return self.commands.pop(0) if self.commands else None
+
+
+class _FakeHelperJournal:
+    def __init__(self, chunks=(), enum_rows=(), info=None, read_error=None):
+        self.info = info or usn.QueryInfo(0xA11CE, 0x100, 0x200)
+        self.chunks = list(chunks)
+        self.enum_rows = list(enum_rows)
+        self.read_error = read_error
+        self.queries = 0
+
+    def query(self):
+        self.queries += 1
+        return usn.QueryInfo(self.info.journal_id, self.info.first_usn,
+                             self.info.next_usn + 0x100 * (self.queries - 1))
+
+    def read(self, start_usn, max_bytes=1 << 18):
+        if self.read_error is not None:
+            raise OSError(0, "simulated journal failure", None, self.read_error)
+        if self.chunks:
+            return self.chunks.pop(0)
+        return start_usn, b""
+
+    def iter_enum(self):
+        yield from self.enum_rows
+
+    def close(self):
+        pass
+
+
+_tp = _FakePipe()
+_se = helper.HelperSession(
+    _tp, journal_factory=lambda d: _FakeHelperJournal(), drives=["C:"],
+    probe_fn=lambda d: "ok")
+
+# on connect: probe every fixed drive, announce ready
+_se.start()
+assert _tp.outbox == [proto.m_ready({"C:": "ok"})], _tp.outbox
+
+# subscribe -> journal_info from a FRESH query
+_tp.commands = [proto.m_subscribe("C:", 0x100)]
+_se.handle_command(_tp.commands.pop(0))
+assert _tp.outbox[-1] == proto.m_journal_info(
+    "C:", usn.QueryInfo(0xA11CE, 0x100, 0x200)), _tp.outbox[-1]
+
+# tail: buffered records forwarded in order, cursor advanced; then quiet
+_js = _se._journals.get("C:")
+_js.chunks = [(0x103,
+    _usn_record(12, 5, 0x101, usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE, "a.txt")
+    + _usn_record(13, 5, 0x102, usn.USN_REASON_FILE_DELETE | usn.USN_REASON_CLOSE, "b.txt"))]
+assert _se.pump_tails() is True
+assert _tp.outbox[-1] == proto.m_records(
+    "C:", [[12, 5, 0x101, usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE, 0, "a.txt"],
+           [13, 5, 0x102, usn.USN_REASON_FILE_DELETE | usn.USN_REASON_CLOSE, 0, "b.txt"]],
+    0x103), _tp.outbox[-1]
+assert _se._subs["C:"]["usn"] == 0x103
+assert _se.pump_tails() is False
+assert _tp.outbox[-1]["type"] == "records"  # no new message when quiet
+
+# stale: a start USN that fell out of the journal -> stale + tail dropped
+_js.read_error = 1181
+assert _se.pump_tails() is True
+assert _tp.outbox[-1] == proto.m_stale("C:"), _tp.outbox[-1]
+assert "C:" not in _se._subs
+_js.read_error = None
+assert _se.pump_tails() is False  # dropped tail is not serviced any more
+
+# other read failure -> error for that drive only, tail retained
+_se._subs["C:"] = {"usn": 0x103}
+_js.read_error = 5
+assert _se.pump_tails() is True
+assert _tp.outbox[-1]["type"] == "error" and _tp.outbox[-1]["drive"] == "C:"
+assert "C:" in _se._subs
+_js.read_error = None
+
+# enum streams batches (<= 2000 rows) then enum_done with the PRE-pass values
+_se2 = helper.HelperSession(
+    _FakePipe(), journal_factory=lambda d: _FakeHelperJournal(
+        enum_rows=[(i, 5, "f%d" % i) for i in range(2500)]),
+    drives=["C:"])
+_se2.start()
+_se2.handle_command(proto.m_enum("C:"))
+_msgs2 = _se2.transport.outbox[1:]
+assert [_m["type"] for _m in _msgs2] == ["enum_batch", "enum_batch", "enum_done"], _msgs2
+assert len(_msgs2[0]["rows"]) == 2000 and len(_msgs2[1]["rows"]) == 500
+assert _msgs2[-1] == proto.m_enum_done("C:", 0xA11CE, 0x200), _msgs2[-1]
+
+# unknown command -> error for that drive
+_se.handle_command({"type": "wat", "drive": "C:"})
+assert _tp.outbox[-1]["type"] == "error" and _tp.outbox[-1]["drive"] == "C:"
+
+# helper purity: imports limited to stdlib + ezexp.usn_journal/usn_proto
+_purity_roots = {"argparse", "ctypes", "os", "shutil", "struct", "subprocess",
+                 "sys", "threading", "time", "ezexp"}
+_hsrc = open(os.path.join(r"D:\exp\ezexp", "usn_helper_main.py"), encoding="utf-8").read()
+for _line in _hsrc.splitlines():
+    _s = _line.strip()
+    if _s.startswith("import ") or _s.startswith("from "):
+        _mod = _s.split()[1].rstrip(",")
+        assert _mod.split(".")[0] in _purity_roots, "helper imports non-pure module: %s" % _s
+        if _mod.startswith("ezexp"):
+            assert _mod in ("ezexp.usn_journal", "ezexp.usn_proto"), \
+                "helper must not import %s (only ezexp.usn_journal/usn_proto)" % _mod
+
+# --- U2a end -----------------------------------------------------------------
+
 
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()

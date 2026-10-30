@@ -5,24 +5,26 @@ NTFS appends one record per file-system change to a per-volume journal,
 so reading it beats walking directories for both speed and completeness.
 
 Everything USN lives in this module except the watcher wiring in
-indexer.py and the frn_map table in db.py. The ctypes volume layer is
-isolated in UsnJournal so tests can substitute any object exposing the
-same query()/read()/enum() shape; the applier works against any sqlite
-connection plus such a journal-like object.
+indexer.py, the frn_map table in db.py, and the pure journal layer now
+in usn_journal.py (extracted so the elevated helper program can import
+it without pulling in PySide6/db). This module re-exports the journal
+layer, so its public surface is unchanged.
 
 Reading the journal needs an elevated token on most systems. Unelevated,
 probe() returns access_denied and the caller must keep the mtime delta
 scan running for that drive — never crash, never prompt for elevation.
+The elevated-helper route (U2) reads the journals in a LocalSystem
+service and streams records over a named pipe; this module stays the
+catalog side: checkpoints, frn map, and all writes.
 """
 import ctypes
-import ctypes.wintypes as wintypes
 import os
 import sqlite3
-import struct
 from collections import namedtuple
 
 from ezexp import DB_PATH
 from ezexp import db as db_mod
+from ezexp import usn_journal as _uj
 from ezexp.fsutil import (
     join_path, split_path, like_escape,
     SKIP_DIR_NAMES, SKIP_FILE_NAMES, REPARSE_ATTR,
@@ -31,204 +33,24 @@ from ezexp.db import (
     insert_rows, delete_tree, get_meta, set_meta,
 )
 
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_k32.CreateFileW.restype = ctypes.c_void_p
-_k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                             wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-                             wintypes.HANDLE]
-_k32.DeviceIoControl.restype = wintypes.BOOL
-_k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
-                                 wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
-                                 ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-_k32.CloseHandle.argtypes = [wintypes.HANDLE]
-_k32.CloseHandle.restype = wintypes.BOOL
+# Re-export the pure journal layer: usn.py's public U1 surface is unchanged.
+from ezexp.usn_journal import (  # noqa: F401
+    UsnJournal, parse_records, QueryInfo, USNRecord, probe,
+    GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    INVALID_HANDLE_VALUE,
+    FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, FSCTL_ENUM_USN_DATA,
+    ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE,
+    ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED,
+    USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_EXTEND,
+    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE,
+    USN_REASON_FILE_DELETE, USN_REASON_RENAME_OLD_NAME,
+    USN_REASON_RENAME_NEW_NAME, USN_REASON_BASIC_INFO_CHANGE,
+    USN_REASON_CLOSE, REASON_MASK, FILE_ATTRIBUTE_DIRECTORY,
+    ROOT_FRN, READ_CHUNK, MAX_CHUNKS_PER_POLL, ENUM_BATCH_ROWS,
+    _read_request, _k32,
+)
 
-GENERIC_READ = 0x80000000
-FILE_SHARE_READ = 0x00000001
-FILE_SHARE_WRITE = 0x00000002
-OPEN_EXISTING = 3
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-FSCTL_QUERY_USN_JOURNAL = 0x000900F4
-FSCTL_READ_USN_JOURNAL = 0x000900BB
-FSCTL_ENUM_USN_DATA = 0x000900B3
-
-ERROR_ACCESS_DENIED = 5
-ERROR_HANDLE_EOF = 38
-ERROR_JOURNAL_NOT_ACTIVE = 1176
-ERROR_JOURNAL_DELETE_IN_PROGRESS = 1178
-
-USN_REASON_DATA_OVERWRITE = 0x00000001
-USN_REASON_DATA_EXTEND = 0x00000002
-USN_REASON_DATA_TRUNCATION = 0x00000004
-USN_REASON_FILE_CREATE = 0x00000100
-USN_REASON_FILE_DELETE = 0x00000200
-USN_REASON_RENAME_OLD_NAME = 0x00001000
-USN_REASON_RENAME_NEW_NAME = 0x00002000
-USN_REASON_BASIC_INFO_CHANGE = 0x00008000
-USN_REASON_CLOSE = 0x80000000
-
-REASON_MASK = (USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND |
-               USN_REASON_DATA_TRUNCATION | USN_REASON_FILE_CREATE |
-               USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME |
-               USN_REASON_RENAME_NEW_NAME | USN_REASON_BASIC_INFO_CHANGE)
-
-FILE_ATTRIBUTE_DIRECTORY = 0x10
-
-ROOT_FRN = 5
-
-READ_CHUNK = 1 << 18  # bytes per FSCTL_READ_USN_JOURNAL (~2.5k records)
-MAX_CHUNKS_PER_POLL = 64  # ~16M bytes drained per poll cycle, then reschedule
-
-ERROR_JOURNAL_ENTRY_DELETED = 1181
-
-
-def _read_request(start_usn, journal_id):
-    """READ_USN_JOURNAL_DATA_V0 wire layout: StartUsn FIRST, UsnJournalID
-    LAST (StartUsn; ReasonMask; ReturnOnlyOnClose; Timeout; BytesToWaitFor;
-    UsnJournalID — 40 bytes packed). StartUsn is the explicit resume
-    cursor; a nonzero value below the journal's FirstUsn fails with
-    ERROR_JOURNAL_ENTRY_DELETED, which the caller treats as a wrap."""
-    return struct.pack("<qIIqqQ", start_usn, 0xFFFFFFFF, 1, 0, 0, journal_id)
-
-QueryInfo = namedtuple("QueryInfo", "journal_id first_usn next_usn")
 Checkpoint = namedtuple("Checkpoint", "journal_id next_usn")
-USNRecord = namedtuple("USNRecord", "frn parent_frn usn reason attrs name")
-
-
-def parse_records(buf):
-    """Parse a byte buffer of consecutive USN_RECORD_V2 records (the
-    READ_USN_JOURNAL / ENUM_USN_DATA payload after its leading USN or
-    StartFileReferenceNumber). Stops cleanly at any truncation."""
-    out = []
-    off = 0
-    n = len(buf)
-    while off + 60 <= n:
-        rec_len = struct.unpack_from("<I", buf, off)[0]
-        if rec_len < 60 or off + rec_len > n:
-            break
-        major, = struct.unpack_from("<H", buf, off + 4)
-        if major != 2:
-            break  # only V2 records are understood here
-        frn, pfrn, usn, _ts, reason, _src, _sec, attrs = struct.unpack_from(
-            "<QQqQIIII", buf, off + 8)
-        fn_len, fn_off = struct.unpack_from("<HH", buf, off + 56)
-        if fn_off + fn_len > rec_len or off + fn_off + fn_len > n:
-            break
-        name = buf[off + fn_off: off + fn_off + fn_len].decode("utf-16-le", "replace")
-        out.append(USNRecord(frn, pfrn, usn, reason, attrs, name))
-        off += rec_len
-    return out
-
-
-class UsnJournal:
-    """ctypes wrapper over one NTFS volume's USN change journal.
-
-    drive is a letter with optional trailing backslash ('C:' / 'C:\\').
-    """
-
-    def __init__(self, drive):
-        self.drive = drive.rstrip("\\")
-        self._handle = None
-        self._jid = None
-        handle = _k32.CreateFileW(
-            ctypes.c_wchar_p("\\\\.\\%s" % self.drive),
-            GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
-            OPEN_EXISTING, 0, None)
-        if handle == INVALID_HANDLE_VALUE:
-            raise ctypes.WinError(ctypes.get_last_error())
-        self._handle = handle
-
-    def close(self):
-        if self._handle is not None:
-            _k32.CloseHandle(self._handle)
-            self._handle = None
-
-    def _ioctl(self, code, inbuf, out_size):
-        out = ctypes.create_string_buffer(out_size)
-        returned = wintypes.DWORD(0)
-        ok = _k32.DeviceIoControl(self._handle, code, inbuf,
-                                  len(inbuf) if inbuf else 0,
-                                  out, out_size, ctypes.byref(returned), None)
-        if not ok:
-            raise ctypes.WinError(ctypes.get_last_error())
-        return out.raw[:returned.value]
-
-    def query(self):
-        """FSCTL_QUERY_USN_JOURNAL -> QueryInfo(journal_id, first, next)."""
-        raw = self._ioctl(FSCTL_QUERY_USN_JOURNAL, None, 56)
-        jid, first, nxt = struct.unpack_from("<QQQ", raw, 0)
-        return QueryInfo(jid, first, nxt)
-
-    def read(self, start_usn, max_bytes=READ_CHUNK):
-        """One FSCTL_READ_USN_JOURNAL call from start_usn, close records
-        only. Returns (next_usn_after_this_buffer, records_bytes); an
-        empty buffer (next_usn == start_usn) means no records are
-        available right now."""
-        if self._jid is None:
-            self._jid = self.query().journal_id
-        inbuf = _read_request(start_usn, self._jid)
-        try:
-            raw = self._ioctl(FSCTL_READ_USN_JOURNAL, inbuf, max_bytes)
-        except OSError as exc:
-            if getattr(exc, "winerror", None) == ERROR_HANDLE_EOF:
-                return start_usn, b""
-            raise
-        next_usn = struct.unpack_from("<Q", raw, 0)[0]
-        return next_usn, raw[8:]
-
-    def enum(self):
-        """One MFT pass via FSCTL_ENUM_USN_DATA: every file-name record
-        as (frn, parent_frn, name). The volume root arrives as frn 5."""
-        out = []
-        start = 0
-        while True:
-            inbuf = struct.pack("<QQQ", start, 0, 0xFFFFFFFFFFFFFFFF)
-            try:
-                raw = self._ioctl(FSCTL_ENUM_USN_DATA, inbuf, 1 << 16)
-            except OSError as exc:
-                if getattr(exc, "winerror", None) == ERROR_HANDLE_EOF:
-                    break
-                raise
-            start = struct.unpack_from("<Q", raw, 0)[0]
-            for rec in parse_records(raw[8:]):
-                out.append((rec.frn, rec.parent_frn, rec.name))
-            if start == 0:
-                break  # no forward progress; do not spin
-        return out
-
-
-def probe(drive):
-    """Whether a drive's USN journal is usable from this token.
-
-    Returns one of: 'ok', 'not_ntfs', 'no_journal', 'access_denied',
-    'error:<detail>'. access_denied is a legitimate outcome for an
-    unelevated process — callers must degrade to the delta scan."""
-    root = drive if drive.endswith("\\") else drive + "\\"
-    fs = ctypes.create_unicode_buffer(64)
-    if not _k32.GetVolumeInformationW(ctypes.c_wchar_p(root), None, 0,
-                                      None, None, None, fs, 64):
-        return "error:GetVolumeInformationW:%d" % ctypes.get_last_error()
-    if fs.value.lower() != "ntfs":
-        return "not_ntfs"
-    try:
-        journal = UsnJournal(drive)
-    except OSError as exc:
-        if getattr(exc, "winerror", None) == ERROR_ACCESS_DENIED:
-            return "access_denied"
-        return "error:open:%s" % exc
-    try:
-        journal.query()
-        return "ok"
-    except OSError as exc:
-        we = getattr(exc, "winerror", None)
-        if we in (ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_DELETE_IN_PROGRESS):
-            return "no_journal"
-        if we == ERROR_ACCESS_DENIED:
-            return "access_denied"
-        return "error:query:%s" % exc
-    finally:
-        journal.close()
 
 
 def read_checkpoint(conn, drive):
@@ -257,19 +79,29 @@ def bootstrap_volume(conn, journal, drive):
     BEFORE the pass so the replay window covers the bootstrap itself.
     Returns the captured NextUsn."""
     info = journal.query()
-    rows = [(drive, ROOT_FRN, 0, drive.rstrip("\\"))]
-    for frn, pfrn, name in journal.enum():
+    bootstrap_rows(conn, drive, journal.enum(), info.journal_id,
+                   info.next_usn)
+    return info.next_usn
+
+
+def bootstrap_rows(conn, drive, rows, journal_id, next_usn):
+    """The pipe form of bootstrap_volume: consume an iterator of
+    (frn, parent_frn, name) rows with an explicit pre-pass journal_id /
+    next_usn (captured by the helper BEFORE its MFT pass). Same frn_map
+    and checkpoint writes as the U1 journal-object form."""
+    all_rows = [(drive, ROOT_FRN, 0, drive.rstrip("\\"))]
+    for frn, pfrn, name in rows:
         if frn == ROOT_FRN or not name or name in (".", ".."):
             continue
-        rows.append((drive, frn, pfrn, name))
-    for i in range(0, len(rows), 50000):
+        all_rows.append((drive, frn, pfrn, name))
+    for i in range(0, len(all_rows), 50000):
         conn.executemany(
             "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
-            " VALUES(?,?,?,?)", rows[i:i + 50000])
-    set_meta(conn, "usn.%s.journal_id" % drive, str(info.journal_id))
-    set_meta(conn, "usn.%s.next_usn" % drive, str(info.next_usn))
+            " VALUES(?,?,?,?)", all_rows[i:i + 50000])
+    set_meta(conn, "usn.%s.journal_id" % drive, str(journal_id))
+    set_meta(conn, "usn.%s.next_usn" % drive, str(next_usn))
     conn.commit()
-    return info.next_usn
+    return next_usn
 
 
 def resolve_frn_path(conn, drive, frn):
@@ -321,11 +153,14 @@ def apply_records(conn, drive, records):
     frn map. Only close records carrying the REASON_MASK reasons do
     anything. Returns (applied, skipped); skipped counts records dropped
     for an unknown parent FRN or an unpaired rename — the delta net
-    catches those later."""
+    catches those later. records may be USNRecord namedtuples or
+    [frn, parent_frn, usn, reason, attrs, name] lists from the pipe."""
     applied = 0
     skipped = 0
     pending_renames = {}  # frn -> (old_parent_frn, old_name)
     for rec in records:
+        if not isinstance(rec, USNRecord):
+            rec = USNRecord(*rec)
         if not (rec.reason & USN_REASON_CLOSE):
             continue
         reason = rec.reason & ~USN_REASON_CLOSE & 0xFFFFFFFF
