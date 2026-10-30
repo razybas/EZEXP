@@ -189,12 +189,18 @@ def apply_records(conn, drive, records):
     """Apply parsed USN records (in Usn order) to the catalog and the
     frn map. Only close records carrying the REASON_MASK reasons do
     anything. Returns (applied, skipped); skipped counts records dropped
-    for an unknown parent FRN or an unpaired rename — the delta net
-    catches those later. records may be USNRecord namedtuples or
-    [frn, parent_frn, usn, reason, attrs, name] lists from the pipe."""
+    for an unknown parent FRN — the delta net catches those later.
+    records may be USNRecord namedtuples or [frn, parent_frn, usn,
+    reason, attrs, name] lists from the pipe.
+
+    Renames are driven by the RENAME_NEW_NAME record alone: live
+    volumes do not deliver a separate RENAME_OLD_NAME record under
+    ReturnOnlyOnClose (verified in the U2 battery — the OLD record's
+    bytes exist in the journal but the kernel never returns them), and
+    the frn map's current entry for the FRN IS the old name/location.
+    RENAME_OLD records are consumed as no-ops."""
     applied = 0
     skipped = 0
-    pending_renames = {}  # frn -> (old_parent_frn, old_name)
     for rec in records:
         if not isinstance(rec, USNRecord):
             rec = USNRecord(*rec)
@@ -205,14 +211,9 @@ def apply_records(conn, drive, records):
         if not (reason & REASON_MASK):
             continue
         if reason & USN_REASON_RENAME_OLD_NAME:
-            pending_renames[rec.frn] = (rec.parent_frn, rec.name)
-            continue
+            continue  # the RENAME_NEW record carries the rename
         if reason & USN_REASON_RENAME_NEW_NAME:
-            old = pending_renames.pop(rec.frn, None)
-            if old is None:
-                skipped += 1
-                continue
-            ok, unk = _apply_rename(conn, drive, old[0], old[1], rec)
+            ok, unk = _apply_rename(conn, drive, rec)
         elif reason & USN_REASON_FILE_DELETE:
             ok, unk = _apply_delete(conn, drive, rec)
         elif reason & USN_REASON_FILE_CREATE:
@@ -273,17 +274,36 @@ def _fts_rename(conn, rowid, old_name, new_name):
     conn.execute("INSERT INTO fts(rowid, name) VALUES(?,?)", (rowid, new_name))
 
 
-def _apply_rename(conn, drive, old_pfrn, old_name, rec):
-    old_parent = resolve_frn_path(conn, drive, old_pfrn)
+def _apply_rename(conn, drive, rec):
+    """A RENAME_NEW record: the frn map's CURRENT entry for rec.frn is
+    the old name/location — move the catalog row to rec.name under
+    rec.parent_frn and refresh the map. No map entry means the item is
+    new to the index (created+renamed within one close, or moved in
+    from elsewhere) — apply it as a create instead."""
     new_parent = resolve_frn_path(conn, drive, rec.parent_frn)
-    if old_parent is None or new_parent is None:
-        return 0, 1
-    old_path = join_path(old_parent, old_name)
+    if new_parent is None:
+        return 0, 1  # unknown parent: never guess a path
+    old_path = resolve_frn_path(conn, drive, rec.frn)
+    if old_path is None:
+        return _apply_create(conn, drive, rec)
     new_path = join_path(new_parent, rec.name)
+    if old_path == new_path:
+        conn.execute(
+            "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
+            " VALUES(?,?,?,?)",
+            (drive, rec.frn, rec.parent_frn, rec.name))
+        return 1, 0
+    old_parent, old_name = split_path(old_path)
     row = conn.execute("SELECT id, is_dir FROM files WHERE parent=? AND name=?",
                        (old_parent, old_name)).fetchone()
     if row is None:
-        return 0, 1  # not indexed (skipped name / pre-bootstrap); delta net
+        # not indexed (skipped name / pre-bootstrap): refresh the map;
+        # the delta net settles the catalog
+        conn.execute(
+            "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
+            " VALUES(?,?,?,?)",
+            (drive, rec.frn, rec.parent_frn, rec.name))
+        return 1, 0
     rid, is_dir = row
     try:
         if is_dir:

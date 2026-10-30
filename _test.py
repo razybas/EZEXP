@@ -2412,7 +2412,8 @@ assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
 assert _u1conn.execute("SELECT size FROM files WHERE parent=? AND name=?",
                        (_u1docs, "hello.txt")).fetchone()[0] == 40
 
-# file rename pair by FRN -> row moves, FTS follows
+# file rename pair by FRN -> row moves, FTS follows (the OLD record is a
+# no-op on live volumes; the NEW record + the frn map carry the rename)
 os.rename(os.path.join(_u1docs, "hello.txt"), os.path.join(_u1docs, "goodbye.txt"))
 _u1fj.chunks = [(0x10006,
     _usn_record(200, 100, 0x10005, usn.USN_REASON_RENAME_OLD_NAME | usn.USN_REASON_CLOSE, "hello.txt")
@@ -2430,6 +2431,21 @@ assert names(_rows) == ["goodbye.txt"], _rows
 _rows, _ = ez.do_search(_u1conn, "hello")
 assert names(_rows) == [], _rows
 
+# the LIVE kernel shape: RENAME_NEW alone (no OLD record ever arrives) must
+# move the row using the frn map's current entry as the old name
+os.rename(os.path.join(_u1docs, "goodbye.txt"), os.path.join(_u1docs, "renamed.txt"))
+_u1fj.chunks = [(0x10007, _usn_record(200, 100, 0x10007,
+                usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE, "renamed.txt"))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
+assert not _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                           (_u1docs, "goodbye.txt")).fetchone()
+assert _u1conn.execute("SELECT id FROM files WHERE parent=? AND name=?",
+                       (_u1docs, "renamed.txt")).fetchone()
+assert _u1conn.execute("SELECT name FROM fts WHERE rowid=?",
+                       (_u1conn.execute("SELECT id FROM files WHERE name='renamed.txt'"
+                                        ).fetchone()[0],)).fetchone() == ("renamed.txt",)
+
 # directory rename -> dir row renamed, child parent prefixes rewritten in one pass
 ez.insert_rows(_u1conn, [ez._make_row(_u1dir, "docs", True, os.stat(_u1docs), _u1drive)])
 _u1fj.chunks = [(0x10008,
@@ -2444,38 +2460,33 @@ assert _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
 assert not _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
                            (_u1dir, "docs")).fetchone()
 assert _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
-                       (_u1papers, "goodbye.txt")).fetchone(), "child parent prefix not rewritten"
-_rows, _ = ez.do_search(_u1conn, "goodbye")
-assert names(_rows) == ["goodbye.txt"], _rows
+                       (_u1papers, "renamed.txt")).fetchone(), "child parent prefix not rewritten"
+_rows, _ = ez.do_search(_u1conn, "renamed")
+assert names(_rows) == ["renamed.txt"], _rows
 assert _u1conn.execute("SELECT name FROM frn_map WHERE drive=? AND frn=100",
                        (_u1drive,)).fetchone()[0] == "papers"
 
 # directory delete -> subtree rows gone, FTS gone, frn_map subtree gone
 os.rename(_u1docs, _u1papers)  # mirror the journal-applied rename on disk
-os.remove(os.path.join(_u1papers, "goodbye.txt"))
+os.remove(os.path.join(_u1papers, "renamed.txt"))
 os.rmdir(_u1papers)
 _u1fj.chunks = [(0x1000A, _usn_record(100, 5, 0x10009,
                 usn.USN_REASON_FILE_DELETE | usn.USN_REASON_CLOSE, "papers",
                 usn.FILE_ATTRIBUTE_DIRECTORY))]
 _u1res = usn.poll(_u1conn, _u1fj, _u1drive)
 assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
-assert _u1conn.execute("SELECT COUNT(*) FROM files WHERE name IN ('papers','goodbye.txt')").fetchone()[0] == 0
-assert _u1conn.execute("SELECT COUNT(*) FROM fts WHERE name IN ('papers','goodbye.txt')").fetchone()[0] == 0
+assert _u1conn.execute("SELECT COUNT(*) FROM files WHERE name IN ('papers','renamed.txt')").fetchone()[0] == 0
+assert _u1conn.execute("SELECT COUNT(*) FROM fts WHERE name IN ('papers','renamed.txt')").fetchone()[0] == 0
 assert _u1conn.execute("SELECT COUNT(*) FROM frn_map WHERE drive=? AND frn IN (100,200)",
                        (_u1drive,)).fetchone()[0] == 0
 
-# unknown parent FRN -> record skipped and counted, never guessed
+# RENAME_NEW for an item with NO map entry and an unknown parent -> skipped
+# and counted (never guess); with a resolvable parent it applies as a create
 _u1fj.chunks = [(0x1000C, _usn_record(999, 424242, 0x1000B,
-                usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE, "ghost.txt"))]
+                usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE, "ghost.txt"))]
 _u1res = usn.poll(_u1conn, _u1fj, _u1drive)
 assert _u1res["applied"] == 0 and _u1res["skipped"] == 1, _u1res
 assert _u1conn.execute("SELECT COUNT(*) FROM files WHERE name='ghost.txt'").fetchone()[0] == 0
-
-# unpaired RENAME_NEW (window boundary) -> skipped and counted
-_u1fj.chunks = [(0x1000E, _usn_record(300, 5, 0x1000D,
-                usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE, "orphan.txt"))]
-_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
-assert _u1res["applied"] == 0 and _u1res["skipped"] == 1, _u1res
 
 # invalid checkpoint (journal id changed) -> poll refuses
 ez.set_meta(_u1conn, "usn.%s.journal_id" % _u1drive, "777")
