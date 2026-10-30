@@ -68,6 +68,13 @@ def _ensure_schema(conn):
             mtime REAL NOT NULL,
             target TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS frn_map(
+            drive TEXT NOT NULL,
+            frn INTEGER NOT NULL,
+            parent_frn INTEGER,
+            name TEXT,
+            PRIMARY KEY(drive, frn)
+        );
     """)
     try:
         conn.execute(

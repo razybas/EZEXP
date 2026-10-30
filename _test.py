@@ -2274,6 +2274,208 @@ assert "#1d1d1f" in main_win.dock_transcript.styleSheet().lower(), "dock_transcr
 assert "#ffffff" in main_win.dock_input.styleSheet().lower(), "dock_input must have light #ffffff background"
 assert "#1d1d1f" in main_win.dock_input.styleSheet().lower(), "dock_input must have dark #1d1d1f text"
 
+# --- U1: USN journal core (parser, frn_map schema, checkpoints, applier) -----
+from ezexp import usn as usn  # noqa: E402
+import struct as _struct  # noqa: E402
+
+
+def _usn_record(frn, parent_frn, usn_val, reason, name, attrs=0):
+    """Independent USN_RECORD_V2 encoder built from the documented layout
+    (test-side on purpose: it must not share code with usn.parse_records)."""
+    nb = name.encode("utf-16-le")
+    rec_len = (60 + len(nb) + 7) & ~7
+    return _struct.pack("<IHHQQqQIIIIHH",
+                        rec_len, 2, 0, frn, parent_frn, usn_val, 0,
+                        reason, 0, 0, attrs, len(nb), 60) + nb + b"\x00" * (rec_len - 60 - len(nb))
+
+
+class _FakeJournal:
+    """Journal-like object with the same query()/read()/enum() seam as
+    usn.UsnJournal, serving pre-built record buffers."""
+
+    def __init__(self, journal_id=0xA11CE, first_usn=0x10000, next_usn=0x10000,
+                 chunks=None, enum_entries=()):
+        self.journal_id = journal_id
+        self.first_usn = first_usn
+        self.next_usn = next_usn
+        self.chunks = list(chunks or [])  # [(next_usn_after, raw_bytes), ...]
+        self.enum_entries = list(enum_entries)
+
+    def query(self):
+        return usn.QueryInfo(self.journal_id, self.first_usn, self.next_usn)
+
+    def read(self, start_usn, max_bytes=1 << 20):
+        if self.chunks:
+            return self.chunks.pop(0)
+        return start_usn, b""
+
+    def enum(self):
+        return list(self.enum_entries)
+
+
+# (a) parser round-trip on synthetic USN_RECORD_V2 byte buffers
+_u1buf = (
+    _usn_record(100, 5, 0x1001, usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE, "new-file.txt")
+    + _usn_record(101, 100, 0x1002, usn.USN_REASON_FILE_DELETE | usn.USN_REASON_CLOSE, "old.txt")
+    + _usn_record(102, 100, 0x1003, usn.USN_REASON_RENAME_OLD_NAME | usn.USN_REASON_CLOSE, "a.txt")
+    + _usn_record(102, 100, 0x1004, usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE,
+                  "b.txt", usn.FILE_ATTRIBUTE_DIRECTORY)
+)
+_recs = usn.parse_records(_u1buf)
+assert [r.name for r in _recs] == ["new-file.txt", "old.txt", "a.txt", "b.txt"], _recs
+assert [r.frn for r in _recs] == [100, 101, 102, 102], _recs
+assert [r.parent_frn for r in _recs] == [5, 100, 100, 100], _recs
+assert [r.usn for r in _recs] == [0x1001, 0x1002, 0x1003, 0x1004], _recs
+assert _recs[0].reason & usn.USN_REASON_CLOSE, _recs[0]
+assert _recs[0].reason & usn.USN_REASON_FILE_CREATE, _recs[0]
+assert _recs[3].reason & usn.USN_REASON_RENAME_NEW_NAME, _recs[3]
+assert _recs[3].attrs & usn.FILE_ATTRIBUTE_DIRECTORY, _recs[3]
+# a truncated/garbage tail must not raise and must not yield a bogus record
+assert len(usn.parse_records(_u1buf + b"\x99\x00\x00\x00\x00")) == 4
+
+# frn_map table exists after _ensure_schema with the spec'd shape
+_u1schema = ez.sqlite3.connect(os.path.join(tmp, "u1schema.db"))
+ez._ensure_schema(_u1schema)
+assert [r[1] for r in _u1schema.execute("PRAGMA table_info(frn_map)")] == [
+    "drive", "frn", "parent_frn", "name"], "frn_map schema mismatch"
+_u1schema.execute("INSERT INTO frn_map VALUES('C:', 5, 0, 'C:')")
+try:
+    _u1schema.execute("INSERT INTO frn_map VALUES('C:', 5, 0, 'dup')")
+    raise AssertionError("frn_map must enforce PRIMARY KEY(drive, frn)")
+except ez.sqlite3.IntegrityError:
+    pass
+_u1schema.close()
+
+# (c) checkpoint wrap logic — function-level, fake journal data
+_u1info = usn.QueryInfo(0xA11CE, 0x90000, 0x90010)  # journal wrapped: FirstUsn above saved USN
+assert not usn.checkpoint_valid(None, _u1info)
+assert not usn.checkpoint_valid(usn.Checkpoint(0xA11CE, 0x1000), _u1info), \
+    "saved USN below FirstUsn (wrap) must be invalid"
+assert not usn.checkpoint_valid(usn.Checkpoint(0xB0B, 0x90010), _u1info), \
+    "journal id change must be invalid"
+assert usn.checkpoint_valid(usn.Checkpoint(0xA11CE, 0x90005), _u1info)
+
+# (b) applier on a temp catalog + fake journal
+_u1dir = os.path.join(tmp, "u1tree")
+_u1docs = os.path.join(_u1dir, "docs")
+os.makedirs(_u1docs, exist_ok=True)
+_u1drive = _u1dir[:2].upper()
+_u1conn = ez.sqlite3.connect(os.path.join(tmp, "u1.db"))
+ez._ensure_schema(_u1conn)
+_u1fj = _FakeJournal(enum_entries=[(100, 5, "docs")])
+
+# no checkpoint yet -> poll must refuse (caller bootstraps or falls back to delta)
+assert usn.poll(_u1conn, _u1fj, _u1drive) is None, "poll without checkpoint must refuse"
+
+usn.bootstrap_volume(_u1conn, _u1fj, _u1drive)
+assert _u1conn.execute("SELECT name FROM frn_map WHERE drive=? AND frn=5",
+                       (_u1drive,)).fetchone()[0] == _u1drive
+assert _u1conn.execute("SELECT parent_frn, name FROM frn_map WHERE drive=? AND frn=100",
+                       (_u1drive,)).fetchone() == (5, "docs")
+assert ez.get_meta(_u1conn, "usn.%s.journal_id" % _u1drive) == str(0xA11CE)
+assert ez.get_meta(_u1conn, "usn.%s.next_usn" % _u1drive) == str(0x10000)
+# the fake volume's root resolves to the temp tree, not the real C: root
+_u1conn.execute("UPDATE frn_map SET name=? WHERE drive=? AND frn=5", (_u1dir, _u1drive))
+_u1conn.commit()
+
+# create -> files row + FTS entry + frn_map entry, checkpoint advanced
+with open(os.path.join(_u1docs, "hello.txt"), "w") as f:
+    f.write("hi")
+_u1fj.chunks = [(0x10002, _usn_record(200, 100, 0x10001,
+                 usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE, "hello.txt"))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res is not None and _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
+_u1row = _u1conn.execute("SELECT id FROM files WHERE parent=? AND name=?",
+                         (_u1docs, "hello.txt")).fetchone()
+assert _u1row, "USN create did not insert the files row"
+assert _u1conn.execute("SELECT name FROM fts WHERE rowid=?",
+                       (_u1row[0],)).fetchone() == ("hello.txt",)
+assert _u1conn.execute("SELECT parent_frn, name FROM frn_map WHERE drive=? AND frn=200",
+                       (_u1drive,)).fetchone() == (100, "hello.txt")
+assert ez.get_meta(_u1conn, "usn.%s.next_usn" % _u1drive) == str(0x10002)
+
+# data change -> size/mtime refreshed from stat
+with open(os.path.join(_u1docs, "hello.txt"), "w") as f:
+    f.write("x" * 40)
+_u1fj.chunks = [(0x10004, _usn_record(200, 100, 0x10003,
+                 usn.USN_REASON_DATA_EXTEND | usn.USN_REASON_CLOSE, "hello.txt"))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
+assert _u1conn.execute("SELECT size FROM files WHERE parent=? AND name=?",
+                       (_u1docs, "hello.txt")).fetchone()[0] == 40
+
+# file rename pair by FRN -> row moves, FTS follows
+os.rename(os.path.join(_u1docs, "hello.txt"), os.path.join(_u1docs, "goodbye.txt"))
+_u1fj.chunks = [(0x10006,
+    _usn_record(200, 100, 0x10005, usn.USN_REASON_RENAME_OLD_NAME | usn.USN_REASON_CLOSE, "hello.txt")
+    + _usn_record(200, 100, 0x10006, usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE, "goodbye.txt"))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
+assert not _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                           (_u1docs, "hello.txt")).fetchone()
+assert _u1conn.execute("SELECT id FROM files WHERE parent=? AND name=?",
+                       (_u1docs, "goodbye.txt")).fetchone()
+assert _u1conn.execute("SELECT parent_frn, name FROM frn_map WHERE drive=? AND frn=200",
+                       (_u1drive,)).fetchone() == (100, "goodbye.txt")
+_rows, _ = ez.do_search(_u1conn, "goodbye")
+assert names(_rows) == ["goodbye.txt"], _rows
+_rows, _ = ez.do_search(_u1conn, "hello")
+assert names(_rows) == [], _rows
+
+# directory rename -> dir row renamed, child parent prefixes rewritten in one pass
+ez.insert_rows(_u1conn, [ez._make_row(_u1dir, "docs", True, os.stat(_u1docs), _u1drive)])
+_u1fj.chunks = [(0x10008,
+    _usn_record(100, 5, 0x10007, usn.USN_REASON_RENAME_OLD_NAME | usn.USN_REASON_CLOSE, "docs")
+    + _usn_record(100, 5, 0x10008, usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE,
+                  "papers", usn.FILE_ATTRIBUTE_DIRECTORY))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
+_u1papers = os.path.join(_u1dir, "papers")
+assert _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                       (_u1dir, "papers")).fetchone()
+assert not _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                           (_u1dir, "docs")).fetchone()
+assert _u1conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                       (_u1papers, "goodbye.txt")).fetchone(), "child parent prefix not rewritten"
+_rows, _ = ez.do_search(_u1conn, "goodbye")
+assert names(_rows) == ["goodbye.txt"], _rows
+assert _u1conn.execute("SELECT name FROM frn_map WHERE drive=? AND frn=100",
+                       (_u1drive,)).fetchone()[0] == "papers"
+
+# directory delete -> subtree rows gone, FTS gone, frn_map subtree gone
+os.rename(_u1docs, _u1papers)  # mirror the journal-applied rename on disk
+os.remove(os.path.join(_u1papers, "goodbye.txt"))
+os.rmdir(_u1papers)
+_u1fj.chunks = [(0x1000A, _usn_record(100, 5, 0x10009,
+                usn.USN_REASON_FILE_DELETE | usn.USN_REASON_CLOSE, "papers",
+                usn.FILE_ATTRIBUTE_DIRECTORY))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 1 and _u1res["skipped"] == 0, _u1res
+assert _u1conn.execute("SELECT COUNT(*) FROM files WHERE name IN ('papers','goodbye.txt')").fetchone()[0] == 0
+assert _u1conn.execute("SELECT COUNT(*) FROM fts WHERE name IN ('papers','goodbye.txt')").fetchone()[0] == 0
+assert _u1conn.execute("SELECT COUNT(*) FROM frn_map WHERE drive=? AND frn IN (100,200)",
+                       (_u1drive,)).fetchone()[0] == 0
+
+# unknown parent FRN -> record skipped and counted, never guessed
+_u1fj.chunks = [(0x1000C, _usn_record(999, 424242, 0x1000B,
+                usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE, "ghost.txt"))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 0 and _u1res["skipped"] == 1, _u1res
+assert _u1conn.execute("SELECT COUNT(*) FROM files WHERE name='ghost.txt'").fetchone()[0] == 0
+
+# unpaired RENAME_NEW (window boundary) -> skipped and counted
+_u1fj.chunks = [(0x1000E, _usn_record(300, 5, 0x1000D,
+                usn.USN_REASON_RENAME_NEW_NAME | usn.USN_REASON_CLOSE, "orphan.txt"))]
+_u1res = usn.poll(_u1conn, _u1fj, _u1drive)
+assert _u1res["applied"] == 0 and _u1res["skipped"] == 1, _u1res
+
+# invalid checkpoint (journal id changed) -> poll refuses
+ez.set_meta(_u1conn, "usn.%s.journal_id" % _u1drive, "777")
+assert usn.poll(_u1conn, _u1fj, _u1drive) is None
+_u1conn.close()
+
+# --- U1 end ------------------------------------------------------------------
+
 
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()
