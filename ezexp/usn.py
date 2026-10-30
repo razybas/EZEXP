@@ -52,6 +52,18 @@ from ezexp.usn_journal import (  # noqa: F401
 
 Checkpoint = namedtuple("Checkpoint", "journal_id next_usn")
 
+# NTFS file reference numbers carry a 16-bit sequence number in the high
+# bits: the root directory arrives as (1<<48)|5 in USN records but as a
+# fresh sequence number after re-creation. The frn map is keyed on the
+# 48-bit MFT RECORD NUMBER only — one record number identifies exactly
+# one live file at a time, so masking is collision-free and makes the
+# enum rows and the USN records' parent references agree.
+FRN_MASK = (1 << 48) - 1
+
+
+def _frn(v):
+    return int(v) & FRN_MASK
+
 
 def read_checkpoint(conn, drive):
     jid = get_meta(conn, "usn.%s.journal_id" % drive)
@@ -104,9 +116,10 @@ def _write_frn_rows(conn, drive, rows):
         " VALUES(?,?,?,?)", (drive, ROOT_FRN, 0, drive.rstrip("\\")))
     batch = []
     for frn, pfrn, name in rows:
+        frn = _frn(frn)
         if frn == ROOT_FRN or not name or name in (".", ".."):
             continue
-        batch.append((drive, frn, pfrn, name))
+        batch.append((drive, frn, _frn(pfrn), name))
         if len(batch) >= 50000:
             conn.executemany(
                 "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
@@ -133,7 +146,7 @@ def resolve_frn_path(conn, drive, frn):
     skip the record, never guess a path."""
     parts = []
     seen = set()
-    cur = frn
+    cur = _frn(frn)
     while True:
         if cur in seen:
             return None
@@ -152,6 +165,7 @@ def resolve_frn_path(conn, drive, frn):
 
 
 def _forget_frn_subtree(conn, drive, frn):
+    frn = _frn(frn)
     conn.execute(
         "WITH RECURSIVE d(frn) AS ("
         " SELECT ? UNION"
@@ -184,6 +198,7 @@ def apply_records(conn, drive, records):
     for rec in records:
         if not isinstance(rec, USNRecord):
             rec = USNRecord(*rec)
+        rec = rec._replace(frn=_frn(rec.frn), parent_frn=_frn(rec.parent_frn))
         if not (rec.reason & USN_REASON_CLOSE):
             continue
         reason = rec.reason & ~USN_REASON_CLOSE & 0xFFFFFFFF
