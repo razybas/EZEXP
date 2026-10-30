@@ -277,7 +277,7 @@ class MainWindow(FramelessWindow):
         ws_header_row.addWidget(self.ws_btn_refresh)
         ws_lay.addLayout(ws_header_row)
 
-        self.ws_lbl_context = QLabel("Context: (none)", self.workspace_pane)
+        self.ws_lbl_context = QLabel("Context: (no folder open)", self.workspace_pane)
         self.ws_lbl_context.setObjectName("wsLblContext")
         self.ws_lbl_context.setStyleSheet("font-size: 11px; color: #6e6e73;")
         self.ws_lbl_context.setWordWrap(True)
@@ -926,20 +926,24 @@ class MainWindow(FramelessWindow):
         self.status_left.setText(left)
         if not rows and not self._ql_selected:
             self.details.show_row(None)
+            self.update_dock_context()
         else:
             self.tree.setCurrentItem(self.tree.topLevelItem(0))
+            self.update_dock_context()
 
     def on_selection(self):
         if self._ql_selected:
             return
         item = self.tree.currentItem()
         self.details.show_row(item.data(0, Qt.UserRole) if item else None)
+        self.update_dock_context()
 
     def on_tree_clicked(self, item, col=0):
         self._ql_selected = None
         for b in self._ql_buttons:
             b.setChecked(False)
         self.details.show_row(item.data(0, Qt.UserRole) if item else None)
+        self.update_dock_context()
 
     def current_row(self):
         item = self.tree.currentItem()
@@ -1311,9 +1315,12 @@ class MainWindow(FramelessWindow):
     @current_place.setter
     def current_place(self, val):
         self._current_place = val
+        self.update_dock_context()
+
+    def update_dock_context(self):
         if hasattr(self, "ws_lbl_context"):
             cur = self.get_current_folder()
-            self.ws_lbl_context.setText(f"Context: {cur}" if cur else "Context: (none)")
+            self.ws_lbl_context.setText(f"Context: {cur}" if cur else "Context: (no folder open)")
 
     def toggle_agent_dock(self, checked=None):
         if checked is None:
@@ -1344,6 +1351,13 @@ class MainWindow(FramelessWindow):
             return os.path.abspath(self._current_folder_override) if self._current_folder_override else None
         if getattr(self, "_current_place", None):
             return os.path.abspath(self._current_place)
+        row = self.current_row()
+        if not row and hasattr(self, "details"):
+            row = getattr(self.details, "_row", None)
+        if row and row.get("is_dir"):
+            p = self.row_path(row)
+            if p:
+                return os.path.abspath(p)
         cf = getattr(self, "current_folder", None)
         return os.path.abspath(cf) if cf else None
 
@@ -1429,8 +1443,7 @@ class MainWindow(FramelessWindow):
 
     def refresh_workspace_pane(self):
         """Update context/grant labels and refresh file list from grant_dir."""
-        cur_folder = self.get_current_folder()
-        self.ws_lbl_context.setText(f"Context: {cur_folder}" if cur_folder else "Context: (none)")
+        self.update_dock_context()
 
         cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
         grant_dir = (cfg.get("grant_dir") or "").strip() or getattr(self, "grant_dir", None) or ""

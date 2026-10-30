@@ -2170,6 +2170,100 @@ with open(task_file, "r", encoding="utf-8") as f:
 assert task_data_dock.get("context") == {"current_folder": os.path.abspath(r"D:\games\gta 5")}, f"Unexpected context from dock: {task_data_dock.get('context')}"
 assert "test folder context from dock" in task_data_dock.get("text", "")
 
+# (e) T1: Three-state honest context semantics
+# State 1: Drilled into a folder -> that folder
+main_win.current_place = r"D:\games\gta 5"
+assert main_win.get_current_folder() == os.path.abspath(r"D:\games\gta 5")
+assert main_win.ws_lbl_context.text() == f"Context: {os.path.abspath(r'D:\games\gta 5')}"
+
+# State 2: Library root (All Files) WITH a folder selected -> the selected folder is the context
+main_win.current_place = None
+folder_row = {
+    "parent": r"C:\Windows",
+    "name": "Temp",
+    "is_dir": 1,
+    "size": 0,
+    "mtime": 1700000000,
+    "category": "folder",
+    "kind": "Folder",
+}
+file_row = {
+    "parent": r"C:\Windows",
+    "name": "notepad.exe",
+    "is_dir": 0,
+    "size": 12345,
+    "mtime": 1700000000,
+    "category": "prog",
+    "kind": "Application",
+}
+main_win.tree.clear()
+item_folder = ez.make_row_item(folder_row)
+item_file = ez.make_row_item(file_row)
+main_win.tree.addTopLevelItem(item_folder)
+main_win.tree.addTopLevelItem(item_file)
+
+main_win.tree.setCurrentItem(item_folder)
+qapp.processEvents()
+
+expected_folder_ctx = os.path.abspath(r"C:\Windows\Temp")
+assert main_win.get_current_folder() == expected_folder_ctx, f"Expected {expected_folder_ctx}, got {main_win.get_current_folder()}"
+assert main_win.ws_lbl_context.text() == f"Context: {expected_folder_ctx}", f"Expected Context: {expected_folder_ctx}, got {main_win.ws_lbl_context.text()}"
+
+# Payload check for State 2: fake-harness pattern
+remove_control_files()
+set_control({"mode": "happy"})
+main_win.dock_transcript.clear()
+main_win.dock_input.setText("test folder context from selected folder")
+main_win.send_agent_message()
+
+t0 = time.time()
+while main_win._harness_worker is not None and main_win._harness_worker.isRunning():
+    qapp.processEvents()
+    time.sleep(0.05)
+    if time.time() - t0 > 10:
+        break
+
+task_file = os.path.join(fake_harness_root, "task_received.json")
+assert os.path.exists(task_file), "Runner should have received task from dock"
+with open(task_file, "r", encoding="utf-8") as f:
+    task_data_sel = json.load(f)
+assert task_data_sel.get("context") == {"current_folder": expected_folder_ctx}, f"Unexpected context from selection: {task_data_sel.get('context')}"
+
+# State 3: Library root with nothing (or a file) selected -> context stays none, label says Context: (no folder open)
+# Subcase 3a: File selected
+main_win.tree.setCurrentItem(item_file)
+qapp.processEvents()
+assert main_win.get_current_folder() is None, f"Expected None for file selection, got {main_win.get_current_folder()}"
+assert main_win.ws_lbl_context.text() == "Context: (no folder open)", f"Expected Context: (no folder open), got {main_win.ws_lbl_context.text()}"
+
+# Subcase 3b: Nothing selected
+main_win.tree.setCurrentItem(None)
+main_win.details.show_row(None)
+main_win.on_selection()
+qapp.processEvents()
+assert main_win.get_current_folder() is None, f"Expected None for no selection, got {main_win.get_current_folder()}"
+assert main_win.ws_lbl_context.text() == "Context: (no folder open)", f"Expected Context: (no folder open), got {main_win.ws_lbl_context.text()}"
+
+# Payload check for State 3:
+remove_control_files()
+set_control({"mode": "happy"})
+main_win.dock_transcript.clear()
+main_win.dock_input.setText("test folder context with no folder open")
+main_win.send_agent_message()
+
+t0 = time.time()
+while main_win._harness_worker is not None and main_win._harness_worker.isRunning():
+    qapp.processEvents()
+    time.sleep(0.05)
+    if time.time() - t0 > 10:
+        break
+
+task_file = os.path.join(fake_harness_root, "task_received.json")
+assert os.path.exists(task_file), "Runner should have received task from dock"
+with open(task_file, "r", encoding="utf-8") as f:
+    task_data_none = json.load(f)
+assert task_data_none.get("context") == {"current_folder": None}, f"Unexpected context when no folder open: {task_data_none.get('context')}"
+
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()
 worker.stop()
