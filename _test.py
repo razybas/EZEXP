@@ -2645,6 +2645,201 @@ for _line in _hsrc.splitlines():
 
 # --- U2a end -----------------------------------------------------------------
 
+# --- U2b: app-side USN client + watcher wiring (fake transport) --------------
+from ezexp import usn_client as ucl  # noqa: E402
+from ezexp import indexer as idxmod  # noqa: E402
+
+
+class _FakeUsnClient:
+    """UsnClient stand-in: scripted messages per drive, recorded sends."""
+
+    def __init__(self, script=None, ready=None, enum_rows=(), enum_meta=(7, 512)):
+        self.ready = ready if ready is not None else {"C:": "ok"}
+        self.sent = []
+        self.script = dict(script or {})  # drive -> list of messages
+        self.enum_data = list(enum_rows)
+        self.enum_meta = enum_meta
+        self.last_enum = None
+        self.closed = False
+
+    def connect(self):
+        return self.ready
+
+    def send_subscribe(self, drive, start_usn):
+        self.sent.append(("subscribe", drive, start_usn))
+
+    def send_enum(self, drive):
+        self.sent.append(("enum", drive))  # real clients send this too
+
+    def next_message(self, drive=None, timeout=0.0):
+        q = self.script.get(drive)
+        if q:
+            return q.pop(0)
+        return None
+
+    def enum_rows(self, drive):
+        self.sent.append(("enum", drive))
+        for row in self.enum_data:
+            if self._stopped():
+                raise ucl.UsnUnavailable("stopped")
+            yield tuple(row)
+        self.last_enum = (drive, self.enum_meta[0], self.enum_meta[1])
+
+    def _stopped(self):
+        return False
+
+    def close(self):
+        self.closed = True
+
+
+_u2b_delta_calls = []
+_u2b_conn = ez.sqlite3.connect(os.path.join(tmp, "u2b.db"), check_same_thread=False)
+_u2b_dbpath = os.path.join(tmp, "u2b.db")
+def _u2b_newconn():
+    return ez.sqlite3.connect(_u2b_dbpath, check_same_thread=False, timeout=10)
+ez._ensure_schema(_u2b_conn)
+_u2bdir = os.path.join(tmp, "u2btree")
+_u2bdocs = os.path.join(_u2bdir, "docs")
+os.makedirs(_u2bdocs, exist_ok=True)
+_u2bdrive = _u2bdir[:2].upper()
+
+# valid checkpoint + populated frn_map whose root resolves to the temp tree
+ez.set_meta(_u2b_conn, "usn.%s.journal_id" % _u2bdrive, "4242")
+ez.set_meta(_u2b_conn, "usn.%s.next_usn" % _u2bdrive, "256")
+_u2b_conn.execute("INSERT INTO frn_map VALUES(?,?,?,?)", (_u2bdrive, 5, 0, _u2bdir))
+_u2b_conn.execute("INSERT INTO frn_map VALUES(?,?,?,?)", (_u2bdrive, 100, 5, "docs"))
+_u2b_conn.commit()
+
+_JI = {"type": "journal_info", "drive": _u2bdrive, "journal_id": 4242,
+       "first_usn": 16, "next_usn": 4096}  # valid: saved 256 >= first 16
+
+
+def _rec_msg(rows, nxt):
+    return {"type": "records", "drive": _u2bdrive, "records": rows, "next_usn": nxt}
+
+
+def _u2b_wait(pred, secs=5):
+    end = time.time() + secs
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+# scenario 1: valid checkpoint -> subscribe FROM THE CHECKPOINT, replay applies
+with open(os.path.join(_u2bdocs, "fresh.txt"), "w") as f:
+    f.write("z" * 11)
+_cli = _FakeUsnClient(script={_u2bdrive: [
+    _JI,
+    _rec_msg([[200, 100, 257, usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE,
+               0, "fresh.txt"]], 258),
+]})
+_w = idxmod.UsnWatcher(client_factory=lambda: _cli,
+                       conn_factory=_u2b_newconn,
+                       delta_fn=lambda conn, roots, p, alive: _u2b_delta_calls.append(roots))
+_w.start()
+assert _u2b_wait(lambda: ez.get_meta(_u2b_conn, "usn.%s.next_usn" % _u2bdrive) == "258"), \
+    "replay did not advance the checkpoint to 258"
+assert ("subscribe", _u2bdrive, 256) in _cli.sent, _cli.sent  # from the checkpoint, not 0
+assert _u2b_conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                         (_u2bdocs, "fresh.txt")).fetchone()
+assert _u2b_conn.execute("SELECT parent_frn, name FROM frn_map WHERE drive=? AND frn=200",
+                         (_u2bdrive,)).fetchone() == (100, "fresh.txt")
+assert _u2bdrive + " USN" in _w.last_status, _w.last_status
+assert "delta" in _w.last_status  # drives the helper does not report ok
+assert _u2b_delta_calls == []  # replay path runs NO delta scan
+_w.stop()
+_w.wait(5000)
+assert _cli.closed
+
+# scenario 2: stale -> helper enum -> bootstrap -> ONE delta scan -> subscribe
+# from the enum's next_usn, then live records apply
+ez.set_meta(_u2b_conn, "usn.%s.journal_id" % _u2bdrive, "4242")
+ez.set_meta(_u2b_conn, "usn.%s.next_usn" % _u2bdrive, "256")
+_u2b_conn.commit()
+_cli2 = _FakeUsnClient(
+    script={_u2bdrive: [_JI, {"type": "stale", "drive": _u2bdrive}]},
+    enum_rows=[(100, 5, "docs"), (200, 100, "boot.txt"), (300, 5, "top.txt")],
+    enum_meta=(999, 512))
+with open(os.path.join(_u2bdocs, "boot.txt"), "w") as f:
+    f.write("boot")
+_w2 = idxmod.UsnWatcher(client_factory=lambda: _cli2,
+                        conn_factory=_u2b_newconn,
+                        delta_fn=lambda conn, roots, p, alive: _u2b_delta_calls.append(roots))
+_n_delta = len(_u2b_delta_calls)
+_w2.start()
+assert _u2b_wait(lambda: ez.get_meta(_u2b_conn, "usn.%s.next_usn" % _u2bdrive) == "512"), \
+    "bootstrap did not write the enum's checkpoint"
+assert ("enum", _u2bdrive) in _cli2.sent
+# the bootstrap legitimately re-pointed the root FRN at the real volume;
+# re-point it at the temp tree so the live record below can stat its file
+_u2b_conn.execute("UPDATE frn_map SET name=? WHERE drive=? AND frn=5",
+                  (_u2bdir, _u2bdrive))
+_u2b_conn.commit()
+assert _u2b_conn.execute("SELECT name FROM frn_map WHERE drive=? AND frn=300",
+                         (_u2bdrive,)).fetchone() == ("top.txt",)
+assert _u2b_conn.execute("SELECT parent_frn, name FROM frn_map WHERE drive=? AND frn=200",
+                         (_u2bdrive,)).fetchone() == (100, "boot.txt")
+assert ez.get_meta(_u2b_conn, "usn.%s.journal_id" % _u2bdrive) == "999"
+assert len(_u2b_delta_calls) == _n_delta + 1, _u2b_delta_calls  # exactly one delta
+assert _u2b_delta_calls[-1] == [_u2bdrive + "\\"], _u2b_delta_calls
+assert ("subscribe", _u2bdrive, 512) in _cli2.sent, _cli2.sent  # from the enum tip
+# live record after bootstrap lands
+with open(os.path.join(_u2bdocs, "after-boot.txt"), "w") as f:
+    f.write("ab")
+_cli2.script[_u2bdrive].append(
+    _rec_msg([[400, 100, 513, usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE,
+               0, "after-boot.txt"]], 514))
+assert _u2b_wait(lambda: ez.get_meta(_u2b_conn, "usn.%s.next_usn" % _u2bdrive) == "514")
+assert _u2b_conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
+                         (_u2bdocs, "after-boot.txt")).fetchone()
+_w2.stop()
+_w2.wait(5000)
+
+# scenario 3: helper unreachable -> every drive degrades to delta, zero
+# exceptions, delta net untouched, clean shutdown
+def _boom():
+    raise ucl.UsnUnavailable("no pipe in test")
+
+
+_w3 = idxmod.UsnWatcher(client_factory=_boom,
+                        conn_factory=_u2b_newconn,
+                        delta_fn=lambda conn, roots, p, alive: _u2b_delta_calls.append(roots))
+_n_delta = len(_u2b_delta_calls)
+_w3.start()
+assert _u2b_wait(lambda: "delta" in _w3.last_status and "Live:" in _w3.last_status), _w3.last_status
+assert _u2bdrive + " delta" in _w3.last_status, _w3.last_status
+assert len(_u2b_delta_calls) == _n_delta  # fallback path runs no injected delta
+_w3.stop()
+_w3.wait(5000)
+assert not _w3.isRunning()
+assert _w3.last_status == "Live: " + " · ".join(
+    "%s delta" % d for d in sorted(_w3._modes)), _w3.last_status
+
+# IndexerThread lifecycle: run() starts the watcher singleton, stop() joins it
+# (an earlier GUI test may already have created the singleton — that's fine)
+_pre = idxmod._USN_WATCHER
+
+
+class _SilentIndexer(idxmod.IndexerThread):
+    def _run_once(self):
+        return -1
+
+
+_ix = _SilentIndexer(rebuild=False)
+_ix.start()
+assert _u2b_wait(lambda: idxmod._USN_WATCHER is not None and
+                 idxmod._USN_WATCHER.isRunning(), 5), "indexer run() must start the watcher"
+_wl = idxmod._USN_WATCHER
+assert _pre is None or _wl is _pre, "the watcher must be a singleton"
+_ix.stop()
+_ix.wait(5000)
+assert not _wl.isRunning(), "indexer stop() must stop the watcher"
+
+_u2b_conn.close()
+# --- U2b end -----------------------------------------------------------------
+
 
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()

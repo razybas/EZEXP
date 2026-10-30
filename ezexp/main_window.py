@@ -1262,6 +1262,7 @@ class MainWindow(FramelessWindow):
         self._indexer = IndexerThread(rebuild=rebuild)
         self._indexer.progress.connect(self.on_index_progress)
         self._indexer.done.connect(self.on_index_done)
+        self._indexer.usn_status.connect(self.on_usn_status)
         self._indexer.start()
         self.rescan_btn.setEnabled(False)
         self._spinner.start()
@@ -1301,7 +1302,10 @@ class MainWindow(FramelessWindow):
         self._index_lock_retried = False
         stamp = time.strftime("%H:%M")
         if total >= 0:
-            self.status_right.setText(f"{total:,} items indexed · updated {stamp}")
+            line = f"{total:,} items indexed · updated {stamp}"
+            if getattr(self, "_usn_live", ""):
+                line += f" · {self._usn_live}"
+            self.status_right.setText(line)
             set_meta(thread_conn(), "total", total)
         else:
             self.status_right.setText("Indexing was interrupted")
@@ -1310,6 +1314,13 @@ class MainWindow(FramelessWindow):
             self.refresh_graph()
         self.start_link_analyzer()
         self._consume_pending_index()
+
+    def on_usn_status(self, text):
+        """Per-drive live mode from the USN watcher, shown in the
+        existing status label when no scan is running."""
+        self._usn_live = text
+        if not (self._indexer and self._indexer.isRunning()):
+            self.status_right.setText(text)
 
     def _retry_last_index(self):
         self._index_pending = None

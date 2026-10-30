@@ -89,15 +89,35 @@ def bootstrap_rows(conn, drive, rows, journal_id, next_usn):
     (frn, parent_frn, name) rows with an explicit pre-pass journal_id /
     next_usn (captured by the helper BEFORE its MFT pass). Same frn_map
     and checkpoint writes as the U1 journal-object form."""
-    all_rows = [(drive, ROOT_FRN, 0, drive.rstrip("\\"))]
+    _write_frn_rows(conn, drive, rows)
+    write_checkpoint(conn, drive, journal_id, next_usn)
+    return next_usn
+
+
+def _write_frn_rows(conn, drive, rows):
+    """frn_map rows for one volume: the root entry (the drive itself),
+    then the streamed MFT rows, written in chunks as they arrive."""
+    conn.execute(
+        "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
+        " VALUES(?,?,?,?)", (drive, ROOT_FRN, 0, drive.rstrip("\\")))
+    batch = []
     for frn, pfrn, name in rows:
         if frn == ROOT_FRN or not name or name in (".", ".."):
             continue
-        all_rows.append((drive, frn, pfrn, name))
-    for i in range(0, len(all_rows), 50000):
+        batch.append((drive, frn, pfrn, name))
+        if len(batch) >= 50000:
+            conn.executemany(
+                "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
+                " VALUES(?,?,?,?)", batch)
+            batch = []
+    if batch:
         conn.executemany(
             "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
-            " VALUES(?,?,?,?)", all_rows[i:i + 50000])
+            " VALUES(?,?,?,?)", batch)
+    conn.commit()
+
+
+def write_checkpoint(conn, drive, journal_id, next_usn):
     set_meta(conn, "usn.%s.journal_id" % drive, str(journal_id))
     set_meta(conn, "usn.%s.next_usn" % drive, str(next_usn))
     conn.commit()
