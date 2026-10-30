@@ -162,10 +162,13 @@ class UsnJournal:
     def iter_enum(self):
         """One MFT pass via FSCTL_ENUM_USN_DATA, streamed record by
         record: yields (frn, parent_frn, name). The volume root arrives
-        as frn 5."""
+        as frn 5. HighUsn must be a REAL USN bound — the journal's
+        current NextUsn; a saturated 0xFFFF...F range returns zero
+        records on real volumes (live-verified in the U2 battery)."""
+        high = self.query().next_usn
         start = 0
         while True:
-            inbuf = struct.pack("<QQQ", start, 0, 0xFFFFFFFFFFFFFFFF)
+            inbuf = struct.pack("<QQQ", start, 0, high)
             try:
                 raw = self._ioctl(FSCTL_ENUM_USN_DATA, inbuf, 1 << 16)
             except OSError as exc:

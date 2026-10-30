@@ -209,7 +209,7 @@ class UsnClient:
         as captured by the helper BEFORE the pass."""
         self.send_enum(drive)
         while True:
-            msg = self.next_message(drive, timeout=10.0)
+            msg = self.next_message(drive, timeout=60.0)
             if msg is None:
                 raise UsnUnavailable("no enum reply for %s" % drive)
             if msg["type"] == "enum_batch":

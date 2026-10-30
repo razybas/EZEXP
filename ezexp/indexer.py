@@ -302,7 +302,9 @@ class UsnWatcher(QThread):
         ok = {d for d, p in (client.ready or {}).items() if p == "ok"}
         for root in fixed_drives():
             d = root[:2]
-            self._set_mode(d, "USN" if d in ok else "delta")
+            if d not in ok:
+                self._set_mode(d, "delta")  # USN is set by the worker
+                # only once it is actually live, never optimistically
         workers = []
         for d in sorted(ok):
             t = threading.Thread(target=self._drive_worker,
@@ -344,6 +346,10 @@ class UsnWatcher(QThread):
                 return
         except UsnUnavailable:
             pass  # pipe dropped: the session ends and reconnects
+        except sqlite3.Error:
+            # a transient lock/failure must not kill the thread silently:
+            # mark the drive delta; the ~30 s reconnect re-bootstraps it
+            self._set_mode(drive, "delta")
         finally:
             if conn is not None:
                 try:
@@ -500,6 +506,8 @@ class IndexerThread(QThread):
             w.wait(2000)
 
     def _ensure_usn_watcher(self):
+        if os.environ.get("EZEXP_NO_USN"):
+            return  # hermetic test runs; the battery exercises the live path
         try:
             w = _usn_watcher()
             if not w.isRunning():

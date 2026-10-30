@@ -96,7 +96,9 @@ def bootstrap_rows(conn, drive, rows, journal_id, next_usn):
 
 def _write_frn_rows(conn, drive, rows):
     """frn_map rows for one volume: the root entry (the drive itself),
-    then the streamed MFT rows, written in chunks as they arrive."""
+    then the streamed MFT rows, committed per chunk — a multi-million
+    row enum must not hold the write lock for its whole duration or
+    every other watcher worker dies on 'database is locked'."""
     conn.execute(
         "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
         " VALUES(?,?,?,?)", (drive, ROOT_FRN, 0, drive.rstrip("\\")))
@@ -109,6 +111,7 @@ def _write_frn_rows(conn, drive, rows):
             conn.executemany(
                 "INSERT OR REPLACE INTO frn_map(drive,frn,parent_frn,name)"
                 " VALUES(?,?,?,?)", batch)
+            conn.commit()
             batch = []
     if batch:
         conn.executemany(

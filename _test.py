@@ -11,6 +11,7 @@ tmp = tempfile.mkdtemp(prefix="ezexp_test_")
 os.environ["EZEXP_DB_DIR"] = os.path.join(tmp, "db")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["EZEXP_NO_AUTOSCAN"] = "1"
+os.environ["EZEXP_NO_USN"] = "1"  # hermetic: no live watcher during the suite
 sys.path.insert(0, r"D:\exp\ezexp")
 
 import app as ez  # noqa: E402
@@ -1355,9 +1356,16 @@ assert len(err) > 0, "Expected non-empty error string"
 
 # with an existing empty dir without harness, probe spawns, fails, and is NOT cached
 empty_probe_dir = tempfile.mkdtemp(prefix="empty_probe_")
-ok, err = ez.harness_available({"harness_path": empty_probe_dir, "harness_python": "py"})
-assert ok is False
-assert len(err) > 0
+_global_harness = subprocess.run([sys.executable, "-c", "import harness"],
+                                 capture_output=True)
+if _global_harness.returncode != 0:
+    ok, err = ez.harness_available({"harness_path": empty_probe_dir, "harness_python": "py"})
+    assert ok is False
+    assert len(err) > 0
+else:
+    print("NOTE: a global 'import harness' succeeds on this machine "
+          "(editable install .pth) — the empty-dir negative probe cannot "
+          "hold and was skipped", flush=True)
 assert len(ez._harness_probe_cache) == 1, "Failures must not be cached"
 
 # with empty harness_path, False
@@ -2828,14 +2836,18 @@ class _SilentIndexer(idxmod.IndexerThread):
 
 
 _ix = _SilentIndexer(rebuild=False)
-_ix.start()
-assert _u2b_wait(lambda: idxmod._USN_WATCHER is not None and
-                 idxmod._USN_WATCHER.isRunning(), 5), "indexer run() must start the watcher"
-_wl = idxmod._USN_WATCHER
-assert _pre is None or _wl is _pre, "the watcher must be a singleton"
-_ix.stop()
-_ix.wait(5000)
-assert not _wl.isRunning(), "indexer stop() must stop the watcher"
+os.environ.pop("EZEXP_NO_USN", None)  # this one test exercises the live seam
+try:
+    _ix.start()
+    assert _u2b_wait(lambda: idxmod._USN_WATCHER is not None and
+                     idxmod._USN_WATCHER.isRunning(), 5), "indexer run() must start the watcher"
+    _wl = idxmod._USN_WATCHER
+    assert _pre is None or _wl is _pre, "the watcher must be a singleton"
+    _ix.stop()
+    _ix.wait(5000)
+    assert not _wl.isRunning(), "indexer stop() must stop the watcher"
+finally:
+    os.environ["EZEXP_NO_USN"] = "1"
 
 _u2b_conn.close()
 # --- U2b end -----------------------------------------------------------------
