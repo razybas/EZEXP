@@ -37,6 +37,7 @@ PHASE = sys.argv[1] if len(sys.argv) > 1 else "A"
 RESULTS = []
 DELTA_CALLS = []
 CLIENT_EVENTS = []
+READY_DRIVES = {}
 
 
 def report(step, ok, detail):
@@ -58,6 +59,12 @@ def measure(cond_fn, budget=2.0, max_wait=30.0, poll=0.05):
 
 
 class InstrumentedClient(UsnClient):
+    def connect(self):
+        ready = super().connect()
+        READY_DRIVES.clear()
+        READY_DRIVES.update(ready or {})
+        return ready
+
     def send_subscribe(self, drive, start_usn):
         CLIENT_EVENTS.append(("subscribe", drive, int(start_usn)))
         return super().send_subscribe(drive, start_usn)
@@ -166,6 +173,15 @@ def all_pass():
     return all(ok for _, ok, _ in RESULTS)
 
 
+def wait_for(pred, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return False
+
+
 # ---------------------------------------------------------------- phase A
 if PHASE == "A":
     shutil.rmtree(BATTERY_DIR, ignore_errors=True)
@@ -178,13 +194,15 @@ if PHASE == "A":
     w.start()
 
     def steady():
-        # truly live: checkpoint written (enum + delta-once finished) AND
-        # the worker is past validation and consuming (subscribe sent)
+        # truly live: the checkpoint written (enum + delta-once finished)
+        # AND every drive the helper reports ok is subscribed — no worker
+        # still mid-enum contending for the db lock
         jid, _ = checkpoint()
+        subs = {e[1] for e in CLIENT_EVENTS if e[0] == "subscribe"}
+        ok_drives = {d for d, p in READY_DRIVES.items() if p == "ok"}
         return (jid is not None
                 and DRIVE + " USN" in (w.last_status or "")
-                and any(e[0] == "subscribe" and e[1] == DRIVE
-                        for e in CLIENT_EVENTS))
+                and ok_drives and subs >= ok_drives)
 
     end = time.time() + 30 * 60
     while time.time() < end and not steady():
@@ -209,6 +227,12 @@ if PHASE == "A":
     report("A-scratchdir", ok,
            "dir row %s appeared in %.3f s (budget 2 s)"
            % (SCRATCH, lat if lat is not None else -1))
+    c = conn()
+    sfrn = c.execute("SELECT frn FROM frn_map WHERE drive=? AND name=? AND parent_frn=5",
+                     (DRIVE, os.path.basename(SCRATCH))).fetchall()
+    c.close()
+    assert len(sfrn) == 1, "expected exactly one map entry for the scratch dir: %r" % (sfrn,)
+    SCRATCH_FRN = sfrn[0][0]
 
     # B1 create
     p = os.path.join(SCRATCH, "b1_probe.txt")
@@ -248,6 +272,12 @@ if PHASE == "A":
     c.close()
     report("B3-dirrename", ok and child == (SCRATCH + "\\sub2", "inner.txt"),
            "child follows in %.3f s; verbatim row=%r" % (lat or -1, child))
+    c = conn()
+    s2 = c.execute("SELECT frn FROM frn_map WHERE drive=? AND name='sub2' AND parent_frn=?",
+                   (DRIVE, SCRATCH_FRN)).fetchall()
+    c.close()
+    assert len(s2) == 1, "expected exactly one map entry for sub2: %r" % (s2,)
+    SUB2_FRN = s2[0][0]
 
     # B4 delete file + folder
     t0 = time.perf_counter()
@@ -262,12 +292,13 @@ if PHASE == "A":
                       and fts_names("b2_probe") == [])
     c = conn()
     frn_left = c.execute(
-        "SELECT name FROM frn_map WHERE drive=? AND name IN "
-        "('b1_probe.txt','b2_probe.txt','sub','sub2','inner.txt')",
-        (DRIVE,)).fetchall()
+        "SELECT name FROM frn_map WHERE drive=? AND (frn=? OR parent_frn=?"
+        " OR parent_frn=?)",
+        (DRIVE, SUB2_FRN, SUB2_FRN, SCRATCH_FRN)).fetchall()
     c.close()
     report("B4-delete", ok and frn_left == [],
-           "rows+FTS gone in %.3f s; frn_map leftovers=%r" % (lat or -1, frn_left))
+           "rows+FTS gone in %.3f s; deleted-subtree frn_map leftovers=%r"
+           % (lat or -1, frn_left))
 
     # B5 prep: two rows the closed-app gap will rename/delete
     with open(os.path.join(SCRATCH, "b5_old.txt"), "w") as f:
@@ -306,6 +337,10 @@ if PHASE == "B":
                  and not row_exists(SCRATCH, "b5_del.txt"),
                  budget=5.0, max_wait=60.0)[1]
     lat = time.perf_counter() - t0
+    # the checkpoint advance can land a lock-cycle after the rows (the
+    # applier's delete_tree commits mid-batch); wait for it explicitly
+    pre_gap = int(st["pre_gap_cp"][1])
+    _u2b_cp_ok = wait_for(lambda: int(checkpoint()[1]) > pre_gap, 10)
     c = conn()
     evidence = c.execute("SELECT parent, name FROM files WHERE name LIKE "
                          "'b5%' ORDER BY name").fetchall()
@@ -316,13 +351,13 @@ if PHASE == "B":
                   for e in subs)
     no_delta = len(DELTA_CALLS) == 0
     frn_after = frn_count()
-    report("B5-replay", ok and no_enum and from_cp and no_delta,
-           "catalog correct in %.2f s; rows=%r; subscribe events=%r "
-           "(pre-gap checkpoint=%r); enum_sent=%s; delta_calls=%d; "
-           "frn_map %d -> %d (expected %d: +1 create -1 delete)"
-           % (lat, evidence, subs[:3], st["pre_gap_cp"], not no_enum,
-              len(DELTA_CALLS), st["frn_before_b5"], frn_after,
-              st["frn_before_b5"] + 1 - 1))
+    report("B5-replay", ok and _u2b_cp_ok and no_enum and from_cp and no_delta,
+           "catalog correct in %.2f s; checkpoint %r -> %r (advanced=%s); "
+           "rows=%r; subscribe events=%r; enum_sent=%s; delta_calls=%d; "
+           "frn_map %d -> %d (+1 create -1 delete)"
+           % (lat, st["pre_gap_cp"], checkpoint(), _u2b_cp_ok, evidence,
+              subs[:3], not no_enum, len(DELTA_CALLS),
+              st["frn_before_b5"], frn_after))
     print("B-checkpoint-after:", checkpoint(), flush=True)
     print("B-mode:", w.last_status, flush=True)
     save_state(cp_after_b5=checkpoint(), mode_B=w.last_status)
