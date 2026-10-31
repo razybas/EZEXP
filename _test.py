@@ -220,6 +220,10 @@ rows, _ = ez.do_search(conn, "doomed")
 assert rows == [], rows
 
 # --- Obsidian vault settings -------------------------------------------------
+# save the OWNER's configured vaults first: set_vaults writes real QSettings
+# and the suite must restore them at the end (live-caught: the suite left a
+# temp path as the user's only vault)
+_owner_vaults = ez.get_vaults()
 vault = os.path.join(tmp, "vault")
 os.makedirs(vault)
 with open(os.path.join(vault, "note.md"), "w") as f:
@@ -2964,6 +2968,8 @@ _fxb.close()
 
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()
+# restore the OWNER's vaults — the suite overwrote them via real QSettings
+ez.set_vaults(list(_owner_vaults or []))
 worker.stop()
 worker.wait(3000)
 print("ALL TESTS PASSED")
