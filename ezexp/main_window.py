@@ -1259,6 +1259,13 @@ class MainWindow(FramelessWindow):
             self.rescan_btn.setText("  Rescan queued…")
             return
         self._analyzer_stop.set()
+        # WAIT for the analyzer thread to actually exit (its current pass
+        # can take a few more seconds and it writes note_links): a scan
+        # starting under it dies on 'database is locked' and the indexer
+        # retries the WHOLE rebuild from zero
+        t0 = time.time()
+        while self._analyzer_running and time.time() - t0 < 15:
+            time.sleep(0.2)
         self._indexer = IndexerThread(rebuild=rebuild)
         self._indexer.progress.connect(self.on_index_progress)
         self._indexer.done.connect(self.on_index_done)

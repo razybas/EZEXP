@@ -27,6 +27,30 @@ BATCH = 4000
 
 MTIME_EPS = 1e-6
 
+
+def _locked_retry(conn, fn, attempts=12, rollback=True):
+    """Run fn(); on a transient 'database is locked' retry the WHOLE fn
+    after a growing backoff. fn must be idempotent (the scanners'
+    batches are: INSERT OR IGNORE + commit). A single lock collision
+    must never abort a multi-minute scan — IndexerThread's retry loop
+    restarts the ENTIRE rebuild from zero otherwise (live-caught in the
+    G4 rebuild). rollback=True rolls the txn back before retrying (for
+    re-executable batches); for a failed COMMIT pass rollback=False —
+    sqlite keeps the txn open and the retry just commits it again."""
+    for i in range(attempts):
+        try:
+            fn()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or i == attempts - 1:
+                raise
+            if rollback:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            time.sleep(1.0 + i)
+
 def _entry_skipped(name, is_dir):
     low = name.lower()
     return (low in SKIP_DIR_NAMES) if is_dir else (low in SKIP_FILE_NAMES)
@@ -42,10 +66,12 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
     if should_run is None:
         should_run = lambda: True
     if wipe:
-        conn.execute("DELETE FROM files")
-        conn.execute("DELETE FROM note_links")
-        rebuild_fts(conn)
-        conn.commit()
+        def _wipe():
+            conn.execute("DELETE FROM files")
+            conn.execute("DELETE FROM note_links")
+            rebuild_fts(conn)
+            conn.commit()
+        _locked_retry(conn, _wipe)
     total = 0
     batch = []
     for root in roots:
@@ -100,23 +126,28 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
                         stack.append(join_path(d, name))
                     if len(batch) >= BATCH:
                         total += len(batch)
-                        insert_rows(conn, batch, sync_fts=False)
-                        conn.commit()
+                        b = list(batch)
+                        _locked_retry(conn, lambda: (
+                            insert_rows(conn, b, sync_fts=False),
+                            conn.commit()))
                         if progress:
                             progress(d, total)
                         batch = []
         if batch:
             total += len(batch)
-            insert_rows(conn, batch, sync_fts=False)
+            b = list(batch)
+            _locked_retry(conn, lambda: (
+                insert_rows(conn, b, sync_fts=False),))
             batch = []
-        conn.commit()
+        _locked_retry(conn, conn.commit)
         if progress:
             progress(root, total)
     if should_run():
-        rebuild_fts(conn)  # index all names in one pass
-        conn.commit()
-        set_meta(conn, "phase", "full_done")
-        conn.commit()
+        def _finalize():
+            rebuild_fts(conn)  # index all names in one pass
+            set_meta(conn, "phase", "full_done")
+            conn.commit()
+        _locked_retry(conn, _finalize)
 
 def scan_delta(conn, roots, progress=None, should_run=None):
     """Incremental scan: only re-read directories whose mtime changed."""
@@ -229,7 +260,9 @@ def scan_delta(conn, roots, progress=None, should_run=None):
                 for r in new_rows:
                     if r[2]:
                         stack.append(join_path(d, r[1]))
-            conn.commit()
+            # a lock hit at this commit must not drop the dir's txn:
+            # sqlite keeps it open, the retry just commits it again
+            _locked_retry(conn, conn.commit, rollback=False)
             if progress:
                 progress(d, changed_items)
 
