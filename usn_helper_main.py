@@ -445,6 +445,11 @@ def _svc_main(argc, argv):
     _svc_status_handle = _adv.RegisterServiceCtrlHandlerW(
         ctypes.c_wchar_p(SERVICE_NAME), _handler_ref)
     _svc_set_status(SERVICE_START_PENDING)
+    # announce RUNNING before serving: without this the SCM keeps the
+    # service in START_PENDING forever (unstoppable, restart policy may
+    # consider it hung) even though the pipe works
+    _svc_set_status(SERVICE_RUNNING,
+                    accept=SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN)
     try:
         if not allow_sid:
             log("service pipe grants Authenticated Users (no --allow-sid)")
