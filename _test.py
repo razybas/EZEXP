@@ -222,8 +222,19 @@ assert rows == [], rows
 # --- Obsidian vault settings -------------------------------------------------
 # save the OWNER's configured vaults first: set_vaults writes real QSettings
 # and the suite must restore them at the end (live-caught: the suite left a
-# temp path as the user's only vault)
+# temp path as the user's only vault). A CRASHED run never reaches the
+# restore block at the end, so the owner's value is mirrored to a sidecar
+# file and recovered here on the next run (live-caught: a mid-suite abort
+# left the owner's vaults pointing at a deleted temp dir).
+_vault_sidecar = os.path.join(tempfile.gettempdir(), "ezexp_owner_vaults.txt")
+if os.path.exists(_vault_sidecar):
+    with open(_vault_sidecar, encoding="utf-8") as _vsf:
+        _saved_vaults = [l for l in _vsf.read().splitlines() if l.strip()]
+    if _saved_vaults and ez.get_vaults() != _saved_vaults:
+        ez.set_vaults(_saved_vaults)  # a previous run crashed before restoring
 _owner_vaults = ez.get_vaults()
+with open(_vault_sidecar, "w", encoding="utf-8") as _vsf:
+    _vsf.write("\n".join(_owner_vaults))
 vault = os.path.join(tmp, "vault")
 os.makedirs(vault)
 with open(os.path.join(vault, "note.md"), "w") as f:
@@ -2964,6 +2975,157 @@ _rows, _ = ez.do_search(_fxb, "beta")
 assert names(_rows) == ["beta report.txt"], _rows
 _fxb.close()
 # --- Fix B end ---------------------------------------------------------------
+
+# --- Fix 1: in-directory progress heartbeat ----------------------------------
+# A stall must identify itself in the UI: progress must fire at least every
+# 500 entries INSIDE a directory (not just at batch commits), and the emitted
+# path must be the folder being scanned (the spinner shows it verbatim).
+# Private DBs (the Fix B pattern): at this point in the suite background
+# writers may still hold the shared catalog.
+while getattr(main_win, "_analyzer_running", False):
+    main_win._analyzer_stop.set()
+    if not main_win._analyzer_running:
+        break
+    time.sleep(0.2)
+_hb = os.path.join(tmp, "heartbeat")
+_hb_deep = os.path.join(_hb, "deep")
+os.makedirs(_hb_deep)
+for _i in range(1200):
+    with open(os.path.join(_hb_deep, "f%04d.txt" % _i), "w") as _f:
+        _f.write("x")
+_hb_conn = ez.sqlite3.connect(os.path.join(tmp, "heartbeat.db"))
+ez._ensure_schema(_hb_conn)
+_hb_events = []
+ez.scan_full(_hb_conn, [_hb], lambda p, c: _hb_events.append((p, c)))
+_hb_dir = [(p, c) for p, c in _hb_events if p == _hb_deep]
+assert len(_hb_dir) >= 2, \
+    f"progress must fire >= every 500 entries inside a directory: {_hb_events}"
+_hb_counts = [c for _, c in _hb_dir]
+assert all(b > a for a, b in zip(_hb_counts, _hb_counts[1:])), _hb_counts
+
+# delta: the same heartbeat inside a changed directory (a NEW file bumps the
+# directory's mtime so the delta actually re-reads it; a file-content edit
+# alone would not, and skipping it is correct delta behaviour)
+with open(os.path.join(_hb_deep, "fnew.txt"), "w") as _f:
+    _f.write("new")
+_hb_delta = []
+ez.scan_delta(_hb_conn, [_hb], lambda p, c: _hb_delta.append((p, c)))
+_hb_dcount = len([1 for p, _ in _hb_delta if p == _hb_deep])
+assert _hb_dcount >= 2, \
+    f"delta progress must heartbeat inside a changed directory: {_hb_delta}"
+_hb_conn.close()
+# --- Fix 1 end ---------------------------------------------------------------
+
+# --- Fix 2: virtual-root quarantine ------------------------------------------
+from ezexp.indexer import RootWatchdog, _virtual_roots  # noqa: E402
+from ezexp import usn_journal  # noqa: E402
+
+# classification: a drive whose probe is not ok (missing Q: -> error) is a
+# virtual root; a drive that probes ok (real NTFS) is never watched
+assert _virtual_roots([r"Q:\nope"]) == [r"Q:\nope"], "unprobeable drive is virtual"
+_ok_drives = [d for d in ez.fixed_drives()
+              if usn_journal.probe(d[:2]) == "ok"]
+if _ok_drives:
+    assert _virtual_roots([_ok_drives[0] + "\\"]) == [], \
+        "an ok-probe NTFS root must never be watched"
+
+# the monitor itself: a silent virtual root is deferred after the timeout;
+# a root that keeps reporting progress is never deferred
+_got_defers = []
+_wd = RootWatchdog([r"Q:\slow"], timeout=0.5, poll=0.1,
+                   on_defer=_got_defers.append)
+_wd.start()
+_wd.begin(r"Q:\slow")
+_t0 = time.time()
+while time.time() - _t0 < 5 and not _wd.deferred(r"Q:\slow"):
+    time.sleep(0.05)
+assert _wd.deferred(r"Q:\slow"), "watchdog must defer a silent virtual root"
+assert _got_defers == [r"Q:\slow"], _got_defers
+_wd.stop()
+
+_wd2 = RootWatchdog([r"Q:\busy"], timeout=0.5, poll=0.1,
+                    on_defer=_got_defers.append)
+_wd2.start()
+_wd2.begin(r"Q:\busy")
+for _ in range(12):
+    time.sleep(0.1)
+    _wd2.touch(r"Q:\busy")
+assert not _wd2.deferred(r"Q:\busy"), "progress must keep a root alive"
+_wd2.stop()
+assert _got_defers == [r"Q:\slow"], _got_defers
+
+# end-to-end with fake scans: a root whose entries take 50 ms each (slowed
+# real scandir) makes no heartbeat for > timeout; the walk must abandon THAT
+# root only and the run must continue with the healthy root afterwards
+_stall = os.path.join(tmp, "stall_root")
+_stall_dir = os.path.join(_stall, "stuck")
+os.makedirs(_stall_dir)
+for _i in range(30):
+    with open(os.path.join(_stall_dir, "s%02d.txt" % _i), "w") as _f:
+        _f.write("x")
+_ok_root = os.path.join(tmp, "ok_root")
+os.makedirs(os.path.join(_ok_root, "sub"))
+with open(os.path.join(_ok_root, "sub", "fine.txt"), "w") as _f:
+    _f.write("ok")
+
+_real_scandir = os.scandir
+
+class _SlowScandir:
+    def __init__(self, path, delay):
+        self._it = _real_scandir(path)
+        self._delay = delay
+    def __iter__(self):
+        return self
+    def __next__(self):
+        time.sleep(self._delay)
+        return next(self._it)
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        self._it.close()
+        return False
+    def close(self):
+        self._it.close()
+
+def _slow_scandir(path):
+    if str(path).lower().startswith(_stall.lower()):
+        return _SlowScandir(path, 0.05)
+    return _real_scandir(path)
+
+ez.os.scandir = _slow_scandir
+_q_defers = []
+_q_wd = RootWatchdog([_stall], timeout=0.5, poll=0.1, on_defer=_q_defers.append)
+_q_conn = ez.sqlite3.connect(os.path.join(tmp, "quarantine.db"))
+ez._ensure_schema(_q_conn)
+_q_events = []
+try:
+    _q_wd.start()
+    _t0 = time.time()
+    ez.scan_full(_q_conn, [_stall, _ok_root],
+                 lambda p, c: _q_events.append((p, c)), watchdog=_q_wd)
+    _q_took = time.time() - _t0
+finally:
+    ez.os.scandir = _real_scandir
+    _q_wd.stop()
+assert _q_wd.deferred(_stall), "the stalling virtual root must be deferred"
+assert _q_defers == [_stall], _q_defers
+assert _q_took < 10, f"the scan must not wait out the stalled root: {_q_took}s"
+assert _q_conn.execute("SELECT COUNT(*) FROM files WHERE name='fine.txt'"
+                       ).fetchone()[0] == 1, \
+    "the run must continue with the healthy root after the defer"
+_q_conn.close()
+
+# UI: deferred roots surface once in the final status line
+main_win._deferred_notes = []
+main_win.on_root_deferred("G: deferred (no progress)")
+main_win.on_root_deferred("G: deferred (no progress)")  # duplicate: no stack
+assert main_win._deferred_notes == ["G: deferred (no progress)"], \
+    main_win._deferred_notes
+_line = main_win._append_defer_notes("1,234 items indexed · updated 12:00")
+assert _line == ("1,234 items indexed · updated 12:00"
+                 " · G: deferred (no progress)"), _line
+main_win._deferred_notes = []
+# --- Fix 2 end ---------------------------------------------------------------
 
 
 _test_settings.remove('agent_dock_visible')

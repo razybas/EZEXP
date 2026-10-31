@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from PySide6.QtCore import QThread, Signal
 
-from ezexp import DB_PATH
+from ezexp import DB_PATH, APP_DIR
 from ezexp.fsutil import (
     join_path, split_path, real_dir, ext_of, category_for, kind_for,
     SKIP_DIR_NAMES, SKIP_FILE_NAMES, fixed_drives, REPARSE_ATTR
@@ -17,6 +17,7 @@ from ezexp.db import (
     ensure_indexes, fts_drop_ids, rebuild_fts
 )
 from ezexp.search_engine import do_search
+from ezexp.usn_journal import probe as probe_drive
 from ezexp.usn import (
     QueryInfo, read_checkpoint, checkpoint_valid, apply_records,
     write_checkpoint, _write_frn_rows,
@@ -26,6 +27,119 @@ from ezexp.usn_client import UsnClient, UsnUnavailable
 BATCH = 4000
 
 MTIME_EPS = 1e-6
+
+# Fix 1: a stall must identify itself — progress fires at least this often
+# inside a directory, and the emitted path is the folder being scanned
+PROGRESS_EVERY = 500
+
+# Fix 2: a virtual root (probe != 'ok') that makes no progress for this long
+# is deferred for the rest of the run by the monitor below
+QUARANTINE_SECS = 120.0
+
+QUARANTINE_POLL = 2.0
+
+def _log_defer(root, secs):
+    line = "%s  '%s' deferred (no progress for %ds)" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), root, int(secs))
+    print("EzExp scan: " + line, flush=True)
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(os.path.join(APP_DIR, "scan.log"), "a",
+                  encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+class RootWatchdog(threading.Thread):
+    """Fix 2: virtual-root quarantine monitor.
+
+    Lives OUTSIDE the scan thread on purpose: a walk stuck in a blocking
+    syscall can never time itself out from its own thread, so a separate
+    monitor tracks per-root progress and FLAGS stalled roots; the walk
+    checks the flag between loop iterations and abandons that root for
+    this run, letting the rest of the run (queue + USN watcher) proceed.
+    Only virtual roots are constructed watched (_virtual_roots); NTFS
+    roots scan exactly as before."""
+    daemon = True
+
+    def __init__(self, roots, timeout=QUARANTINE_SECS, on_defer=None,
+                 poll=QUARANTINE_POLL):
+        super().__init__(daemon=True)
+        self._watched = set(roots)
+        self._timeout = timeout
+        self._poll = poll
+        self._on_defer = on_defer
+        self._lock = threading.Lock()
+        self._last = {}
+        self._deferred = set()
+        self._stop = False
+
+    def begin(self, root):
+        self.touch(root)
+
+    def touch(self, root):
+        if root in self._watched:
+            with self._lock:
+                self._last[root] = time.monotonic()
+
+    def finish(self, root):
+        """Root walked to completion: stop monitoring it so the idle time
+        after it cannot trip the quarantine."""
+        with self._lock:
+            self._watched.discard(root)
+            self._last.pop(root, None)
+
+    def deferred(self, root):
+        with self._lock:
+            return root in self._deferred
+
+    def deferred_roots(self):
+        with self._lock:
+            return sorted(self._deferred)
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        while not self._stop:
+            end = time.monotonic() + self._poll
+            while not self._stop and time.monotonic() < end:
+                time.sleep(0.05)
+            if self._stop:
+                return
+            now = time.monotonic()
+            stalled = []
+            with self._lock:
+                for root in self._watched:
+                    if root in self._deferred:
+                        continue
+                    last = self._last.get(root)
+                    if last is not None and now - last >= self._timeout:
+                        self._deferred.add(root)
+                        stalled.append(root)
+            for root in stalled:
+                _log_defer(root, self._timeout)
+                if self._on_defer:
+                    try:
+                        self._on_defer(root)
+                    except Exception:
+                        pass  # reporting must never kill the monitor
+
+def _virtual_roots(roots):
+    """Roots whose drive probe is not 'ok' (G: = not_ntfs on Google Drive,
+    access_denied unelevated): candidates for the Fix 2 quarantine."""
+    out = []
+    seen = {}
+    for root in roots:
+        drive = root[:2]
+        if drive not in seen:
+            try:
+                seen[drive] = probe_drive(drive)
+            except Exception:
+                seen[drive] = "error:probe"
+        if seen[drive] != "ok":
+            out.append(root)
+    return out
 
 
 def _locked_retry(conn, fn, attempts=12, rollback=True):
@@ -60,9 +174,14 @@ def _make_row(parent, name, is_dir, st, drive):
             st.st_size if not is_dir else 0, st.st_mtime, drive,
             category_for(name, is_dir), kind_for(name, is_dir))
 
-def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
+def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
+              watchdog=None):
     """Rebuild the index from the given roots. wipe=False indexes extra roots
-    without erasing the rest of the catalog (used for newly-appeared drives)."""
+    without erasing the rest of the catalog (used for newly-appeared drives).
+
+    watchdog: optional RootWatchdog (Fix 2). Virtual roots flagged by the
+    monitor (no progress for the quarantine timeout) are abandoned between
+    loop iterations; the rest of the run continues."""
     if should_run is None:
         should_run = lambda: True
     if wipe:
@@ -77,10 +196,16 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
     for root in roots:
         if not should_run():
             break
+        if watchdog is not None and watchdog.deferred(root):
+            continue  # deferred earlier in this run
+        if watchdog is not None:
+            watchdog.begin(root)
         drive = root[:2]
         try:
             root_st = os.stat(real_dir(root))
         except OSError:
+            if watchdog is not None:
+                watchdog.finish(root)
             continue
         stack = []
         if len(root) == 3 and root.endswith("\\"):
@@ -88,6 +213,8 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
             batch.append(row)
         stack.append(root.rstrip("\\"))
         while stack and should_run():
+            if watchdog is not None and watchdog.deferred(root):
+                break
             d = stack.pop()
             real = real_dir(d)
             try:
@@ -95,9 +222,20 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
             except OSError:
                 continue
             with it:
+                n_here = 0
                 for e in it:
                     if not should_run():
                         break
+                    if watchdog is not None and watchdog.deferred(root):
+                        break
+                    n_here += 1
+                    if n_here % PROGRESS_EVERY == 0:
+                        # Fix 1: the status line names the folder being
+                        # scanned even inside a long directory
+                        if watchdog is not None:
+                            watchdog.touch(root)
+                        if progress:
+                            progress(d, total + len(batch))
                     name = e.name
                     try:
                         st = e.stat(follow_symlinks=False)
@@ -132,6 +270,8 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
                             conn.commit()))
                         if progress:
                             progress(d, total)
+                        if watchdog is not None:
+                            watchdog.touch(root)
                         batch = []
         if batch:
             total += len(batch)
@@ -140,6 +280,8 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
                 insert_rows(conn, b, sync_fts=False),))
             batch = []
         _locked_retry(conn, conn.commit)
+        if watchdog is not None:
+            watchdog.finish(root)
         if progress:
             progress(root, total)
     if should_run():
@@ -149,25 +291,33 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True):
             conn.commit()
         _locked_retry(conn, _finalize)
 
-def scan_delta(conn, roots, progress=None, should_run=None):
-    """Incremental scan: only re-read directories whose mtime changed."""
+def scan_delta(conn, roots, progress=None, should_run=None, watchdog=None):
+    """Incremental scan: only re-read directories whose mtime changed.
+    watchdog: same RootWatchdog contract as scan_full (Fix 2)."""
     if should_run is None:
         should_run = lambda: True
     changed_items = 0
     for root in roots:
         if not should_run():
             break
+        if watchdog is not None and watchdog.deferred(root):
+            continue
+        if watchdog is not None:
+            watchdog.begin(root)
         drive = root[:2]
         existing = {}
         for parent, name, mtime, in conn.execute(
                 "SELECT parent, name, mtime FROM files WHERE drive=? AND is_dir=1", (drive,)):
             existing[join_path(parent, name)] = mtime
         if not existing:
-            scan_full(conn, [root], progress, should_run, wipe=False)
+            scan_full(conn, [root], progress, should_run, wipe=False,
+                      watchdog=watchdog)
             continue
         stack = [root.rstrip("\\")]
         visited = set()
         while stack and should_run():
+            if watchdog is not None and watchdog.deferred(root):
+                break
             d = stack.pop()
             if d in visited:
                 continue
@@ -183,6 +333,8 @@ def scan_delta(conn, roots, progress=None, should_run=None):
             old_mtime = existing.get(d)
             if old_mtime is not None and abs(cur_mtime - old_mtime) < MTIME_EPS:
                 # unchanged — keep walking into known child dirs
+                if watchdog is not None:
+                    watchdog.touch(root)
                 for parent, name in conn.execute(
                         "SELECT parent, name FROM files WHERE parent=? AND is_dir=1", (d,)):
                     stack.append(join_path(parent, name))
@@ -204,9 +356,19 @@ def scan_delta(conn, roots, progress=None, should_run=None):
                     delete_tree(conn, d)
                 continue
             with it:
+                n_here = 0
                 for e in it:
                     if not should_run():
                         break
+                    if watchdog is not None and watchdog.deferred(root):
+                        break
+                    n_here += 1
+                    if n_here % PROGRESS_EVERY == 0:
+                        # Fix 1: heartbeat inside a large changed directory
+                        if watchdog is not None:
+                            watchdog.touch(root)
+                        if progress:
+                            progress(d, changed_items)
                     name = e.name
                     try:
                         st = e.stat(follow_symlinks=False)
@@ -263,8 +425,12 @@ def scan_delta(conn, roots, progress=None, should_run=None):
             # a lock hit at this commit must not drop the dir's txn:
             # sqlite keeps it open, the retry just commits it again
             _locked_retry(conn, conn.commit, rollback=False)
+            if watchdog is not None:
+                watchdog.touch(root)
             if progress:
                 progress(d, changed_items)
+        if watchdog is not None:
+            watchdog.finish(root)
 
 USN_RETRY_SECS = 30
 
@@ -542,6 +708,7 @@ class IndexerThread(QThread):
     progress = Signal(str, int)
     done = Signal(int, str)  # total, error-or-empty
     usn_status = Signal(str)  # per-drive live mode line, e.g. "Live: C: USN · D: delta"
+    root_deferred = Signal(str)  # Fix 2: "G: deferred (no progress)"
 
     def __init__(self, rebuild=False):
         super().__init__()
@@ -586,13 +753,28 @@ class IndexerThread(QThread):
             def prog(path, count):
                 self.progress.emit(path, count)
 
+            def defer_note(root):
+                # runs on the watchdog thread; queued to the UI thread
+                self.root_deferred.emit(
+                    "%s deferred (no progress)" % (root[:2] or root))
+
             def alive():
                 return not self._stop
 
-            if self.rebuild or phase != "full_done":
-                scan_full(conn, roots, prog, alive)
-            else:
-                scan_delta(conn, roots, prog, alive)
+            wd = None
+            try:
+                if not os.environ.get("EZEXP_NO_USN"):
+                    virtual = _virtual_roots(roots)
+                    if virtual:
+                        wd = RootWatchdog(virtual, on_defer=defer_note)
+                        wd.start()
+                if self.rebuild or phase != "full_done":
+                    scan_full(conn, roots, prog, alive, watchdog=wd)
+                else:
+                    scan_delta(conn, roots, prog, alive, watchdog=wd)
+            finally:
+                if wd is not None:
+                    wd.stop()
             if self._stop:
                 return -1
             total = update_total(conn)

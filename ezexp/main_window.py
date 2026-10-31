@@ -1270,6 +1270,8 @@ class MainWindow(FramelessWindow):
         self._indexer.progress.connect(self.on_index_progress)
         self._indexer.done.connect(self.on_index_done)
         self._indexer.usn_status.connect(self.on_usn_status)
+        self._indexer.root_deferred.connect(self.on_root_deferred)
+        self._deferred_notes = []
         self._indexer.start()
         self.rescan_btn.setEnabled(False)
         self._spinner.start()
@@ -1285,6 +1287,21 @@ class MainWindow(FramelessWindow):
     def on_index_progress(self, path, count):
         self._indexing_path = path
         self._count = count
+
+    def on_root_deferred(self, text):
+        """Fix 2: the quarantine flagged a virtual root (e.g. G: made no
+        progress for 120 s). The spinner keeps overwriting status_right
+        while the scan runs, so keep the note for the final line."""
+        notes = getattr(self, "_deferred_notes", None)
+        if notes is None:
+            notes = self._deferred_notes = []
+        if text not in notes:
+            notes.append(text)
+
+    def _append_defer_notes(self, line):
+        for note in getattr(self, "_deferred_notes", []):
+            line += f" · {note}"
+        return line
 
     def _tick_spinner(self):
         self._spin_i = (self._spin_i + 1) % len(self._spin_frames)
@@ -1312,6 +1329,7 @@ class MainWindow(FramelessWindow):
             line = f"{total:,} items indexed · updated {stamp}"
             if getattr(self, "_usn_live", ""):
                 line += f" · {self._usn_live}"
+            line = self._append_defer_notes(line)
             self.status_right.setText(line)
             set_meta(thread_conn(), "total", total)
         else:
