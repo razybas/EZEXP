@@ -117,6 +117,19 @@ def fts_touch(conn, rowid, name):
     conn.execute("DELETE FROM fts WHERE rowid=?", (rowid,))
     conn.execute("INSERT INTO fts(rowid, name) VALUES(?,?)", (rowid, name))
 
+def fts_rename(conn, rowid, old_name, new_name):
+    """Re-index a renamed row. The plain DELETE in fts_touch reads the
+    row's CURRENT content from files, which after the rename no longer
+    matches the indexed tokens: the old name's tokens stay forever and
+    the delete targets tokens never inserted. FTS5's explicit 'delete'
+    command unindexes the SUPPLIED old value without touching the
+    content table, so it is correct on either side of the row move."""
+    if not FTS_OK:
+        return
+    conn.execute("INSERT INTO fts(fts, rowid, name) VALUES('delete', ?, ?)",
+                 (rowid, old_name))
+    conn.execute("INSERT INTO fts(rowid, name) VALUES(?,?)", (rowid, new_name))
+
 def fts_drop_ids(conn, ids):
     if not FTS_OK or not ids:
         return

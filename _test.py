@@ -2863,6 +2863,35 @@ finally:
 _u2b_conn.close()
 # --- U2b end -----------------------------------------------------------------
 
+# --- Fix B: rename_current FTS reindex via explicit delete -------------------
+# rename_current does UPDATE files SET name=... then reindexes; with the old
+# fts_touch idiom the delete reads the row's NEW content, so the OLD name's
+# tokens stay in the index forever. The same calls with db.fts_rename must
+# leave old-token search empty and new-token search hit.
+_fxb = ez.sqlite3.connect(os.path.join(tmp, "fixb.db"))
+ez._ensure_schema(_fxb)
+_fxb_dir = os.path.join(tmp, "fixb_tree")
+os.makedirs(_fxb_dir, exist_ok=True)
+_fxb_st = os.stat(_fxb_dir)
+ez.insert_rows(_fxb, [ez._make_row(r"D:\fixb", "alpha report.txt", False,
+                                   _fxb_st, "D:")])
+_fxb_row = _fxb.execute("SELECT id FROM files WHERE name='alpha report.txt'"
+                        ).fetchone()
+assert _fxb_row
+_rows, _ = ez.do_search(_fxb, "alpha")
+assert names(_rows) == ["alpha report.txt"], _rows
+# exactly the statements rename_current makes, with the new helper:
+_fxb.execute("UPDATE files SET name=?, ext=?, category=?, kind=? WHERE id=?",
+             ("beta report.txt", "txt", "doc", "Text Document", _fxb_row[0]))
+from ezexp.db import fts_rename  # noqa: E402  (the exact call rename_current makes)
+fts_rename(_fxb, _fxb_row[0], "alpha report.txt", "beta report.txt")
+_rows, _ = ez.do_search(_fxb, "alpha")
+assert names(_rows) == [], _rows
+_rows, _ = ez.do_search(_fxb, "beta")
+assert names(_rows) == ["beta report.txt"], _rows
+_fxb.close()
+# --- Fix B end ---------------------------------------------------------------
+
 
 _test_settings.remove('agent_dock_visible')
 _test_settings.sync()

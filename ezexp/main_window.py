@@ -35,7 +35,7 @@ from ezexp.shell_win import (
 from ezexp.db import (
     db_connect, thread_conn, get_meta, set_meta, update_total,
     insert_rows, delete_tree, index_add_path, ROW_FIELDS,
-    _row_dict, _unique_dest, fts_touch
+    _row_dict, _unique_dest, fts_rename
 )
 from ezexp.indexer import _make_row
 from ezexp.search_engine import sort_rows, do_search
@@ -1211,7 +1211,7 @@ class MainWindow(FramelessWindow):
                     "UPDATE files SET name=?, ext=?, category=?, kind=? WHERE id=?",
                     (new, ext_of(new), category_for(new, row["is_dir"]),
                      kind_for(new, row["is_dir"]), idr[0]))
-                fts_touch(conn, idr[0], new)
+                fts_rename(conn, idr[0], row["name"], new)
             if row["is_dir"]:
                 conn.execute(
                     "UPDATE files SET parent = ? || substr(parent, ?) "

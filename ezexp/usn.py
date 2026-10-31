@@ -261,17 +261,10 @@ def _apply_delete(conn, drive, rec):
 
 
 def _fts_rename(conn, rowid, old_name, new_name):
-    """Re-index one renamed row. fts_touch() cannot be used here: its
-    DELETE reads the row's CURRENT content from files, which after the
-    rename no longer matches the indexed tokens and surfaces as
-    'database disk image is malformed'. The explicit 'delete' command
-    unindexes the supplied old value without touching the content table,
-    so it is safe on either side of the row move."""
-    if not db_mod.FTS_OK:
-        return
-    conn.execute("INSERT INTO fts(fts, rowid, name) VALUES('delete', ?, ?)",
-                 (rowid, old_name))
-    conn.execute("INSERT INTO fts(rowid, name) VALUES(?,?)", (rowid, new_name))
+    """One implementation lives in db.fts_rename (FTS5's explicit
+    'delete' command with the OLD value — see there for why the plain
+    content-read delete cannot be used across a rename)."""
+    db_mod.fts_rename(conn, rowid, old_name, new_name)
 
 
 def _apply_rename(conn, drive, rec):
