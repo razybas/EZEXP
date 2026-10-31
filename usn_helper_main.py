@@ -89,6 +89,10 @@ _k32.CloseHandle.argtypes = [ctypes.c_void_p]
 # ctypes passes it as a 32-bit int and OpenProcessToken rejects the
 # truncated value with ERROR_INVALID_HANDLE (live-caught in --install).
 _k32.GetCurrentProcess.restype = ctypes.c_void_p
+# RegisterServiceCtrlHandlerW returns a 64-bit SERVICE_STATUS_HANDLE; an
+# unprototyped call truncates it to 32 bits and EVERY SetServiceStatus
+# fails silently (live-caught: the service sat in START_PENDING forever)
+_adv.RegisterServiceCtrlHandlerW.restype = ctypes.c_void_p
 _adv.OpenProcessToken.argtypes = [ctypes.c_void_p, wt.DWORD,
                                   ctypes.POINTER(wt.HANDLE)]
 _adv.OpenProcessToken.restype = wt.BOOL
@@ -408,6 +412,13 @@ class SERVICE_STATUS(ctypes.Structure):
                 ("dwServiceSpecificExitCode", wt.DWORD),
                 ("dwCheckPoint", wt.DWORD), ("dwWaitHint", wt.DWORD)]
 
+
+# SetServiceStatus takes the 64-bit SERVICE_STATUS_HANDLE from
+# RegisterServiceCtrlHandlerW (prototyped above) — without argtypes the
+# struct POINTER would not bind correctly either
+_adv.SetServiceStatus.argtypes = [ctypes.c_void_p,
+                                  ctypes.POINTER(SERVICE_STATUS)]
+_adv.SetServiceStatus.restype = wt.BOOL
 
 _SERVICE_MAIN_FUNC = ctypes.WINFUNCTYPE(None, wt.DWORD, ctypes.POINTER(wt.LPWSTR))
 _HANDLER_FUNC = ctypes.WINFUNCTYPE(None, wt.DWORD)
