@@ -127,11 +127,27 @@ def checkpoint():
 
 
 def wait_mode(w, mode, secs):
+    """Poll for the drive's mode; after 30 s without a flip, dump every
+    thread's stack ONCE so a stuck watcher is diagnosable from the log."""
+    import threading
+    import traceback
+    dumped = [False]
     end = time.time() + secs
     while time.time() < end:
         st = w.last_status or ""
         if DRIVE + " " + mode in st:
             return True
+        if not dumped[0] and time.time() > end - secs + 30:
+            dumped[0] = True
+            print("STALL: no mode flip after 30 s; thread stacks:", flush=True)
+            for tid, frame in sys._current_frames().items():
+                name = "t%d" % tid
+                for t in threading.enumerate():
+                    if t.ident == tid:
+                        name = t.name
+                        break
+                print("--- thread %s ---" % name, flush=True)
+                traceback.print_stack(frame)
         time.sleep(0.2)
     return False
 
@@ -370,8 +386,11 @@ if PHASE == "C":
     st = load_state()
     w = make_watcher()
     w.start()
-    if not wait_mode(w, "USN", 120):
-        report("B6-reconnect-ready", False, "no USN session before outage")
+    # the helper may still be down from a previous step: wait up to 15 min
+    # for the owner's elevated console to come up before declaring failure
+    if not wait_mode(w, "USN", 15 * 60):
+        report("B6-reconnect-ready", False,
+               "no USN session before outage; status=%r" % w.last_status)
         sys.exit(1)
 
     print("OWNER: close the helper console window NOW.", flush=True)
@@ -383,12 +402,16 @@ if PHASE == "C":
            "status flipped to delta in %.1f s; mode=%r"
            % (time.perf_counter() - t0, w.last_status))
 
-    # with the helper dead, the delta net must still catch a new file
+    # with the helper dead, the delta net must still catch a new file.
+    # Scope the scan to the SCRATCH subtree: a drive-wide delta walks every
+    # dir the watcher indexed during the session (owner's churn-heavy
+    # trees) and can run for many minutes — the net is proven by the
+    # subtree alone.
     with open(os.path.join(SCRATCH, "b6_offline.txt"), "w") as f:
         f.write("made while helper down")
     c = conn()
     try:
-        scan_delta(c, [ROOT])
+        scan_delta(c, [SCRATCH])
         c.commit()
     finally:
         c.close()
