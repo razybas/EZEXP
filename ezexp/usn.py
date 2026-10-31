@@ -78,11 +78,14 @@ def read_checkpoint(conn, drive):
 
 def checkpoint_valid(cp, info):
     """False when the journal wrapped (saved USN below FirstUsn), when
-    the journal id changed, or when there is nothing saved — the caller
-    must then fall back to the delta scan and re-bootstrap."""
+    the saved USN is AHEAD of the journal's tip (a reset that kept the
+    journal id — live-caught: the helper's tail read silently idles on a
+    start beyond NextUsn), when the journal id changed, or when there is
+    nothing saved — the caller must then fall back to the delta scan
+    and re-bootstrap."""
     return (cp is not None and info is not None
             and cp.journal_id == info.journal_id
-            and cp.next_usn >= info.first_usn)
+            and info.first_usn <= cp.next_usn <= info.next_usn)
 
 
 def bootstrap_volume(conn, journal, drive):

@@ -2314,7 +2314,11 @@ class _FakeJournal:
 
     def read(self, start_usn, max_bytes=1 << 20):
         if self.chunks:
-            return self.chunks.pop(0)
+            nxt, buf = self.chunks.pop(0)
+            # a real journal's tip only ever GROWS; keep query() ahead of
+            # every served cursor so the checkpoint stays within bounds
+            self.next_usn = max(self.next_usn, nxt)
+            return nxt, buf
         return start_usn, b""
 
     def enum(self):
@@ -2362,6 +2366,8 @@ assert not usn.checkpoint_valid(usn.Checkpoint(0xA11CE, 0x1000), _u1info), \
 assert not usn.checkpoint_valid(usn.Checkpoint(0xB0B, 0x90010), _u1info), \
     "journal id change must be invalid"
 assert usn.checkpoint_valid(usn.Checkpoint(0xA11CE, 0x90005), _u1info)
+assert not usn.checkpoint_valid(usn.Checkpoint(0xA11CE, 0x90020), _u1info), \
+    "saved USN ahead of the journal tip must be invalid"
 
 # (b) applier on a temp catalog + fake journal
 _u1dir = os.path.join(tmp, "u1tree")
