@@ -8,3 +8,4 @@ agent.json
 .env
 *.key
 
+dist2/  
