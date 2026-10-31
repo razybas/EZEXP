@@ -655,6 +655,13 @@ finally:
         win._indexer.wait(5000)
     ez.fixed_drives = _orig_fixed
 
+# flush the queued done signal from the scan above NOW, while
+# _index_pending is still None — if it arrives later (after test 4 sets
+# the pending flag) _consume_pending_index schedules a REAL
+# start_indexer(rebuild=True) that full-scans the real drives mid-suite
+qapp.processEvents()
+win._index_pending = None
+
 # 3. Same-operation retry
 assert getattr(win, "_last_index_rebuild", None) is True
 recorded = []
@@ -2718,6 +2725,17 @@ class _FakeUsnClient:
 
 
 _u2b_delta_calls = []
+# stray-scan guard: pending QTimer retries from the indexer-lifecycle tests
+# above can fire a REAL start_indexer(rebuild=True) at any later moment,
+# which would full-scan the REAL drives inside the suite and hold
+# _INDEXER_BUSY for hours. Stop any running scan and pin fixed_drives to
+# the tiny fake tree for the whole U2b span.
+if getattr(win, "_indexer", None) and win._indexer.isRunning():
+    win._indexer.stop()
+    win._indexer.wait(10000)
+idxmod._INDEXER_BUSY.clear()  # any stray scan must not gate these tests
+_u2b_orig_fixed = ez.fixed_drives
+ez.fixed_drives = lambda: [data]
 _u2b_conn = ez.sqlite3.connect(os.path.join(tmp, "u2b.db"), check_same_thread=False)
 _u2b_dbpath = os.path.join(tmp, "u2b.db")
 def _u2b_newconn():
@@ -2765,14 +2783,17 @@ _w = idxmod.UsnWatcher(client_factory=lambda: _cli,
                        delta_fn=lambda conn, roots, p, alive: _u2b_delta_calls.append(roots))
 _w.start()
 assert _u2b_wait(lambda: ez.get_meta(_u2b_conn, "usn.%s.next_usn" % _u2bdrive) == "258"), \
-    "replay did not advance the checkpoint to 258"
+    "replay did not advance the checkpoint to 258 (busy=%s, status=%r, sent=%r)" % (
+        idxmod._INDEXER_BUSY.is_set(), _w.last_status, _cli.sent[:4])
 assert ("subscribe", _u2bdrive, 256) in _cli.sent, _cli.sent  # from the checkpoint, not 0
 assert _u2b_conn.execute("SELECT 1 FROM files WHERE parent=? AND name=?",
                          (_u2bdocs, "fresh.txt")).fetchone()
 assert _u2b_conn.execute("SELECT parent_frn, name FROM frn_map WHERE drive=? AND frn=200",
                          (_u2bdrive,)).fetchone() == (100, "fresh.txt")
 assert _u2bdrive + " USN" in _w.last_status, _w.last_status
-assert "delta" in _w.last_status  # drives the helper does not report ok
+# fixed_drives is pinned to the single fake drive (C:), which the fake
+# helper reports ok — so there are no delta drives in this status line
+assert _w.last_status == "Live: C: USN", _w.last_status
 assert _u2b_delta_calls == []  # replay path runs NO delta scan
 _w.stop()
 _w.wait(5000)
@@ -2868,6 +2889,25 @@ finally:
 
 _u2b_conn.close()
 # --- U2b end -----------------------------------------------------------------
+
+# --- watcher defers bootstrap while an indexer scan is running ---------------
+idxmod._INDEXER_BUSY.set()
+_cli4 = _FakeUsnClient(script={_u2bdrive: [_JI]})
+_w4 = idxmod.UsnWatcher(client_factory=lambda: _cli4,
+                        conn_factory=_u2b_newconn,
+                        delta_fn=lambda conn, roots, p, alive: None)
+_w4.start()
+time.sleep(1.5)
+assert not any(e[0] == "subscribe" for e in _cli4.sent), \
+    "watcher must not bootstrap while _INDEXER_BUSY is set"
+idxmod._INDEXER_BUSY.clear()
+assert _u2b_wait(lambda: any(e[0] == "subscribe" and e[1] == _u2bdrive
+                             for e in _cli4.sent), 10), \
+    "watcher must resume bootstrapping once the scan finishes"
+_w4.stop()
+_w4.wait(5000)
+ez.fixed_drives = _u2b_orig_fixed
+# --- gate test end -----------------------------------------------------------
 
 # --- Fix B: rename_current FTS reindex via explicit delete -------------------
 # rename_current does UPDATE files SET name=... then reindexes; with the old

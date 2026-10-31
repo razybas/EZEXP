@@ -235,6 +235,12 @@ def scan_delta(conn, roots, progress=None, should_run=None):
 
 USN_RETRY_SECS = 30
 
+# Set while IndexerThread._run_once is scanning: the watcher defers its
+# enum bootstrap and delta-once until the scan finishes. Without this a
+# first bootstrap after a catalog wipe launches a FULL scan per drive in
+# parallel with the user's rebuild (live-caught: the rebuild crawled).
+_INDEXER_BUSY = threading.Event()
+
 class UsnWatcher(QThread):
     """Live tail of the USN helper, one client session at a time.
 
@@ -326,6 +332,8 @@ class UsnWatcher(QThread):
         try:
             conn = self._make_conn()
             while not self._stop:
+                while _INDEXER_BUSY.is_set() and not self._stop:
+                    time.sleep(0.5)  # a scan owns the catalog right now
                 if first:
                     state = self._try_live_from_checkpoint(client, conn, drive)
                     first = False
@@ -518,6 +526,7 @@ class IndexerThread(QThread):
 
     def _run_once(self):
         conn = None
+        _INDEXER_BUSY.set()
         try:
             conn = db_connect()
             ensure_indexes(conn)
@@ -546,6 +555,7 @@ class IndexerThread(QThread):
             conn.commit()
             return total
         finally:
+            _INDEXER_BUSY.clear()
             if conn is not None:
                 try:
                     conn.close()
