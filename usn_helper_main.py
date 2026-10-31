@@ -85,6 +85,19 @@ _k32.WriteFile.argtypes = [ctypes.c_void_p, wt.LPCVOID, wt.DWORD,
 _k32.PeekNamedPipe.argtypes = [ctypes.c_void_p, wt.LPVOID, wt.DWORD, wt.LPVOID,
                                ctypes.POINTER(wt.DWORD), wt.LPVOID]
 _k32.CloseHandle.argtypes = [ctypes.c_void_p]
+# GetCurrentProcess returns a 64-bit PSEUDO-handle (-1); without a restype
+# ctypes passes it as a 32-bit int and OpenProcessToken rejects the
+# truncated value with ERROR_INVALID_HANDLE (live-caught in --install).
+_k32.GetCurrentProcess.restype = ctypes.c_void_p
+_adv.OpenProcessToken.argtypes = [ctypes.c_void_p, wt.DWORD,
+                                  ctypes.POINTER(wt.HANDLE)]
+_adv.OpenProcessToken.restype = wt.BOOL
+_adv.GetTokenInformation.argtypes = [ctypes.c_void_p, wt.DWORD, wt.LPVOID,
+                                     wt.DWORD, ctypes.POINTER(wt.DWORD)]
+_adv.GetTokenInformation.restype = wt.BOOL
+_adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                        ctypes.POINTER(wt.LPWSTR)]
+_adv.ConvertSidToStringSidW.restype = wt.BOOL
 
 
 def log(text):
