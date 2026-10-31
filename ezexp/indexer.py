@@ -420,8 +420,18 @@ class UsnWatcher(QThread):
     def _consume(self, client, conn, drive):
         """Apply live record batches with poll()'s commit discipline:
         apply batch -> advance checkpoint -> commit. Returns
-        'stale' | 'error' | 'dead' | 'stop'."""
+        'stale' | 'error' | 'dead' | 'stop'.
+
+        While _INDEXER_BUSY is set (a scan owns the catalog) this worker
+        STOPS READING entirely: the helper blocks on its pipe write, the
+        records accumulate in the kernel journal, and the checkpoint
+        replays them after the scan. Without this, the watcher's small
+        commits interleave with the scan's batches and scan_full dies on
+        'database is locked' — IndexerThread then restarts the whole
+        rebuild from zero, over and over (live-caught)."""
         while not self._stop:
+            while _INDEXER_BUSY.is_set() and not self._stop:
+                time.sleep(0.5)
             try:
                 msg = client.next_message(drive, timeout=0.5)
             except UsnUnavailable:
@@ -429,6 +439,8 @@ class UsnWatcher(QThread):
             if msg is None:
                 continue
             if msg["type"] == "records":
+                while _INDEXER_BUSY.is_set() and not self._stop:
+                    time.sleep(0.5)  # scan started between read and apply
                 try:
                     apply_records(conn, drive, msg["records"])
                     set_meta(conn, "usn.%s.next_usn" % drive,

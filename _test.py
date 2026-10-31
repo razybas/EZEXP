@@ -2904,6 +2904,29 @@ idxmod._INDEXER_BUSY.clear()
 assert _u2b_wait(lambda: any(e[0] == "subscribe" and e[1] == _u2bdrive
                              for e in _cli4.sent), 10), \
     "watcher must resume bootstrapping once the scan finishes"
+# _cli4's bootstrap re-pointed the root FRN at the real volume; re-point it
+# at the temp tree so the paused record below can stat its file
+_c4 = _u2b_newconn()
+_c4.execute("UPDATE frn_map SET name=? WHERE drive=? AND frn=5",
+            (_u2bdir, _u2bdrive))
+_c4.commit()
+_c4.close()
+# consumption pauses too: a record delivered while a scan runs must NOT
+# be applied until the scan finishes (the journal replays it after)
+idxmod._INDEXER_BUSY.set()
+with open(os.path.join(_u2bdocs, "paused.txt"), "w") as f:
+    f.write("p")
+_cli4.script.setdefault(_u2bdrive, []).append(
+    _rec_msg([[210, 100, 515, usn.USN_REASON_FILE_CREATE | usn.USN_REASON_CLOSE,
+               0, "paused.txt"]], 516))
+time.sleep(1.5)
+assert not _u2b_newconn().execute(
+    "SELECT 1 FROM files WHERE name='paused.txt'").fetchone(), \
+    "watcher applied a record while _INDEXER_BUSY was set"
+idxmod._INDEXER_BUSY.clear()
+assert _u2b_wait(lambda: _u2b_newconn().execute(
+    "SELECT 1 FROM files WHERE name='paused.txt'").fetchone(), 10), \
+    "watcher must apply the paused record after the scan finishes"
 _w4.stop()
 _w4.wait(5000)
 ez.fixed_drives = _u2b_orig_fixed
