@@ -27,7 +27,8 @@ from ezexp.agent_config import load_agent_config, agent_status
 from ezexp import APP_NAME
 from ezexp.fsutil import (
     fixed_drives, drive_label, shell_folders, join_path, split_path, ext_of,
-    human_size, fmt_date, real_dir, category_for, kind_for, TEXT_EXTS, like_escape
+    human_size, fmt_date, real_dir, category_for, kind_for, TEXT_EXTS, like_escape,
+    light_field_style
 )
 from ezexp.shell_win import (
     reveal_in_explorer, recycle_path, show_properties, shell_thumbnail
@@ -265,18 +266,14 @@ class MainWindow(FramelessWindow):
         self.dock_transcript = QPlainTextEdit(chat_container)
         self.dock_transcript.setObjectName("dockTranscript")
         self.dock_transcript.setReadOnly(True)
-        self.dock_transcript.setStyleSheet(
-            "background: #ffffff; color: #1d1d1f; border: 1px solid #e6e6ea; border-radius: 8px; padding: 8px 10px; font-size: 13px;"
-        )
+        self.dock_transcript.setStyleSheet(light_field_style(padding="8px 10px"))
         chat_lay.addWidget(self.dock_transcript, 1)
 
         input_row = QHBoxLayout()
         self.dock_input = QLineEdit(chat_container)
         self.dock_input.setObjectName("dockInput")
         self.dock_input.setPlaceholderText("Ask the agent…")
-        self.dock_input.setStyleSheet(
-            "background: #ffffff; color: #1d1d1f; border: 1px solid #e6e6ea; border-radius: 8px; padding: 6px 10px; font-size: 13px;"
-        )
+        self.dock_input.setStyleSheet(light_field_style())
         self.dock_input.returnPressed.connect(self.send_agent_message)
         input_row.addWidget(self.dock_input, 1)
 

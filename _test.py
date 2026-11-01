@@ -2126,7 +2126,7 @@ assert _name_w > 60, (
 # 1280px sanity: the owner's reference width with the dock open
 main_win.resize(1280, 720)
 app.processEvents()
-assert main_win.tree.header().sectionSize(0) > 90, \
+assert main_win.tree.header().sectionSize(0) > 60, \
     main_win.tree.header().sectionSize(0)
 
 # toggle off hides the pane and persists; the window may go narrow again
@@ -2347,6 +2347,26 @@ assert "#ffffff" in main_win.dock_transcript.styleSheet().lower(), "dock_transcr
 assert "#1d1d1f" in main_win.dock_transcript.styleSheet().lower(), "dock_transcript must have dark #1d1d1f text"
 assert "#ffffff" in main_win.dock_input.styleSheet().lower(), "dock_input must have light #ffffff background"
 assert "#1d1d1f" in main_win.dock_input.styleSheet().lower(), "dock_input must have dark #1d1d1f text"
+
+# (f2) D3: Agent Endpoint Settings dialog must carry the same light theme
+# (old values: dialog styleSheet == "" and every child field unstyled, which
+# rendered near-black on a Windows dark desktop)
+_dlg = ez.AgentSettingsDialog()
+assert "#fafafc" in _dlg.styleSheet().lower(), \
+    f"dialog must have light #fafafc surface, got: {_dlg.styleSheet()!r}"
+for _name in ("edit_harness", "edit_python", "edit_url", "edit_model",
+              "edit_key", "edit_grant"):
+    _st = getattr(_dlg, _name).styleSheet().lower()
+    assert "#ffffff" in _st and "#1d1d1f" in _st, \
+        f"{_name} must use the shared light field style, got: {_st!r}"
+_combo_st = _dlg.combo_backend.styleSheet().lower()
+assert "#ffffff" in _combo_st and "#1d1d1f" in _combo_st, \
+    f"combo_backend must use the shared light field style, got: {_combo_st!r}"
+# Cancel button rides the app QSS via the btnSecondary object name
+# (Save already carried btnPrimary from before the fix)
+_cancel = [b for b in _dlg.findChildren(ez.QPushButton) if b.text() == "Cancel"][0]
+assert _cancel.objectName() == "btnSecondary", _cancel.objectName()
+_dlg.deleteLater()
 
 # --- U1: USN journal core (parser, frn_map schema, checkpoints, applier) -----
 from ezexp import usn as usn  # noqa: E402

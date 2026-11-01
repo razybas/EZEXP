@@ -22,7 +22,7 @@ from ezexp.agent_config import (
     load_agent_config, save_agent_config, clear_harness_probe_cache,
     harness_available, agent_status
 )
-from ezexp.fsutil import ext_of, join_path, real_dir
+from ezexp.fsutil import ext_of, join_path, real_dir, light_field_style, TEXT
 from ezexp.db import db_connect, _row_dict, thread_conn
 from ezexp.search_engine import do_search
 from ezexp.indexer import IndexerThread
@@ -35,12 +35,27 @@ class AgentSettingsDialog(QDialog):
         self.setMinimumWidth(440)
         self.cfg = load_agent_config()
 
+        # D3: the dialog never received the app's light theme (the T2 fix
+        # covered the dock only) — on a Windows dark desktop the unstyled
+        # children render near-black. Same light palette source as the dock
+        # fields (ezexp.fsutil.light_field_style); buttons reuse the app QSS
+        # object names (btnPrimary/btnSecondary).
+        self.setStyleSheet(
+            "QDialog { background: #fafafc; } "
+            "QLabel { color: %s; background: transparent; }" % TEXT
+        )
+
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
         lay.setContentsMargins(18, 18, 18, 18)
 
         lbl_backend = QLabel("Backend:", self)
         self.combo_backend = QComboBox(self)
+        self.combo_backend.setStyleSheet(
+            light_field_style(padding="4px 8px")
+            + "QComboBox QAbstractItemView { background: #ffffff; color: %s; "
+              "selection-background-color: #0a84ff; selection-color: #ffffff; }" % TEXT
+        )
         self.combo_backend.addItem("Endpoint")
         self.combo_backend.addItem("Organism Harness")
         backend = (self.cfg.get("backend") or "endpoint").lower()
@@ -119,6 +134,12 @@ class AgentSettingsDialog(QDialog):
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_save)
         lay.addLayout(btn_row)
+
+        # D3: every editable child gets the dock's light field styling
+        for _edit in (self.edit_harness, self.edit_python, self.edit_url,
+                      self.edit_model, self.edit_key, self.edit_grant):
+            _edit.setStyleSheet(light_field_style())
+        btn_cancel.setObjectName("btnSecondary")
 
     def _sync_backend_ui(self):
         is_harness = (self.combo_backend.currentIndex() == 1)

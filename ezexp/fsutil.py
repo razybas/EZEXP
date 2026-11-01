@@ -13,6 +13,25 @@ TEXT = "#1d1d1f"
 
 SUBTLE = "#86868b"
 
+# T2/D3: light field surface shared by every floating editable surface
+# (agent dock transcript/input, AgentSettingsDialog). Plain QLineEdit /
+# QComboBox children of a dialog fall through to the Windows dark theme and
+# render near-black, so each such surface must style from this one source.
+FIELD_BG = "#ffffff"
+
+FIELD_BORDER = "#e6e6ea"
+
+FIELD_PANE = "#fafafc"
+
+
+def light_field_style(padding="6px 10px", radius="8px", font="13px"):
+    """The dock's light field styling: white background, dark text, hairline
+    border. Reused verbatim by the dock fields and the agent settings
+    dialog — do not invent a second palette."""
+    return ("background: %s; color: %s; border: 1px solid %s; "
+            "border-radius: %s; padding: %s; font-size: %s;"
+            % (FIELD_BG, TEXT, FIELD_BORDER, radius, padding, font))
+
 CAT_EXTS = {
     "app": APP_EXTS,
     "doc": {
