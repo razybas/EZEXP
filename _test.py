@@ -17,6 +17,7 @@ sys.path.insert(0, r"D:\exp\ezexp")
 import app as ez  # noqa: E402
 _test_settings = ez.QSettings('ezexp', 'EzExp')
 _test_settings.remove('agent_dock_visible')
+_test_settings.remove('details_visible')
 _test_settings.sync()
 
 # --- fake "drive" tree ------------------------------------------------------
@@ -2104,6 +2105,49 @@ assert not main_win.btn_toggle_agent.isChecked()
 main_win.toggle_agent_dock(True)
 assert not main_win.agent_dock.isHidden()
 
+# (a2) D1: details pane toggle + persistence + Name column layout priority
+# Red-first: with details + dock both visible at a small window size the
+# results tree must still show a usable Name column (the old layout packed
+# the panes over the list and collapsed Name to a sliver).
+from PySide6.QtWidgets import QApplication as _QApp  # noqa: E402
+ez.QSettings("ezexp", "EzExp").setValue("details_visible", "true")
+main_win.toggle_details(True)
+assert not main_win.details.isHidden(), "details must be visible after toggle_details(True)"
+assert main_win.btn_toggle_details.isChecked()
+main_win.toggle_agent_dock(True)
+main_win.resize(1100, 720)
+app = _QApp.instance()
+app.processEvents()
+_name_w = main_win.tree.header().sectionSize(0)
+assert main_win.width() >= 1100
+assert _name_w > 60, (
+    "Name column must survive with details + dock visible at 1100px: "
+    f"got {_name_w}px (window {main_win.width()}px)")
+# 1280px sanity: the owner's reference width with the dock open
+main_win.resize(1280, 720)
+app.processEvents()
+assert main_win.tree.header().sectionSize(0) > 90, \
+    main_win.tree.header().sectionSize(0)
+
+# toggle off hides the pane and persists; the window may go narrow again
+main_win.toggle_details(False)
+assert main_win.details.isHidden(), "details must hide after toggle_details(False)"
+assert not main_win.btn_toggle_details.isChecked()
+assert ez.QSettings("ezexp", "EzExp").value("details_visible") in ("false", False)
+main_win.resize(950, 720)
+app.processEvents()
+assert main_win.tree.header().sectionSize(0) > 60, \
+    main_win.tree.header().sectionSize(0)
+# restore-on-launch: a fresh window picks up details_visible=false
+_w2 = ez.MainWindow(worker)
+assert _w2.details.isHidden(), "fresh window must restore details_visible=false"
+_w2.toggle_details(True)
+assert not _w2.details.isHidden()
+assert ez.QSettings("ezexp", "EzExp").value("details_visible") in ("true", True)
+_w2.deleteLater()
+ez.QSettings("ezexp", "EzExp").setValue("details_visible", "true")
+
+
 # (b) Navigating to a folder updates the dock's Context label to that folder
 main_win.drill_to_path(r"D:\exp\test_nav_dir", "test_nav_dir")
 assert "D:\\exp\\test_nav_dir" in main_win.ws_lbl_context.text(), f"Context not updated: {main_win.ws_lbl_context.text()}"
@@ -3129,6 +3173,7 @@ main_win._deferred_notes = []
 
 
 _test_settings.remove('agent_dock_visible')
+_test_settings.remove('details_visible')
 _test_settings.sync()
 # restore the OWNER's vaults — the suite overwrote them via real QSettings
 ez.set_vaults(list(_owner_vaults or []))

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QMenu, QMessageBox, QFileDialog, QWidget,
     QInputDialog, QTableWidget, QTableWidgetItem, QAbstractItemView,
-    QSplitter, QPlainTextEdit, QDialog
+    QSplitter, QPlainTextEdit, QDialog, QSizePolicy
 )
 from ezexp.agent import AgentClient, BridgeWorker, ConfirmBridge, AgentSettingsDialog
 from ezexp.agent_config import load_agent_config, agent_status
@@ -95,6 +95,19 @@ class MainWindow(FramelessWindow):
         self.titlebar.search.edit.textChanged.connect(self.on_search_changed)
         root.addWidget(self.titlebar)
 
+        self.btn_toggle_details = QPushButton("Details", self.titlebar)
+        self.btn_toggle_details.setObjectName("btnToggleDetails")
+        self.btn_toggle_details.setCheckable(True)
+        self.btn_toggle_details.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_details.setFixedHeight(28)
+        self.btn_toggle_details.setStyleSheet(
+            "QPushButton#btnToggleDetails { background: #e8e8ed; border: none; border-radius: 6px; padding: 0 10px; font-size: 12px; font-weight: 500; color: #1d1d1f; }"
+            "QPushButton#btnToggleDetails:checked { background: #0a84ff; color: #ffffff; }"
+            "QPushButton#btnToggleDetails:hover:!checked { background: #dedee3; }"
+        )
+        self.btn_toggle_details.clicked.connect(self.toggle_details)
+        self.titlebar.layout().addWidget(self.btn_toggle_details)
+
         self.btn_toggle_agent = QPushButton("Agent", self.titlebar)
         self.btn_toggle_agent.setObjectName("btnToggleAgent")
         self.btn_toggle_agent.setCheckable(True)
@@ -139,6 +152,12 @@ class MainWindow(FramelessWindow):
         # ---- main column ----
         main = QFrame(self)
         main.setObjectName("content")
+        # D1: the results list gets layout priority — the details pane and the
+        # agent dock compress before the list does, so the Name column can
+        # never be squeezed away (440 keeps Name + the three fixed columns
+        # visible at any allowed window width).
+        main.setMinimumWidth(440)
+        self.main_column = main
         mbar = QVBoxLayout(main)
         mbar.setContentsMargins(0, 0, 0, 0)
         mbar.setSpacing(0)
@@ -209,9 +228,10 @@ class MainWindow(FramelessWindow):
         body.addWidget(self.details)
 
         # ---- agent dock (extreme right) ----
-        self.agent_dock = QFrame(self)
+        self.agent_dock = AgentDockFrame(self)
         self.agent_dock.setObjectName("agentDock")
-        self.agent_dock.setFixedWidth(340)
+        self.agent_dock.setMinimumWidth(290)
+        self.agent_dock.setMaximumWidth(340)
         self.agent_dock.setStyleSheet("#agentDock { background: #fafafc; border-left: 1px solid #ececf0; }")
         dock_lay = QVBoxLayout(self.agent_dock)
         dock_lay.setContentsMargins(8, 8, 8, 8)
@@ -349,6 +369,15 @@ class MainWindow(FramelessWindow):
         if init_vis:
             self.refresh_workspace_pane()
             self.update_agent_status()
+
+        # D1: details pane visibility (default visible) + the window minimum
+        # that keeps the Name column alive for the visible panes
+        saved_details = QSettings("ezexp", "EzExp").value("details_visible", "true")
+        init_details = not (saved_details is False or
+                            str(saved_details).lower() in ("false", "0"))
+        self.details.setVisible(init_details)
+        self.btn_toggle_details.setChecked(init_details)
+        self._update_layout_mins()
 
         # ---- status bar ----
         self.status_bar = QFrame(self)
@@ -1381,9 +1410,35 @@ class MainWindow(FramelessWindow):
         self.agent_dock.setVisible(new_vis)
         self.btn_toggle_agent.setChecked(new_vis)
         QSettings("ezexp", "EzExp").setValue("agent_dock_visible", "true" if new_vis else "false")
+        self._update_layout_mins(widen=True)
         if new_vis:
             self.refresh_workspace_pane()
             self.update_agent_status()
+
+    def toggle_details(self, checked=None):
+        if checked is None:
+            new_vis = self.details.isHidden()
+        else:
+            new_vis = bool(checked)
+        self.details.setVisible(new_vis)
+        self.btn_toggle_details.setChecked(new_vis)
+        QSettings("ezexp", "EzExp").setValue("details_visible", "true" if new_vis else "false")
+        self._update_layout_mins(widen=True)
+
+    def _update_layout_mins(self, widen=False):
+        """D1: the window must never be narrower than sidebar + the results
+        list's floor + the minimums of the panes that are actually visible —
+        otherwise Qt's layout packs the panes over the list and the Name
+        column disappears. Opening a pane on a too-narrow window widens it."""
+        w = self.sidebar.width() + self.main_column.minimumWidth()
+        if not self.details.isHidden():
+            w += self.details.minimumWidth()
+        if not self.agent_dock.isHidden():
+            w += self.agent_dock.minimumWidth()
+        w = max(w, 900)
+        self.setMinimumWidth(w)
+        if widen and self.width() < w:
+            self.resize(w, self.height())
 
     def update_agent_status(self):
         cfg = self.agent_client.config if self.agent_client.config is not None else load_agent_config()
@@ -1580,14 +1635,32 @@ class ClickableLabel(QLabel):
             self.clicked.emit()
         super().mouseReleaseEvent(e)
 
+class AgentDockFrame(QFrame):
+    """Agent dock host: prefers 340px but compresses down to its minimum
+    before the results list is squeezed (D1 layout priority)."""
+    def sizeHint(self):
+        s = super().sizeHint()
+        s.setWidth(340)
+        return s
+
+
 class DetailsPane(QFrame):
     preview_ready = Signal(int, str, object)
     PREVIEW_H = 200
 
+    def sizeHint(self):
+        s = super().sizeHint()
+        s.setWidth(280)
+        return s
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setObjectName("details")
-        self.setFixedWidth(280)
+        # D1: prefer 280px (sizeHint) but compress to 220 before the results
+        # list loses its Name column. Text labels use an Ignored horizontal
+        # policy so long names/paths cannot inflate the pane's minimum width.
+        self.setMinimumWidth(220)
+        self.setMaximumWidth(280)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 18, 20, 20)
         lay.setSpacing(6)
@@ -1625,11 +1698,15 @@ class DetailsPane(QFrame):
         self.name_label.setAlignment(Qt.AlignCenter)
         self.name_label.setWordWrap(False)
         self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.name_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                      QSizePolicy.Policy.Preferred)
         lay.addWidget(self.name_label)
 
         self.kind_label = QLabel(self)
         self.kind_label.setObjectName("dKind")
         self.kind_label.setAlignment(Qt.AlignCenter)
+        self.kind_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                      QSizePolicy.Policy.Preferred)
         lay.addWidget(self.kind_label)
 
         lay.addSpacing(10)
@@ -1644,6 +1721,8 @@ class DetailsPane(QFrame):
             v = QLabel(self)
             v.setObjectName("dVal")
             v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            v.setSizePolicy(QSizePolicy.Policy.Ignored,
+                            QSizePolicy.Policy.Preferred)
             grid.addWidget(k, i, 0, Qt.AlignTop)
             grid.addWidget(v, i, 1)
             self.meta[key] = v
