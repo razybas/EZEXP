@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QMenu, QMessageBox, QFileDialog, QWidget,
     QInputDialog, QTableWidget, QTableWidgetItem, QAbstractItemView,
-    QSplitter, QPlainTextEdit, QDialog, QSizePolicy
+    QSplitter, QPlainTextEdit, QDialog, QSizePolicy, QScrollArea
 )
 from ezexp.agent import AgentClient, BridgeWorker, ConfirmBridge, AgentSettingsDialog
 from ezexp.agent_config import load_agent_config, agent_status
@@ -143,9 +143,28 @@ class MainWindow(FramelessWindow):
         self.sidebar = QFrame(self)
         self.sidebar.setObjectName("sidebar")
         self.sidebar.setFixedWidth(206)
-        sbar = QVBoxLayout(self.sidebar)
+        # D4: when the rows outgrew the sidebar, the layout packed them into
+        # OVERLAPPING rects (pitch < button height) and a checked row's
+        # highlight painted over its neighbours. The rows now live in a
+        # scrollable list so they always keep their full height.
+        self._side_list = QWidget(self.sidebar)
+        self._side_list.setObjectName("sideList")
+        sbar = QVBoxLayout(self._side_list)
         sbar.setContentsMargins(10, 10, 10, 10)
         sbar.setSpacing(2)
+        self._side_scroll = QScrollArea(self.sidebar)
+        self._side_scroll.setObjectName("sideScroll")
+        self._side_scroll.setWidgetResizable(True)
+        self._side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._side_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "#sideList { background: transparent; }"
+        )
+        self._side_scroll.setWidget(self._side_list)
+        lay = QVBoxLayout(self.sidebar)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._side_scroll)
         self._side_buttons = []
         self._build_sidebar()
         body.addWidget(self.sidebar)
@@ -509,7 +528,7 @@ class MainWindow(FramelessWindow):
 
     # ---- sidebar ----------------------------------------------------------
     def _build_sidebar(self):
-        sbar = self.sidebar.layout()
+        sbar = self._side_list.layout()
         while sbar.count():
             item = sbar.takeAt(0)
             w = item.widget()

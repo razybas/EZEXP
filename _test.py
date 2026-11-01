@@ -2147,6 +2147,39 @@ assert ez.QSettings("ezexp", "EzExp").value("details_visible") in ("true", True)
 _w2.deleteLater()
 ez.QSettings("ezexp", "EzExp").setValue("details_visible", "true")
 
+# (a3) D4: sidebar rows must never be layout-compressed into overlapping
+# rects — when the rows outgrew the sidebar, a checked row's 34px highlight
+# painted over the rows above/below (owner: pressing "New Volume (D:)"
+# covered "Google Drive (G:)" and "Rescan now"). Pad Quick Launch so the
+# content certainly overflows a short sidebar.
+_ql_owner = ez.get_quicklaunch()
+ez.set_quicklaunch(list(_ql_owner or []) + [
+    r"C:\__ezexp_ql_pad__\app%02d.exe" % i for i in range(12)])
+main_win._build_sidebar()
+main_win.resize(1280, 560)
+app.processEvents()
+_side_btns = sorted(main_win._side_buttons + main_win._ql_buttons
+                    + [main_win.rescan_btn, main_win.rebuild_btn],
+                    key=lambda b: b.geometry().top())
+assert len(_side_btns) >= 15, len(_side_btns)
+for _a, _b in zip(_side_btns, _side_btns[1:]):
+    assert _b.geometry().top() >= _a.geometry().bottom(), (
+        "sidebar rows overlap: %r %s vs %r %s" % (
+            _a.text(), _a.geometry(), _b.text(), _b.geometry()))
+# a pressed drive row keeps its highlight inside its own rect: click D: and
+# re-check no other row's rect intersects the button's geometry
+_d_btn = [b for b in main_win._side_buttons if getattr(b, "_place", None) == "D:"][0]
+_d_btn.setChecked(True)
+app.processEvents()
+for _b in _side_btns:
+    if _b is _d_btn:
+        continue
+    assert not _d_btn.geometry().intersects(_b.geometry()), (
+        "checked row highlight rect overlaps %r: %s vs %s" % (
+            _b.text(), _d_btn.geometry(), _b.geometry()))
+ez.set_quicklaunch(list(_ql_owner or []))
+main_win._build_sidebar()
+
 
 # (b) Navigating to a folder updates the dock's Context label to that folder
 main_win.drill_to_path(r"D:\exp\test_nav_dir", "test_nav_dir")
