@@ -1316,6 +1316,7 @@ class MainWindow(FramelessWindow):
         self._indexer.done.connect(self.on_index_done)
         self._indexer.usn_status.connect(self.on_usn_status)
         self._indexer.root_deferred.connect(self.on_root_deferred)
+        self._indexer.scan_kind.connect(self.on_scan_kind)
         self._deferred_notes = []
         self._indexer.start()
         self.rescan_btn.setEnabled(False)
@@ -1332,6 +1333,12 @@ class MainWindow(FramelessWindow):
     def on_index_progress(self, path, count):
         self._indexing_path = path
         self._count = count
+
+    def on_scan_kind(self, kind):
+        """D2: the status line must say which scan is running — a delta
+        after the app was closed can legitimately count thousands of
+        changed items and looked identical to a full reindex."""
+        self._scan_kind = kind
 
     def on_root_deferred(self, text):
         """Fix 2: the quarantine flagged a virtual root (e.g. G: made no
@@ -1351,9 +1358,13 @@ class MainWindow(FramelessWindow):
     def _tick_spinner(self):
         self._spin_i = (self._spin_i + 1) % len(self._spin_frames)
         if self._indexer and self._indexer.isRunning():
+            if getattr(self, "_scan_kind", "full") == "full":
+                verb, noun = "Reindexing", "items this run"
+            else:
+                verb, noun = "Indexing", "changed this run"
             self.status_right.setText(
-                f"{self._spin_frames[self._spin_i]} Indexing: {self._indexing_path}  ·  "
-                f"{getattr(self, '_count', 0):,} items this run")
+                f"{self._spin_frames[self._spin_i]} {verb}: {self._indexing_path}  ·  "
+                f"{getattr(self, '_count', 0):,} {noun}")
 
     def on_index_done(self, total, err):
         self._spinner.stop()

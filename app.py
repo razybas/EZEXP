@@ -88,7 +88,7 @@ from ezexp.db import (
 from ezexp.search_engine import sort_rows, do_search
 from ezexp.indexer import (
     BATCH, MTIME_EPS, _entry_skipped, _make_row, scan_full, scan_delta,
-    SearchWorker, IndexerThread,
+    SearchWorker, IndexerThread, launch_needs_full,
 )
 from ezexp.vault_graph import (
     WIKILINK_RE, parse_wikilinks, active_vault_for, pending_link_count,

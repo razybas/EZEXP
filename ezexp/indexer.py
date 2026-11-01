@@ -186,11 +186,24 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
         should_run = lambda: True
     if wipe:
         def _wipe():
+            if not should_run():
+                # D2: a stopped scan must not sit out the lock-retry inside
+                # the wipe; an un-wiped catalog keeps its phase and the next
+                # launch re-decides (empty -> full, populated -> delta)
+                return
             conn.execute("DELETE FROM files")
             conn.execute("DELETE FROM note_links")
             rebuild_fts(conn)
             conn.commit()
         _locked_retry(conn, _wipe)
+        # D2: record durably that a rebuild is in flight, and which roots
+        # have completed, so an interrupted rebuild's launch decision sees a
+        # populated catalog with a non-final phase and resumes as a DELTA
+        # instead of restarting the whole scan from zero.
+        _locked_retry(conn, lambda: (
+            set_meta(conn, "phase", "full_partial"),
+            set_meta(conn, "full_done_roots", ""),
+            conn.commit()))
     total = 0
     batch = []
     for root in roots:
@@ -282,14 +295,45 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
         _locked_retry(conn, conn.commit)
         if watchdog is not None:
             watchdog.finish(root)
+        if should_run():
+            # D2: durable per-root completion (full_done_roots is a record,
+            # not a skip list — the resume delta still walks completed roots
+            # so changes made after they finished are caught)
+            _locked_retry(conn, lambda r=root: _record_root_done(conn, r))
         if progress:
             progress(root, total)
     if should_run():
         def _finalize():
             rebuild_fts(conn)  # index all names in one pass
-            set_meta(conn, "phase", "full_done")
+            if wipe:
+                # D2: only a COMPLETED full rebuild may stamp the finalize;
+                # a wipe=False extra-root walk (delta's new-drive fallback)
+                # must not vouch for the roots it did not walk
+                set_meta(conn, "phase", "full_done")
+                set_meta(conn, "full_done_roots", "")
             conn.commit()
         _locked_retry(conn, _finalize)
+
+def _record_root_done(conn, root):
+    done = get_meta(conn, "full_done_roots") or ""
+    parts = [p for p in done.split(",") if p]
+    if root not in parts:
+        parts.append(root)
+        set_meta(conn, "full_done_roots", ",".join(parts))
+        conn.commit()
+
+def launch_needs_full(rebuild, phase, files_count):
+    """D2: the launch decision. A full scan is warranted ONLY for an
+    explicit Rebuild or an empty catalog. A populated catalog with a
+    missing/stale finalize stamp (interrupted rebuild, phase missing or
+    'full_partial') must resume as a DELTA — the delta is the witness —
+    and the stamp lands when that delta completes. Never stamp full_done
+    without a completed scan."""
+    if rebuild:
+        return True
+    if phase == "full_done":
+        return False
+    return files_count == 0
 
 def scan_delta(conn, roots, progress=None, should_run=None, watchdog=None):
     """Incremental scan: only re-read directories whose mtime changed.
@@ -709,6 +753,7 @@ class IndexerThread(QThread):
     done = Signal(int, str)  # total, error-or-empty
     usn_status = Signal(str)  # per-drive live mode line, e.g. "Live: C: USN · D: delta"
     root_deferred = Signal(str)  # Fix 2: "G: deferred (no progress)"
+    scan_kind = Signal(str)  # D2: "full" or "delta", emitted once per run
 
     def __init__(self, rebuild=False):
         super().__init__()
@@ -768,10 +813,21 @@ class IndexerThread(QThread):
                     if virtual:
                         wd = RootWatchdog(virtual, on_defer=defer_note)
                         wd.start()
-                if self.rebuild or phase != "full_done":
+                # D2: full scan ONLY for an explicit Rebuild or an empty
+                # catalog; a populated catalog with a missing/stale stamp
+                # resumes as a delta (the delta is the witness) and the
+                # finalize stamp lands when it completes.
+                files_count = conn.execute(
+                    "SELECT COUNT(*) FROM files").fetchone()[0]
+                full = launch_needs_full(self.rebuild, phase, files_count)
+                self.scan_kind.emit("full" if full else "delta")
+                if full:
                     scan_full(conn, roots, prog, alive, watchdog=wd)
                 else:
                     scan_delta(conn, roots, prog, alive, watchdog=wd)
+                    if alive() and get_meta(conn, "phase") != "full_done":
+                        set_meta(conn, "phase", "full_done")
+                        conn.commit()
             finally:
                 if wd is not None:
                     wd.stop()

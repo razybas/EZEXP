@@ -3137,6 +3137,12 @@ _t0 = time.time()
 while time.time() - _t0 < 5 and not _wd.deferred(r"Q:\slow"):
     time.sleep(0.05)
 assert _wd.deferred(r"Q:\slow"), "watchdog must defer a silent virtual root"
+# on_defer fires on the monitor thread AFTER deferred() flips (it runs
+# outside the lock) — give the callback a beat to arrive before asserting
+for _ in range(50):
+    if _got_defers:
+        break
+    time.sleep(0.05)
 assert _got_defers == [r"Q:\slow"], _got_defers
 _wd.stop()
 
@@ -3223,6 +3229,134 @@ assert _line == ("1,234 items indexed · updated 12:00"
                  " · G: deferred (no progress)"), _line
 main_win._deferred_notes = []
 # --- Fix 2 end ---------------------------------------------------------------
+
+# --- D2: launch decision + durable full-partial progress ---------------------
+from ezexp.indexer import launch_needs_full  # noqa: E402
+
+# full scan ONLY for an explicit Rebuild or an empty catalog; a populated
+# catalog with a missing/stale finalize stamp resumes as a delta
+assert launch_needs_full(True, None, 0) is True, "explicit rebuild = full"
+assert launch_needs_full(True, "full_done", 100) is True, "explicit rebuild = full"
+assert launch_needs_full(False, "full_done", 1868840) is False
+assert launch_needs_full(False, None, 1868840) is False, \
+    "populated catalog + missing stamp must resume as a delta"
+assert launch_needs_full(False, "full_partial", 5000) is False, \
+    "interrupted rebuild must resume as a delta"
+assert launch_needs_full(False, None, 0) is True, "empty catalog = first run"
+
+# durable progress: an interrupted full rebuild records full_partial plus
+# the completed roots, so the next launch resumes as a delta instead of
+# restarting the whole scan from zero
+_d2conn = ez.sqlite3.connect(os.path.join(tmp, "d2_partial.db"))
+ez._ensure_schema(_d2conn)
+_rA = os.path.join(tmp, "d2_rootA")
+_rB = os.path.join(tmp, "d2_rootB")
+for _r in (_rA, _rB):
+    os.makedirs(os.path.join(_r, "sub"))
+    with open(os.path.join(_r, "sub", "f.txt"), "w") as _f:
+        _f.write("x")
+    with open(os.path.join(_r, "top.txt"), "w") as _f:
+        _f.write("x")
+_stop_after_A = {"stop": False}
+def _d2_prog(path, count):
+    if path == _rA:
+        _stop_after_A["stop"] = True
+def _d2_should():
+    return not _stop_after_A["stop"]
+ez.scan_full(_d2conn, [_rA, _rB], _d2_prog, _d2_should)
+assert ez.get_meta(_d2conn, "phase") == "full_partial", \
+    ez.get_meta(_d2conn, "phase")
+_done_roots = (ez.get_meta(_d2conn, "full_done_roots") or "").split(",")
+assert _rA in _done_roots and _rB not in _done_roots, _done_roots
+assert launch_needs_full(
+    False, ez.get_meta(_d2conn, "phase"),
+    _d2conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]) is False, \
+    "interrupted rebuild on a populated catalog must resume as a delta"
+# completing the rebuild stamps full_done and clears the record
+ez.scan_full(_d2conn, [_rA, _rB], lambda p, c: None)
+assert ez.get_meta(_d2conn, "phase") == "full_done"
+assert not (ez.get_meta(_d2conn, "full_done_roots") or ""), \
+    ez.get_meta(_d2conn, "full_done_roots")
+# a wipe=False extra-root walk (delta's new-drive fallback) must NOT stamp
+# the finalize on a catalog that has no stamp of its own
+_d2c3 = ez.sqlite3.connect(os.path.join(tmp, "d2_extra.db"))
+ez._ensure_schema(_d2c3)
+ez.scan_full(_d2c3, [_rA], lambda p, c: None, wipe=False)
+assert ez.get_meta(_d2c3, "phase") is None, ez.get_meta(_d2c3, "phase")
+_d2conn.close()
+_d2c3.close()
+
+# honest status line: a delta counts CHANGED items and must say so — the
+# old line ("Indexing: ... N items this run") was identical for both scan
+# kinds and read as a reindex
+class _FakeRunningIndexer:
+    def isRunning(self):
+        return True
+_d2_orig_indexer = main_win._indexer
+main_win._indexer = _FakeRunningIndexer()
+main_win.on_scan_kind("delta")
+main_win.on_index_progress(r"C:\Users\nanub\AppData", 8327)
+main_win._tick_spinner()
+_st = main_win.status_right.text()
+assert "Indexing" in _st and "changed this run" in _st, _st
+assert "items this run" not in _st, _st
+main_win.on_scan_kind("full")
+main_win.on_index_progress("C:\\", 1868840)
+main_win._tick_spinner()
+_st = main_win.status_right.text()
+assert "Reindexing" in _st and "items this run" in _st, _st
+main_win._indexer = _d2_orig_indexer
+
+# integration: the real _run_once on a populated catalog with the stamp
+# removed must take the DELTA branch and land full_done when it completes
+# (never stamp without a completed scan; never full-rescan for a stamp).
+# Runs on a PRIVATE db — the shared suite catalog can hold stray
+# lock-holders from the stray-retry cascade (leaked IndexerThreads), so
+# db_connect/DB_PATH are re-pointed at a fresh file for this section.
+import ezexp.db as _dbmod  # noqa: E402
+for _t in threading.enumerate():
+    if isinstance(_t, ez.IndexerThread) and _t.isRunning():
+        _t.stop()
+        _t.wait(20000)
+idxmod._INDEXER_BUSY.clear()
+_d2_saved_drives = ez.fixed_drives
+_d2_saved_dbpath = _dbmod.DB_PATH
+_d2_saved_dbdir = _dbmod.DB_DIR
+_dbmod.DB_PATH = os.path.join(tmp, "d2_integration.db")
+_dbmod.DB_DIR = tmp
+ez.DB_PATH, ez.DB_DIR = _dbmod.DB_PATH, _dbmod.DB_DIR
+ez.fixed_drives = lambda: [_rA]
+_d2_saved_vaults = ez.get_vaults()
+ez.set_vaults([])
+try:
+    _d2c4 = ez.db_connect()
+    ez.ensure_indexes(_d2c4)
+    ez.scan_full(_d2c4, [_rA], lambda p, c: None)  # populated + full_done
+    ez.set_meta(_d2c4, "phase", "")                # simulate the lost stamp
+    _d2c4.close()
+    _d2_thread = ez.IndexerThread(rebuild=False)
+    _d2_thread._run_once()                          # synchronous; NO_USN set
+    _d2c4 = ez.db_connect()
+    assert ez.get_meta(_d2c4, "phase") == "full_done", \
+        ez.get_meta(_d2c4, "phase")
+    assert _d2c4.execute("SELECT COUNT(*) FROM files").fetchone()[0] > 0
+    _d2c4.close()
+    # ...and an explicit rebuild still goes full even with the stamp present
+    ez.fixed_drives = lambda: [_rB]
+    _d2_thread2 = ez.IndexerThread(rebuild=True)
+    _d2_thread2._run_once()
+    _d2c4 = ez.db_connect()
+    assert ez.get_meta(_d2c4, "phase") == "full_done"
+    assert _d2c4.execute(
+        "SELECT COUNT(*) FROM files WHERE drive=?", (_rB[:2],)).fetchone()[0] > 0
+    _d2c4.close()
+finally:
+    _dbmod.DB_PATH = _d2_saved_dbpath
+    _dbmod.DB_DIR = _d2_saved_dbdir
+    ez.DB_PATH, ez.DB_DIR = _d2_saved_dbpath, _d2_saved_dbdir
+    ez.fixed_drives = _d2_saved_drives
+    ez.set_vaults(list(_d2_saved_vaults or []))
+# --- D2 end -------------------------------------------------------------------
 
 
 _test_settings.remove('agent_dock_visible')
