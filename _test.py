@@ -843,6 +843,68 @@ assert os.path.isdir(target_fld), f"Expected directory at {target_fld}"
 res_exist = client_ok.dispatch_tool("create_file", {"rel_path": "sub/ok.txt", "content": "new"})
 assert "error" in res_exist.lower() or "already exists" in res_exist.lower()
 
+# read_file tests
+# 1. no grant
+res_rf_ng = client_no_grant.dispatch_tool("read_file", {"rel_path": "sub/ok.txt"})
+assert "error" in res_rf_ng.lower()
+# 2. escape
+res_rf_esc = client_ok.dispatch_tool("read_file", {"rel_path": "../escape.txt"})
+assert "escapes granted folder" in res_rf_esc or "error" in res_rf_esc.lower()
+# 3. file not found
+res_rf_nf = client_ok.dispatch_tool("read_file", {"rel_path": "nonexistent.txt"})
+assert "file not found" in res_rf_nf.lower()
+# 4. success
+res_rf_ok = client_ok.dispatch_tool("read_file", {"rel_path": "sub/ok.txt"})
+assert res_rf_ok == "hello disk", f"Expected 'hello disk', got: {res_rf_ok}"
+# 5. cap 200 KB truncation
+big_path = os.path.join(grant_test_dir, "big.txt")
+with open(big_path, "w", encoding="utf-8") as bf:
+    bf.write("Z" * 250000)
+res_rf_big = client_ok.dispatch_tool("read_file", {"rel_path": "big.txt"})
+assert "[TRUNCATED: file exceeded 200 KB]" in res_rf_big
+assert len(res_rf_big) < 250000
+# 6. binary file honest error
+bin_path = os.path.join(grant_test_dir, "test.bin")
+with open(bin_path, "wb") as bf:
+    bf.write(b"\x00\x01\x02\x03\xff")
+res_rf_bin = client_ok.dispatch_tool("read_file", {"rel_path": "test.bin"})
+assert "cannot read binary file" in res_rf_bin.lower()
+
+# run_python tests
+# 1. no grant
+res_rp_ng = client_no_grant.dispatch_tool("run_python", {"rel_path": "script.py"})
+assert "error" in res_rp_ng.lower()
+# 2. escape
+res_rp_esc = client_ok.dispatch_tool("run_python", {"rel_path": "../outside.py"})
+assert "escapes granted folder" in res_rp_esc or "error" in res_rp_esc.lower()
+# 3. non-.py rejected
+res_rp_nonpy = client_ok.dispatch_tool("run_python", {"rel_path": "sub/ok.txt"})
+assert "can only execute .py files" in res_rp_nonpy
+# 4. not found
+res_rp_nf = client_ok.dispatch_tool("run_python", {"rel_path": "missing.py"})
+assert "file not found" in res_rp_nf.lower()
+# 5. success
+py_script = os.path.join(grant_test_dir, "compute.py")
+with open(py_script, "w", encoding="utf-8") as pf:
+    pf.write("import os\nprint('PWD:', os.getcwd())\nprint('RESULT: 42')\n")
+res_rp_ok = client_ok.dispatch_tool("run_python", {"rel_path": "compute.py"})
+assert "Exit code: 0" in res_rp_ok
+assert "RESULT: 42" in res_rp_ok
+assert os.path.realpath(grant_test_dir).lower() in res_rp_ok.lower()
+# 6. 8 KB truncation
+loud_script = os.path.join(grant_test_dir, "loud.py")
+with open(loud_script, "w", encoding="utf-8") as pf:
+    pf.write("print('W' * 12000)\n")
+res_rp_loud = client_ok.dispatch_tool("run_python", {"rel_path": "loud.py"})
+assert "[TRUNCATED: stdout exceeded 8 KB]" in res_rp_loud
+assert len(res_rp_loud) < 12000
+# 7. timeout
+slow_script = os.path.join(grant_test_dir, "slow.py")
+with open(slow_script, "w", encoding="utf-8") as pf:
+    pf.write("import time\ntime.sleep(10)\n")
+res_rp_slow = client_ok.dispatch_tool("run_python", {"rel_path": "slow.py", "timeout_s": 1})
+assert "timed out after 1 seconds" in res_rp_slow
+
 # 4. Client against a stub server (http.server on 127.0.0.1)
 stub_requests = []
 stub_final_reply = "I found your meeting notes in the catalog."
@@ -1292,7 +1354,7 @@ def main():
     # Normal ready
     ready_msg = {
         "type": "ready",
-        "tools": sorted(["create_file", "create_folder", "list_folder", "open_file", "search_files"])
+        "tools": sorted(["create_file", "create_folder", "list_folder", "open_file", "read_file", "run_python", "search_files"])
     }
     sys.stdout.write(json.dumps(ready_msg) + "\n")
     sys.stdout.flush()
@@ -1562,10 +1624,10 @@ assert os.path.exists(setup_file), "Runner should have received setup"
 with open(setup_file, "r", encoding="utf-8") as f:
     setup_data = json.load(f)
 assert setup_data["providers"] == ["groq", "openrouter"]
-assert setup_data["disable"] == ["shell", "read_file", "write_file", "edit_file", "list_dir"]
+assert setup_data["disable"] == ["shell", "write_file", "edit_file", "list_dir"]
 manifest_names = sorted([t["name"] for t in setup_data["tools"]])
-expected_five = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
-assert manifest_names == expected_five, f"Expected manifest tools {expected_five}, got {manifest_names}"
+expected_seven = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder", "read_file", "run_python"])
+assert manifest_names == expected_seven, f"Expected manifest tools {expected_seven}, got {manifest_names}"
 
 # Verify tool schemas match AGENT_TOOLS
 endpoint_tool_map = {t["function"]["name"]: t["function"] for t in ez.AGENT_TOOLS}
@@ -1650,6 +1712,57 @@ with open(tool_res_file, "r", encoding="utf-8") as f:
     tool_res = json.load(f)
 assert tool_res["ok"] is True, f"search_files failed: {tool_res}"
 assert isinstance(tool_res["output"], str)
+
+# 5b. Bridge tool dispatch for read_file
+bridge_test_file = os.path.join(grant_temp, "bridge_read_me.txt")
+with open(bridge_test_file, "w", encoding="utf-8") as f:
+    f.write("bridge content read test")
+remove_control_files()
+set_control({
+    "mode": "happy",
+    "tool_call": {"name": "read_file", "arguments": {"rel_path": "bridge_read_me.txt"}}
+})
+spot.transcript.clear()
+spot.edit.setText("read file via bridge")
+spot.send_agent_message()
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
+qapp.processEvents()
+
+tool_res_file = os.path.join(fake_harness_root, "tool_result_received.json")
+assert os.path.exists(tool_res_file)
+with open(tool_res_file, "r", encoding="utf-8") as f:
+    tool_res = json.load(f)
+assert tool_res["ok"] is True, f"read_file via bridge failed: {tool_res}"
+assert tool_res["output"] == "bridge content read test"
+
+# 5c. Bridge tool dispatch for run_python
+bridge_py_file = os.path.join(grant_temp, "bridge_exec.py")
+with open(bridge_py_file, "w", encoding="utf-8") as f:
+    f.write("print('BRIDGE_PY_SUCCESS')\n")
+remove_control_files()
+set_control({
+    "mode": "happy",
+    "tool_call": {"name": "run_python", "arguments": {"rel_path": "bridge_exec.py"}}
+})
+spot.transcript.clear()
+spot.edit.setText("run python via bridge")
+spot.send_agent_message()
+assert spot._bridge_worker is not None
+while spot._bridge_worker.isRunning():
+    qapp.processEvents()
+spot._bridge_worker.wait(5000)
+qapp.processEvents()
+
+tool_res_file = os.path.join(fake_harness_root, "tool_result_received.json")
+assert os.path.exists(tool_res_file)
+with open(tool_res_file, "r", encoding="utf-8") as f:
+    tool_res = json.load(f)
+assert tool_res["ok"] is True, f"run_python via bridge failed: {tool_res}"
+assert "Exit code: 0" in tool_res["output"]
+assert "BRIDGE_PY_SUCCESS" in tool_res["output"]
 
 # 6. Confirmer gates create_file: Deny vs Allow
 # 6a. Deny

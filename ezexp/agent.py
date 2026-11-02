@@ -188,9 +188,11 @@ SYSTEM_PROMPT = (
     "- list_folder(path): list direct children in a directory.\n"
     "- open_file(path): open a file using its default application.\n"
     "- create_file(rel_path, content): create a new file in the granted folder.\n"
-    "- create_folder(rel_path): create a new folder in the granted folder.\n\n"
+    "- create_folder(rel_path): create a new folder in the granted folder.\n"
+    "- read_file(rel_path): return a file's text content inside the granted folder.\n"
+    "- run_python(rel_path, timeout_s=60): execute a .py file inside the granted folder.\n\n"
     "Rules:\n"
-    "1. Grant rule: you may only create files inside the granted folder; if none is granted, say so.\n"
+    "1. Grant rule: you may only access, create, or execute files inside the granted folder; if none is granted, say so.\n"
     "2. Honesty rule: never invent a path — call search_files or list_folder first; report tool errors verbatim."
 )
 
@@ -282,6 +284,44 @@ AGENT_TOOLS = [
                     "rel_path": {
                         "type": "string",
                         "description": "Relative path inside the granted folder",
+                    },
+                },
+                "required": ["rel_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the text content of a file inside the granted folder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {
+                        "type": "string",
+                        "description": "Relative path inside the granted folder",
+                    },
+                },
+                "required": ["rel_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": "Execute a .py file inside the granted folder with 60s timeout.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {
+                        "type": "string",
+                        "description": "Relative path of .py file inside the granted folder",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Execution timeout in seconds (default: 60)",
                     },
                 },
                 "required": ["rel_path"],
@@ -511,6 +551,11 @@ class AgentClient(QObject):
             return self._tool_create_file(args.get("rel_path", ""), args.get("content", ""))
         elif name == "create_folder":
             return self._tool_create_folder(args.get("rel_path", ""))
+        elif name == "read_file":
+            return self._tool_read_file(args.get("rel_path", ""))
+        elif name == "run_python":
+            timeout_s = args.get("timeout_s", 60)
+            return self._tool_run_python(args.get("rel_path", ""), timeout_s=timeout_s)
         else:
             return f"Error: Unknown tool '{name}'"
 
@@ -583,6 +628,141 @@ class AgentClient(QObject):
             return norm_target
         except Exception as e:
             return f"Error: Failed to create folder: {e}"
+
+    def _tool_read_file(self, rel_path):
+        cfg = self.config if self.config is not None else load_agent_config()
+        grant_dir = (cfg.get("grant_dir") or "").strip()
+        if not grant_dir:
+            return "Error: grant_dir is not configured."
+        if not rel_path or not str(rel_path).strip():
+            return "Error: rel_path cannot be empty."
+        rel_path = str(rel_path).strip()
+        if os.path.isabs(rel_path) or rel_path.startswith("/") or rel_path.startswith("\\") or re.match(r"^[a-zA-Z]:", rel_path):
+            return "Error: Path escapes granted folder (absolute paths not allowed)."
+        norm_grant = os.path.realpath(os.path.abspath(grant_dir))
+        norm_target = os.path.realpath(os.path.abspath(os.path.join(norm_grant, rel_path)))
+        try:
+            common = os.path.commonpath([norm_grant, norm_target])
+        except ValueError:
+            return "Error: Path escapes granted folder."
+        if common.lower() != norm_grant.lower():
+            return "Error: Path escapes granted folder."
+        parts = [p for p in re.split(r"[\\/]", rel_path) if p]
+        if ".." in parts:
+            return "Error: Path escapes granted folder."
+        if not os.path.exists(norm_target):
+            return f"Error: File not found: {rel_path}"
+        if not os.path.isfile(norm_target):
+            return f"Error: Path is not a file: {rel_path}"
+
+        cap_bytes = 200 * 1024
+        try:
+            with open(norm_target, "rb") as f:
+                raw_bytes = f.read(cap_bytes + 1)
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+        sample = raw_bytes[:min(len(raw_bytes), 8192)]
+        if b"\x00" in sample:
+            return f"Error: Cannot read binary file: {rel_path}"
+
+        file_size = os.path.getsize(norm_target)
+        is_truncated = (len(raw_bytes) > cap_bytes) or (file_size > cap_bytes)
+        chunk = raw_bytes[:cap_bytes]
+
+        try:
+            text = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            if is_truncated:
+                decoded = None
+                for trim in range(1, 4):
+                    try:
+                        decoded = chunk[:-trim].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        pass
+                if decoded is not None:
+                    text = decoded
+                else:
+                    return f"Error: Cannot read binary file (invalid text encoding): {rel_path}"
+            else:
+                return f"Error: Cannot read binary file (invalid text encoding): {rel_path}"
+
+        text = text.replace("\r\n", "\n")
+        if is_truncated:
+            text = text + f"\n\n[TRUNCATED: file exceeded 200 KB]"
+        return text
+
+    def _tool_run_python(self, rel_path, timeout_s=60):
+        cfg = self.config if self.config is not None else load_agent_config()
+        grant_dir = (cfg.get("grant_dir") or "").strip()
+        if not grant_dir:
+            return "Error: grant_dir is not configured."
+        if not rel_path or not str(rel_path).strip():
+            return "Error: rel_path cannot be empty."
+        rel_path = str(rel_path).strip()
+        if os.path.isabs(rel_path) or rel_path.startswith("/") or rel_path.startswith("\\") or re.match(r"^[a-zA-Z]:", rel_path):
+            return "Error: Path escapes granted folder (absolute paths not allowed)."
+        norm_grant = os.path.realpath(os.path.abspath(grant_dir))
+        norm_target = os.path.realpath(os.path.abspath(os.path.join(norm_grant, rel_path)))
+        try:
+            common = os.path.commonpath([norm_grant, norm_target])
+        except ValueError:
+            return "Error: Path escapes granted folder."
+        if common.lower() != norm_grant.lower():
+            return "Error: Path escapes granted folder."
+        parts = [p for p in re.split(r"[\\/]", rel_path) if p]
+        if ".." in parts:
+            return "Error: Path escapes granted folder."
+
+        if not norm_target.lower().endswith(".py"):
+            return "Error: run_python can only execute .py files"
+        if not os.path.exists(norm_target):
+            return f"Error: File not found: {rel_path}"
+        if not os.path.isfile(norm_target):
+            return f"Error: Path is not a file: {rel_path}"
+
+        try:
+            timeout_val = int(timeout_s) if timeout_s is not None else 60
+            if timeout_val <= 0:
+                timeout_val = 60
+        except (TypeError, ValueError):
+            timeout_val = 60
+        timeout_val = min(timeout_val, 60)
+
+        try:
+            cmd = [sys.executable, norm_target]
+            popen_kwargs = {
+                "cwd": norm_grant,
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": timeout_val,
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+            proc = subprocess.run(cmd, **popen_kwargs)
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+
+            cap_output = 8192
+            if len(stdout) > cap_output:
+                stdout = stdout[:cap_output] + f"\n[TRUNCATED: stdout exceeded 8 KB]"
+            if len(stderr) > cap_output:
+                stderr = stderr[:cap_output] + f"\n[TRUNCATED: stderr exceeded 8 KB]"
+
+            lines = [f"Exit code: {proc.returncode}"]
+            if stdout:
+                lines.append(f"Stdout:\n{stdout}")
+            if stderr:
+                lines.append(f"Stderr:\n{stderr}")
+            return "\n".join(lines).strip()
+        except subprocess.TimeoutExpired:
+            return f"Error: run_python timed out after {timeout_val} seconds (process killed)."
+        except Exception as e:
+            return f"Error executing python: {e}"
 
 class BridgeWorker(QThread):
     done = Signal(str)
@@ -668,7 +848,7 @@ class BridgeWorker(QThread):
             setup_msg = {
                 "type": "setup",
                 "providers": ["groq", "openrouter"],
-                "disable": ["shell", "read_file", "write_file", "edit_file", "list_dir"],
+                "disable": ["shell", "write_file", "edit_file", "list_dir"],
                 "tools": tools_manifest,
             }
             self._proc.stdin.write(json.dumps(setup_msg) + "\n")
@@ -708,11 +888,11 @@ class BridgeWorker(QThread):
                 self.failed.emit(f"Protocol error: expected 'ready', got '{ready_data.get('type')}'")
                 return
 
-            # Fail closed assertion
-            expected_names = sorted(["search_files", "list_folder", "open_file", "create_file", "create_folder"])
-            actual_names = sorted(ready_data.get("tools", []))
-            if actual_names != expected_names:
-                msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {actual_names}."
+            # Fail closed assertion: must only contain known safe tools, no shell
+            allowed_tools = {"search_files", "list_folder", "open_file", "create_file", "create_folder", "read_file", "run_python"}
+            actual_tools = set(ready_data.get("tools", []))
+            if not actual_tools or not actual_tools.issubset(allowed_tools):
+                msg = f"Refused to run: harness tool set mismatch — expected EzExp tools only, got: {sorted(actual_tools)}."
                 self._terminate_proc()
                 self.failed.emit(msg)
                 return
