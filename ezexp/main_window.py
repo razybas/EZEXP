@@ -1528,8 +1528,9 @@ class MainWindow(FramelessWindow):
             grant_dir = (cfg.get("grant_dir") or "").strip()
             hp = (cfg.get("harness_path") or "").strip()
             hpython = (cfg.get("harness_python") or "py").strip() or "py"
+            hmode = (cfg.get("harness_mode") or "single").strip() or "single"
             cur_folder = self.get_current_folder()
-            self._start_harness_task(text, grant_dir, hp, hpython, mode="single", current_folder=cur_folder)
+            self._start_harness_task(text, grant_dir, hp, hpython, mode=hmode, current_folder=cur_folder)
         else:
             self.dock_input.clear()
             self.dock_transcript.appendPlainText(f"You: {text}\n")

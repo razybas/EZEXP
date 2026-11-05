@@ -85,6 +85,28 @@ class AgentSettingsDialog(QDialog):
         self.edit_python.setPlaceholderText("py")
         lay.addWidget(self.edit_python)
 
+        self.lbl_mode = QLabel("Harness mode:", self)
+        lay.addWidget(self.lbl_mode)
+        self.combo_mode = QComboBox(self)
+        self.combo_mode.setStyleSheet(
+            light_field_style(padding="4px 8px")
+            + "QComboBox QAbstractItemView { background: #ffffff; color: %s; "
+              "selection-background-color: #0a84ff; selection-color: #ffffff; }" % TEXT
+        )
+        self.combo_mode.addItem("single")
+        self.combo_mode.addItem("pipeline")
+        self.combo_mode.addItem("fanout")
+        curr_mode = (self.cfg.get("harness_mode") or "single").strip().lower()
+        idx = self.combo_mode.findText(curr_mode)
+        if idx >= 0:
+            self.combo_mode.setCurrentIndex(idx)
+        else:
+            self.combo_mode.addItem(curr_mode)
+            self.combo_mode.setCurrentIndex(self.combo_mode.count() - 1)
+        self.lbl_harness_mode = self.lbl_mode
+        self.combo_harness_mode = self.combo_mode
+        lay.addWidget(self.combo_mode)
+
         lbl_url = QLabel("Base URL:", self)
         self.edit_url = QLineEdit(self)
         self.edit_url.setText(self.cfg.get("base_url", ""))
@@ -148,11 +170,15 @@ class AgentSettingsDialog(QDialog):
         self.btn_choose_harness.setEnabled(is_harness)
         self.lbl_python.setEnabled(is_harness)
         self.edit_python.setEnabled(is_harness)
+        self.lbl_mode.setEnabled(is_harness)
+        self.combo_mode.setEnabled(is_harness)
         self.lbl_harness.setVisible(is_harness)
         self.edit_harness.setVisible(is_harness)
         self.btn_choose_harness.setVisible(is_harness)
         self.lbl_python.setVisible(is_harness)
         self.edit_python.setVisible(is_harness)
+        self.lbl_mode.setVisible(is_harness)
+        self.combo_mode.setVisible(is_harness)
 
     def _choose_harness(self):
         curr = self.edit_harness.text().strip() or os.path.expanduser("~")
@@ -171,6 +197,7 @@ class AgentSettingsDialog(QDialog):
             "backend": "harness" if self.combo_backend.currentIndex() == 1 else "endpoint",
             "harness_path": self.edit_harness.text().strip(),
             "harness_python": self.edit_python.text().strip() or "py",
+            "harness_mode": self.combo_mode.currentText().strip() or "single",
             "base_url": self.edit_url.text().strip(),
             "model": self.edit_model.text().strip(),
             "api_key": self.edit_key.text().strip(),
