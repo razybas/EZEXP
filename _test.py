@@ -663,7 +663,27 @@ win._index_lock_retried = False
 _orig_fixed = ez.fixed_drives
 ez.fixed_drives = lambda: [data]
 try:
+    # 2a: delta scan leaves analyzer running (phase='full_done', populated catalog)
     win._analyzer_running = True
+    win._analyzer_stop.clear()
+    assert ez.get_meta(ez.thread_conn(), "phase") == "full_done"
+    assert ez.thread_conn().execute("SELECT COUNT(*) FROM files").fetchone()[0] > 0
+    _t_stop1 = threading.Thread(
+        target=lambda: (win._analyzer_stop.wait(5), setattr(win, "_analyzer_running", False)),
+        daemon=True)
+    _t_stop1.start()
+    win.start_indexer(False)
+    assert not win._analyzer_stop.is_set(), "delta scan must leave analyzer running"
+    if win._indexer:
+        win._indexer.wait(5000)
+
+    # 2b: rebuild sets _analyzer_stop (quiesce)
+    win._analyzer_stop.clear()
+    win._analyzer_running = True
+    _t_stop2 = threading.Thread(
+        target=lambda: (win._analyzer_stop.wait(5), setattr(win, "_analyzer_running", False)),
+        daemon=True)
+    _t_stop2.start()
     win.start_indexer(True)
     assert win._analyzer_stop.is_set()
 finally:

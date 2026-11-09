@@ -40,7 +40,7 @@ from ezexp.db import (
 )
 from ezexp.indexer import _make_row
 from ezexp.search_engine import sort_rows, do_search
-from ezexp.indexer import SearchWorker, IndexerThread
+from ezexp.indexer import SearchWorker, IndexerThread, launch_needs_full
 from ezexp.settings_store import (
     get_vaults, set_vaults, get_quicklaunch, set_quicklaunch,
     get_launch_counts, bump_launch_count, remove_launch_count, APP_EXTS
@@ -1303,14 +1303,18 @@ class MainWindow(FramelessWindow):
             self._index_pending = True if (self._index_pending or rebuild) else False
             self.rescan_btn.setText("  Rescan queued…")
             return
-        self._analyzer_stop.set()
-        # WAIT for the analyzer thread to actually exit (its current pass
-        # can take a few more seconds and it writes note_links): a scan
-        # starting under it dies on 'database is locked' and the indexer
-        # retries the WHOLE rebuild from zero
-        t0 = time.time()
-        while self._analyzer_running and time.time() - t0 < 15:
-            time.sleep(0.2)
+        conn = thread_conn()
+        phase = get_meta(conn, "phase")
+        files_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        if launch_needs_full(rebuild, phase, files_count):
+            self._analyzer_stop.set()
+            # WAIT for the analyzer thread to actually exit (its current pass
+            # can take a few more seconds and it writes note_links): a scan
+            # starting under it dies on 'database is locked' and the indexer
+            # retries the WHOLE rebuild from zero
+            t0 = time.time()
+            while self._analyzer_running and time.time() - t0 < 15:
+                time.sleep(0.2)
         self._indexer = IndexerThread(rebuild=rebuild)
         self._indexer.progress.connect(self.on_index_progress)
         self._indexer.done.connect(self.on_index_done)
