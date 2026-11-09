@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 
 from ezexp import DB_PATH, APP_DIR
 from ezexp.fsutil import (
-    join_path, split_path, real_dir, ext_of, category_for, kind_for,
+    join_path, split_path, like_escape, real_dir, ext_of, category_for, kind_for,
     SKIP_DIR_NAMES, SKIP_FILE_NAMES, fixed_drives, REPARSE_ATTR
 )
 from ezexp.settings_store import get_vaults
@@ -174,6 +174,54 @@ def _make_row(parent, name, is_dir, st, drive):
             st.st_size if not is_dir else 0, st.st_mtime, drive,
             category_for(name, is_dir), kind_for(name, is_dir))
 
+
+def drivefs_cache_root():
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return ""
+    return os.path.normpath(os.path.join(local, "Google", "DriveFS"))
+
+
+def _is_drivefs_cache_path(path, cache_root):
+    if not cache_root:
+        return False
+    p = os.path.normpath(path).lower()
+    c = cache_root.lower()
+    return p == c or p.startswith(c + "\\")
+
+
+def _cache_exclusion_applies(roots, cache_root):
+    if not cache_root:
+        return False
+    c = cache_root.lower()
+    for r in roots:
+        r_norm = os.path.normpath(r).lower()
+        if c == r_norm or c.startswith(r_norm + "\\") or c.startswith(r_norm.rstrip("\\") + "\\"):
+            return True
+    return False
+
+
+def _purge_drivefs_cache(conn, cache_root):
+    if not cache_root:
+        return
+    parent, name = split_path(cache_root)
+    esc = like_escape(cache_root)
+    ids = [r[0] for r in conn.execute(
+        "SELECT id FROM files WHERE parent=? OR parent LIKE ? ESCAPE '#'"
+        " OR (parent=? AND name=?)",
+        (cache_root, esc + "\\%", parent, name)).fetchall()]
+    if ids:
+        fts_drop_ids(conn, ids)
+        conn.execute(
+            "DELETE FROM files WHERE parent=? OR parent LIKE ? ESCAPE '#'"
+            " OR (parent=? AND name=?)",
+            (cache_root, esc + "\\%", parent, name))
+        conn.execute(
+            "DELETE FROM note_links WHERE (parent=? AND name=?) OR parent=?"
+            " OR parent LIKE ? ESCAPE '#'",
+            (parent, name, cache_root, esc + "\\%"))
+
+
 def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
               watchdog=None):
     """Rebuild the index from the given roots. wipe=False indexes extra roots
@@ -204,6 +252,9 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
             set_meta(conn, "phase", "full_partial"),
             set_meta(conn, "full_done_roots", ""),
             conn.commit()))
+    cache_root = drivefs_cache_root()
+    if _cache_exclusion_applies(roots, cache_root):
+        _locked_retry(conn, lambda: (_purge_drivefs_cache(conn, cache_root), conn.commit()))
     total = 0
     batch = []
     for root in roots:
@@ -229,6 +280,8 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
             if watchdog is not None and watchdog.deferred(root):
                 break
             d = stack.pop()
+            if cache_root and _is_drivefs_cache_path(d, cache_root):
+                continue
             real = real_dir(d)
             try:
                 it = os.scandir(real)
@@ -250,6 +303,9 @@ def scan_full(conn, roots, progress=None, should_run=None, wipe=True,
                         if progress:
                             progress(d, total + len(batch))
                     name = e.name
+                    child = join_path(d, name)
+                    if cache_root and _is_drivefs_cache_path(child, cache_root):
+                        continue
                     try:
                         st = e.stat(follow_symlinks=False)
                     except OSError:
@@ -340,6 +396,9 @@ def scan_delta(conn, roots, progress=None, should_run=None, watchdog=None):
     watchdog: same RootWatchdog contract as scan_full (Fix 2)."""
     if should_run is None:
         should_run = lambda: True
+    cache_root = drivefs_cache_root()
+    if _cache_exclusion_applies(roots, cache_root):
+        _locked_retry(conn, lambda: (_purge_drivefs_cache(conn, cache_root), conn.commit()))
     changed_items = 0
     for root in roots:
         if not should_run():
@@ -363,6 +422,8 @@ def scan_delta(conn, roots, progress=None, should_run=None, watchdog=None):
             if watchdog is not None and watchdog.deferred(root):
                 break
             d = stack.pop()
+            if cache_root and _is_drivefs_cache_path(d, cache_root):
+                continue
             if d in visited:
                 continue
             visited.add(d)
@@ -381,7 +442,9 @@ def scan_delta(conn, roots, progress=None, should_run=None, watchdog=None):
                     watchdog.touch(root)
                 for parent, name in conn.execute(
                         "SELECT parent, name FROM files WHERE parent=? AND is_dir=1", (d,)):
-                    stack.append(join_path(parent, name))
+                    child_p = join_path(parent, name)
+                    if not (cache_root and _is_drivefs_cache_path(child_p, cache_root)):
+                        stack.append(child_p)
                 continue
 
             # changed or new directory: rescan its direct children
@@ -414,6 +477,9 @@ def scan_delta(conn, roots, progress=None, should_run=None, watchdog=None):
                         if progress:
                             progress(d, changed_items)
                     name = e.name
+                    child = join_path(d, name)
+                    if cache_root and _is_drivefs_cache_path(child, cache_root):
+                        continue
                     try:
                         st = e.stat(follow_symlinks=False)
                     except OSError:

@@ -3471,6 +3471,73 @@ finally:
     ez.set_vaults(list(_d2_saved_vaults or []))
 # --- D2 end -------------------------------------------------------------------
 
+# --- F1: Google DriveFS cache exclusion --------------------------------------
+_f1_tmp = tempfile.mkdtemp(prefix="ezexp_test_f1_")
+_f1_localappdata = os.path.join(_f1_tmp, "AppData", "Local")
+_f1_drivefs = os.path.join(_f1_localappdata, "Google", "DriveFS")
+os.makedirs(_f1_drivefs)
+_f1_docs = os.path.join(_f1_localappdata, "Google", "OtherDir")
+os.makedirs(_f1_docs)
+
+with open(os.path.join(_f1_drivefs, "cache_file.dat"), "w") as f:
+    f.write("binary")
+_f1_dfs_sub = os.path.join(_f1_drivefs, "content_cache")
+os.makedirs(_f1_dfs_sub)
+with open(os.path.join(_f1_dfs_sub, "chunk.dat"), "w") as f:
+    f.write("chunk")
+with open(os.path.join(_f1_docs, "doc.txt"), "w") as f:
+    f.write("doc")
+
+_saved_localappdata = os.environ.get("LOCALAPPDATA")
+os.environ["LOCALAPPDATA"] = _f1_localappdata
+
+try:
+    _f1_conn = ez.sqlite3.connect(os.path.join(_f1_tmp, "f1.db"))
+    ez._ensure_schema(_f1_conn)
+
+    # (a) fixture tree containing a Google\DriveFS subtree with files ->
+    # full scan indexes everything except that subtree
+    ez.scan_full(_f1_conn, [_f1_localappdata], lambda p, c: None)
+    assert _f1_conn.execute("SELECT COUNT(*) FROM files WHERE name='doc.txt'").fetchone()[0] == 1
+    _f1_dfs_cnt = _f1_conn.execute(
+        "SELECT COUNT(*) FROM files WHERE parent=? OR parent LIKE ? OR name='DriveFS'",
+        (_f1_drivefs, _f1_drivefs + "\\%")).fetchone()[0]
+    assert _f1_dfs_cnt == 0, f"F1(a) failed: DriveFS subtree was indexed ({_f1_dfs_cnt} rows)"
+
+    # (b) delta scan with churned mtimes inside the subtree completes without visiting it
+    with open(os.path.join(_f1_drivefs, "churned.dat"), "w") as f:
+        f.write("churn")
+    os.utime(os.path.join(_f1_dfs_sub, "chunk.dat"), (time.time() + 10, time.time() + 10))
+    os.utime(_f1_drivefs, (time.time() + 10, time.time() + 10))
+    with open(os.path.join(_f1_docs, "new_doc.txt"), "w") as f:
+        f.write("new")
+
+    _f1_visited = []
+    ez.scan_delta(_f1_conn, [_f1_localappdata], lambda p, c: _f1_visited.append(p))
+    _f1_dfs_visited = [p for p in _f1_visited if p == _f1_drivefs or p.startswith(_f1_drivefs + "\\")]
+    assert len(_f1_dfs_visited) == 0, f"F1(b) failed: delta scan visited DriveFS subtree: {_f1_dfs_visited}"
+    assert _f1_conn.execute("SELECT COUNT(*) FROM files WHERE name='churned.dat'").fetchone()[0] == 0
+
+    # (c) pre-seeded catalog rows under the prefix are gone after one scan
+    _f1_conn.execute(
+        "INSERT INTO files (parent, name, is_dir, ext, size, mtime, drive, category, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (_f1_drivefs, "old_cache.dat", 0, "dat", 100, 1000.0, _f1_drivefs[:2], "other", "other"))
+    _f1_conn.commit()
+    assert _f1_conn.execute("SELECT COUNT(*) FROM files WHERE parent=? AND name='old_cache.dat'", (_f1_drivefs,)).fetchone()[0] == 1
+    ez.scan_delta(_f1_conn, [_f1_localappdata], lambda p, c: None)
+    _f1_post_cnt = _f1_conn.execute(
+        "SELECT COUNT(*) FROM files WHERE parent=? OR parent LIKE ?",
+        (_f1_drivefs, _f1_drivefs + "\\%")).fetchone()[0]
+    assert _f1_post_cnt == 0, f"F1(c) failed: pre-seeded rows still exist ({_f1_post_cnt})"
+    _f1_conn.close()
+finally:
+    if _saved_localappdata is not None:
+        os.environ["LOCALAPPDATA"] = _saved_localappdata
+    else:
+        os.environ.pop("LOCALAPPDATA", None)
+    shutil.rmtree(_f1_tmp, ignore_errors=True)
+# --- F1 end -------------------------------------------------------------------
+
 
 _test_settings.remove('agent_dock_visible')
 _test_settings.remove('details_visible')
