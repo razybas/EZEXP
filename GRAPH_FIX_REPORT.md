@@ -9,7 +9,7 @@
 ## 1. Phase 0 Diagnostics (Owner Machine Verbatim)
 
 ### 0.1 Launched Executable Verification
-- **Desktop Shortcut**: `C:\Users\nanub\Desktop\ezexp - Shortcut.lnk`
+- **Desktop Shortcut**: `%USERPROFILE%\Desktop\ezexp - Shortcut.lnk`
 - **Shortcut Target**: `D:\exp\ezexp\dist\ezexp.exe`
 - **File Size**: `48,084,107 bytes`
 - **Comparison to Reference**: Matches the `1d3d23a` reference build (`48,084,107 bytes`) byte-for-byte. The owner is running the latest reference build.

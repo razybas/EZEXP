@@ -166,7 +166,28 @@ follows the current tab:
 - **Crash log**: if anything ever goes wrong, the traceback is
   appended to `%LOCALAPPDATA%\EzExp\error.log` — send that file with
   a bug report.
-- **Version**: 1.2.0 (stamped into the exe's file properties).
+- **Version**: 1.3.0 (stamped into the exe's file properties).
+
+## Agent (optional, bring your own API)
+
+EzExp has a built-in agent window (toggle it from the **Agent** button in
+the main window). It can search your index, and — inside one folder you
+explicitly grant — create and read files and run Python, so it can do real
+work on a project folder while you watch.
+
+To use it, open **Agent Endpoint Settings** (the gear in the agent window)
+and enter any OpenAI-compatible endpoint:
+
+- **Base URL** — e.g. a cloud provider's `/v1` URL, or a local Ollama at
+  `http://localhost:11434/v1`
+- **Model** — the model name your provider expects
+- **API key** — your key (stored only on your machine; leave empty for a
+  local Ollama)
+- **Grant folder** — the one folder the agent may write to
+
+Nothing is sent anywhere until you configure an endpoint. An advanced
+harness backend (for a local multi-agent harness checkout) is also in the
+same dialog; the endpoint mode above is all most people need.
 
 ## How it works
 

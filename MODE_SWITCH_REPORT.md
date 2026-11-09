@@ -211,7 +211,7 @@ index 1ae1b11..3860ca5 100644
 
 ### 1.2 Configured Mode String
 - **Mode string persisted in `agent.json`**: `"pipeline"`
-- Path: `C:\Users\nanub\AppData\Local\EzExp\agent.json`
+- Path: `%USERPROFILE%\AppData\Local\EzExp\agent.json`
 
 ---
 
@@ -220,7 +220,7 @@ index 1ae1b11..3860ca5 100644
 ```
 NOTE: a global 'import harness' succeeds on this machine (editable install .pth)  the empty-dir negative probe cannot hold and was skipped
 EzExp scan: 2026-11-05 18:39:16  'Q:\slow' deferred (no progress for 0s)
-EzExp scan: 2026-11-05 18:39:18  'C:\Users\nanub\AppData\Local\Temp\ezexp_test_drzj5sgm\stall_root' deferred (no progress for 0s)
+EzExp scan: 2026-11-05 18:39:18  '%USERPROFILE%\AppData\Local\Temp\ezexp_test_drzj5sgm\stall_root' deferred (no progress for 0s)
 ALL TESTS PASSED
 ```
 Exit code: `0` (Fully Green).

@@ -794,8 +794,8 @@ try:
         "backend": "endpoint",
         "harness_path": "",
         "harness_python": "py",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "meta/llama-3.3-70b-instruct",
+        "base_url": "",
+        "model": "",
         "api_key": "",
         "grant_dir": "",
     }
