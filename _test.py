@@ -687,6 +687,8 @@ try:
     win.start_indexer(True)
     assert win._analyzer_stop.is_set()
 finally:
+    win._analyzer_stop.set()
+    win._analyzer_running = False
     if win._indexer:
         win._indexer.wait(5000)
     ez.fixed_drives = _orig_fixed
@@ -3557,6 +3559,82 @@ finally:
         os.environ.pop("LOCALAPPDATA", None)
     shutil.rmtree(_f1_tmp, ignore_errors=True)
 # --- F1 end -------------------------------------------------------------------
+
+# --- F3: vault graph renders from existing links during analysis -------------
+_f3_tmp = tempfile.mkdtemp(prefix="ezexp_f3_test_")
+_f3_vdir = os.path.join(_f3_tmp, "F3Vault")
+os.makedirs(_f3_vdir, exist_ok=True)
+for _i in range(1, 4):
+    with open(os.path.join(_f3_vdir, f"note{_i}.md"), "w") as _f:
+        _f.write(f"Link [[note{(_i % 3) + 1}]]")
+
+_f3_saved_dbpath = _dbmod.DB_PATH
+_f3_saved_dbdir = _dbmod.DB_DIR
+_f3_dbfile = os.path.join(_f3_tmp, "f3_test.db")
+_dbmod.DB_PATH = _f3_dbfile
+_dbmod.DB_DIR = _f3_tmp
+ez.DB_PATH, ez.DB_DIR = _f3_dbfile, _f3_tmp
+
+if hasattr(_dbmod._tls, "conn") and _dbmod._tls.conn:
+    try:
+        _dbmod._tls.conn.close()
+    except Exception:
+        pass
+    _dbmod._tls.conn = None
+
+_f3_conn = ez.db_connect()
+ez.ensure_indexes(_f3_conn)
+ez.scan_full(_f3_conn, [_f3_vdir], lambda p, c: None)
+_f3_st = os.stat(os.path.join(_f3_vdir, "note1.md"))
+_f3_conn.execute("INSERT OR REPLACE INTO note_links (parent, name, target, mtime) VALUES (?, ?, ?, ?)",
+                 (_f3_vdir, "note1.md", "note2", _f3_st.st_mtime))
+_f3_conn.commit()
+
+_f3_pending = ez.pending_link_count(_f3_conn, [_f3_vdir])
+assert _f3_pending > 0
+
+_f3_saved_vaults = ez.get_vaults()
+ez.set_vaults([_f3_vdir])
+_f3_orig_fixed = ez.fixed_drives
+ez.fixed_drives = lambda: []
+_f3_win = ez.MainWindow(worker)
+_f3_win._analyzer_stop.set()
+try:
+    for _b in _f3_win._side_buttons:
+        if getattr(_b, "_vault", False):
+            _b.click()
+            break
+    qapp.processEvents()
+    _f3_win.enter_graph_mode()
+    qapp.processEvents()
+    # Trigger on_links_progress while analysis is pending
+    _f3_win.on_links_progress(1, _f3_pending)
+    qapp.processEvents()
+    # Graph has nodes without waiting for links_done
+    _t0 = time.time()
+    while time.time() - _t0 < 3.0 and not (_f3_win.graph_view._items or _f3_win.graph_view.nodes):
+        qapp.processEvents()
+        time.sleep(0.05)
+    _f3_nodes_count = len(_f3_win.graph_view._items or _f3_win.graph_view.nodes)
+    assert _f3_nodes_count > 0, "F3: graph must have nodes without waiting for links_done"
+    assert f"{_f3_pending} notes left" in _f3_win.status_left.text(), f"F3: countdown in status line, got {_f3_win.status_left.text()!r}"
+finally:
+    if _f3_win._indexer:
+        _f3_win._indexer.wait(2000)
+    ez.fixed_drives = _f3_orig_fixed
+    ez.set_vaults(_f3_saved_vaults)
+    _dbmod.DB_PATH = _f3_saved_dbpath
+    _dbmod.DB_DIR = _f3_saved_dbdir
+    ez.DB_PATH, ez.DB_DIR = _f3_saved_dbpath, _f3_saved_dbdir
+    if hasattr(_dbmod._tls, "conn") and _dbmod._tls.conn:
+        try:
+            _dbmod._tls.conn.close()
+        except Exception:
+            pass
+        _dbmod._tls.conn = None
+    _f3_win.close()
+    shutil.rmtree(_f3_tmp, ignore_errors=True)
+# --- F3 end -------------------------------------------------------------------
 
 
 _test_settings.remove('agent_dock_visible')

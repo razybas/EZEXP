@@ -80,6 +80,8 @@ class MainWindow(FramelessWindow):
         self.current_rows = []
         self.view_mode = "list"
         self._graph_seq = 0
+        self._last_graph_refresh = 0.0
+        self._last_graph_remaining = None
         self._analyzer_running = False
         self._analyzer_stop = threading.Event()
         self._indexer = None
@@ -786,8 +788,9 @@ class MainWindow(FramelessWindow):
         self._graph_seq += 1
         seq = self._graph_seq
         if is_vault_root:
-            self.graph_view.show_message(
-                f"Building link graph of “{os.path.basename(vault)}”…")
+            if not (self.graph_view.nodes or self.graph_view._items):
+                self.graph_view.show_message(
+                    f"Building link graph of “{os.path.basename(vault)}”…")
             spec = {"mode": "vault", "vault": vault}
         else:
             self.graph_view.show_message("Building structure graph from the index…")
@@ -843,8 +846,24 @@ class MainWindow(FramelessWindow):
             self.links_done.emit()
 
     def on_links_progress(self, done, remaining):
-        if self.view_mode == "graph" and not self.graph_view.nodes:
-            self.graph_view.show_message(f"Analyzing vault links… {remaining} notes left")
+        if self.view_mode == "graph":
+            place = self.current_place
+            vault = active_vault_for(place) if place else None
+            is_vault_root = bool(vault) and place.rstrip("\\").lower() == vault.lower()
+            if is_vault_root:
+                cur = self.status_left.text()
+                cnt = f"Analyzing vault links… {remaining} notes left"
+                if " · " in cur:
+                    prefix = cur.split(" · Analyzing")[0].split(" · analyzing")[0]
+                    self.status_left.setText(f"{prefix} · {cnt}")
+                else:
+                    self.status_left.setText(cnt)
+                now = time.time()
+                if (now - getattr(self, "_last_graph_refresh", 0.0) >= 15.0 and
+                        (self._last_graph_remaining is None or remaining < self._last_graph_remaining)):
+                    self._last_graph_refresh = now
+                    self._last_graph_remaining = remaining
+                    self.refresh_graph()
 
     def on_links_done(self):
         if self.view_mode == "graph":
@@ -871,8 +890,8 @@ class MainWindow(FramelessWindow):
         else:
             v = spec["vault"]
             analyzed = data.get("analyzed", data["total_md"])
-            ann = "" if analyzed >= data["total_md"] else \
-                f" · analyzing {analyzed}/{data['total_md']} notes (completes in background)"
+            rem = data["total_md"] - analyzed
+            ann = "" if rem <= 0 else f" · Analyzing vault links… {rem} notes left"
             self.status_left.setText(
                 f"{data['total_md']} notes · {len(data.get('link_edges', []))} links · "
                 f"{os.path.basename(v)}{ann}")
